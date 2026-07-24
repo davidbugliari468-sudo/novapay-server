@@ -84,9 +84,9 @@ app.post("/api/create-payment", async (req, res) => {
         console.error(error.response?.data || error.message);
 
         res.status(500).json({
-            success: false,
-            message: "Unable to create payment."
-        });
+    success: false,
+    message: error.response?.data || error.message
+});
 
     }
 
