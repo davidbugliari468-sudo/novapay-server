@@ -10,7 +10,8 @@ const {
     CONTRACT_CODE,
     BASE_URL
 } = require("./monnify");
-
+console.log("BASE_URL:", BASE_URL);
+console.log("CONTRACT_CODE:", CONTRACT_CODE);
 const app = express();
 
 app.use(cors());
