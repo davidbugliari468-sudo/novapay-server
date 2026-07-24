@@ -1,21 +1,16 @@
 const admin = require("firebase-admin");
 
-// Read the JSON stored in Render Environment Variables
-const serviceAccount = JSON.parse(
-    process.env.FIREBASE_SERVICE_ACCOUNT
-);
+const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+
+// Convert literal \n into real newlines if Render stored them that way
+serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, "\n");
 
 if (!admin.apps.length) {
-
-    admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount)
-    });
-
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+  });
 }
 
 const db = admin.firestore();
 
-module.exports = {
-    admin,
-    db
-};
+module.exports = { admin, db };
