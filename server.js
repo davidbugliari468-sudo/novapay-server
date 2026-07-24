@@ -50,7 +50,7 @@ app.post("/api/create-payment", async (req, res) => {
 
             {
                 amount: Number(amount),
-                customerName,
+                customerName: customerName || "NovaPay User",
                 customerEmail,
                 paymentReference,
                 paymentDescription: "NovaPay Wallet Funding",
