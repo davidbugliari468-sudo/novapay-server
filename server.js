@@ -220,6 +220,27 @@ if (!eventData || eventData.paymentStatus !== "PAID") {
 }
 
 const paymentReference = eventData.paymentReference;
+const paymentReference = eventData.paymentReference;
+
+console.log("Webhook paymentReference:", paymentReference);
+
+const paymentDoc = await db
+    .collection("paymentReferences")
+    .doc(paymentReference)
+    .get();
+
+console.log("Payment doc exists:", paymentDoc.exists);
+
+const paymentData = paymentDoc.data();
+console.log("Payment data:", paymentData);
+
+const uid = paymentData.uid;
+console.log("UID:", uid);
+
+const userRef = db.collection("users").doc(uid);
+const userDoc = await userRef.get();
+
+console.log("User exists:", userDoc.exists);
 const paymentDoc = await db
     .collection("paymentReferences")
     .doc(paymentReference)
