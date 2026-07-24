@@ -50,7 +50,7 @@ app.post("/api/create-payment", async (req, res) => {
             customerEmail,
             uid
         } = req.body;
-
+console.log("UID received from frontend:", uid);
         if (!amount || !customerName || !customerEmail || !uid) {
 
             return res.status(400).json({
