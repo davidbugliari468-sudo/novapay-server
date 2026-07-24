@@ -4,7 +4,7 @@ const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
 const { v4: uuidv4 } = require("uuid");
-
+const { db, admin } = require("./firebase-admin");
 const {
     getAccessToken,
     CONTRACT_CODE,
@@ -47,10 +47,11 @@ app.post("/api/create-payment", async (req, res) => {
         const {
             amount,
             customerName,
-            customerEmail
+            customerEmail,
+            uid
         } = req.body;
 
-        if (!amount || !customerName || !customerEmail) {
+        if (!amount || !customerName || !customerEmail || !uid) {
 
             return res.status(400).json({
                 success: false,
@@ -62,6 +63,16 @@ app.post("/api/create-payment", async (req, res) => {
         const accessToken = await getAccessToken();
 
         const paymentReference = uuidv4();
+
+        await db.collection("paymentReferences")
+            .doc(paymentReference)
+            .set({
+                uid,
+                customerEmail,
+                amount: Number(amount),
+                status: "PENDING",
+                createdAt: admin.firestore.FieldValue.serverTimestamp()
+            });
 
         const response = await axios.post(
 
@@ -194,8 +205,110 @@ app.post("/api/monnify/webhook", async (req, res) => {
         console.log(JSON.stringify(req.body, null, 2));
         console.log("========================================");
 
-        return res.status(200).send("OK");
+        const { eventType, eventData } = req.body;
 
+if (eventType !== "SUCCESSFUL_TRANSACTION") {
+
+    return res.status(200).send("IGNORED");
+
+}
+
+if (!eventData || eventData.paymentStatus !== "PAID") {
+
+    return res.status(200).send("IGNORED");
+
+}
+
+const paymentReference = eventData.paymentReference;
+const paymentDoc = await db
+    .collection("paymentReferences")
+    .doc(paymentReference)
+    .get();
+
+if (!paymentDoc.exists) {
+
+    console.log("Payment reference not found.");
+
+    return res.status(200).send("NOT FOUND");
+
+}
+
+const paymentData = paymentDoc.data();
+if (paymentData.status === "COMPLETED") {
+
+    console.log("Payment already processed.");
+
+    return res.status(200).send("ALREADY PROCESSED");
+
+}
+
+const uid = paymentData.uid;
+
+const amount = Number(eventData.amountPaid);
+const userRef = db.collection("users").doc(uid);
+
+const userDoc = await userRef.get();
+
+if (!userDoc.exists) {
+
+    console.log("User not found.");
+
+    return res.status(200).send("USER NOT FOUND");
+
+}
+
+const userData = userDoc.data();
+
+const currentBalance =
+    Number(userData.walletBalance || 0);
+
+const newBalance =
+    currentBalance + amount;
+
+await userRef.update({
+
+    walletBalance: newBalance,
+
+    updatedAt:
+        admin.firestore.FieldValue.serverTimestamp()
+
+});
+await paymentDoc.ref.update({
+
+    status: "COMPLETED",
+
+    completedAt:
+        admin.firestore.FieldValue.serverTimestamp(),
+
+    transactionReference:
+        eventData.transactionReference
+
+});
+
+await db.collection("transactions").add({
+
+    uid,
+
+    type: "DEPOSIT",
+
+    amount,
+
+    status: "SUCCESS",
+
+    paymentReference,
+
+    transactionReference:
+        eventData.transactionReference,
+
+    paymentMethod:
+        eventData.paymentMethod,
+
+    createdAt:
+        admin.firestore.FieldValue.serverTimestamp()
+
+});
+
+return res.status(200).send("OK");
     } catch (error) {
 
         console.error(error);
