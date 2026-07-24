@@ -207,132 +207,124 @@ app.post("/api/monnify/webhook", async (req, res) => {
 
         const { eventType, eventData } = req.body;
 
-if (eventType !== "SUCCESSFUL_TRANSACTION") {
+        if (eventType !== "SUCCESSFUL_TRANSACTION") {
+            return res.status(200).send("IGNORED");
+        }
 
-    return res.status(200).send("IGNORED");
+        if (!eventData || eventData.paymentStatus !== "PAID") {
+            return res.status(200).send("IGNORED");
+        }
 
-}
+        const paymentReference = eventData.paymentReference;
 
-if (!eventData || eventData.paymentStatus !== "PAID") {
+        console.log("Webhook paymentReference:", paymentReference);
 
-    return res.status(200).send("IGNORED");
+        const paymentDoc = await db
+            .collection("paymentReferences")
+            .doc(paymentReference)
+            .get();
 
-}
+        console.log("Payment doc exists:", paymentDoc.exists);
 
-const paymentReference = eventData.paymentReference;
-const paymentReference = eventData.paymentReference;
+        if (!paymentDoc.exists) {
 
-console.log("Webhook paymentReference:", paymentReference);
+            console.log("Payment reference not found.");
 
-const paymentDoc = await db
-    .collection("paymentReferences")
-    .doc(paymentReference)
-    .get();
+            return res.status(200).send("NOT FOUND");
 
-console.log("Payment doc exists:", paymentDoc.exists);
+        }
 
-const paymentData = paymentDoc.data();
-console.log("Payment data:", paymentData);
+        const paymentData = paymentDoc.data();
 
-const uid = paymentData.uid;
-console.log("UID:", uid);
+        console.log("Payment data:", paymentData);
 
-const userRef = db.collection("users").doc(uid);
-const userDoc = await userRef.get();
+        if (paymentData.status === "COMPLETED") {
 
-console.log("User exists:", userDoc.exists);
-const paymentDoc = await db
-    .collection("paymentReferences")
-    .doc(paymentReference)
-    .get();
+            console.log("Payment already processed.");
 
-if (!paymentDoc.exists) {
+            return res.status(200).send("ALREADY PROCESSED");
 
-    console.log("Payment reference not found.");
+        }
 
-    return res.status(200).send("NOT FOUND");
+        const uid = paymentData.uid;
 
-}
+        console.log("UID:", uid);
 
-const paymentData = paymentDoc.data();
-if (paymentData.status === "COMPLETED") {
+        const amount = Number(eventData.amountPaid);
 
-    console.log("Payment already processed.");
+        const userRef = db.collection("users").doc(uid);
 
-    return res.status(200).send("ALREADY PROCESSED");
+        const userDoc = await userRef.get();
 
-}
+        console.log("User exists:", userDoc.exists);
 
-const uid = paymentData.uid;
+        if (!userDoc.exists) {
 
-const amount = Number(eventData.amountPaid);
-const userRef = db.collection("users").doc(uid);
+            console.log("User not found.");
 
-const userDoc = await userRef.get();
+            return res.status(200).send("USER NOT FOUND");
 
-if (!userDoc.exists) {
+        }
 
-    console.log("User not found.");
+        const userData = userDoc.data();
 
-    return res.status(200).send("USER NOT FOUND");
+        const currentBalance =
+            Number(userData.walletBalance || 0);
 
-}
+        const newBalance =
+            currentBalance + amount;
 
-const userData = userDoc.data();
+        await userRef.update({
 
-const currentBalance =
-    Number(userData.walletBalance || 0);
+            walletBalance: newBalance,
 
-const newBalance =
-    currentBalance + amount;
+            updatedAt:
+                admin.firestore.FieldValue.serverTimestamp()
 
-await userRef.update({
+        });
 
-    walletBalance: newBalance,
+        await paymentDoc.ref.update({
 
-    updatedAt:
-        admin.firestore.FieldValue.serverTimestamp()
+            status: "COMPLETED",
 
-});
-await paymentDoc.ref.update({
+            completedAt:
+                admin.firestore.FieldValue.serverTimestamp(),
 
-    status: "COMPLETED",
+            transactionReference:
+                eventData.transactionReference
 
-    completedAt:
-        admin.firestore.FieldValue.serverTimestamp(),
+        });
 
-    transactionReference:
-        eventData.transactionReference
+        await db.collection("transactions").add({
 
-});
+            uid,
 
-await db.collection("transactions").add({
+            type: "DEPOSIT",
 
-    uid,
+            amount,
 
-    type: "DEPOSIT",
+            status: "SUCCESS",
 
-    amount,
+            paymentReference,
 
-    status: "SUCCESS",
+            transactionReference:
+                eventData.transactionReference,
 
-    paymentReference,
+            paymentMethod:
+                eventData.paymentMethod,
 
-    transactionReference:
-        eventData.transactionReference,
+            createdAt:
+                admin.firestore.FieldValue.serverTimestamp()
 
-    paymentMethod:
-        eventData.paymentMethod,
+        });
 
-    createdAt:
-        admin.firestore.FieldValue.serverTimestamp()
+        console.log("Wallet updated successfully.");
 
-});
+        return res.status(200).send("OK");
 
-return res.status(200).send("OK");
     } catch (error) {
 
-        console.error(error);
+        console.error("WEBHOOK ERROR:", error);
 
         return res.status(500).send("Webhook Error");
 
