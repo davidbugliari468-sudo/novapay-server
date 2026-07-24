@@ -135,7 +135,25 @@ app.post("/api/verify-payment", async (req, res) => {
         res.status(500).json({
             success: false,
             message: "Unable to verify payment."
-        });
+        }); 
+        app.post("/api/monnify/webhook", async (req, res) => {
+
+    try {
+
+        console.log("Webhook Received:");
+        console.log(JSON.stringify(req.body, null, 2));
+
+        res.status(200).send("OK");
+
+    } catch (error) {
+
+        console.error(error);
+
+        res.status(500).send("Webhook Error");
+
+    }
+
+});
     }
 });
 const PORT = process.env.PORT || 10000;
