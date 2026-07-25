@@ -86,7 +86,7 @@ console.log("UID received from frontend:", uid);
                 paymentDescription: "NovaPay Wallet Funding",
                 currencyCode: "NGN",
                 contractCode: CONTRACT_CODE,
-                redirectUrl: "https://davidbugliari468-sudo.github.io/payment-success.html",
+                redirectUrl: "https://davidbugliari468-sudo.github.io/NovaPay/payment-success.html",
                 paymentMethods: [
                     "CARD",
                     "ACCOUNT_TRANSFER",
