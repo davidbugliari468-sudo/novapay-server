@@ -331,6 +331,145 @@ app.post("/api/monnify/webhook", async (req, res) => {
     }
 
 });
+/*
+|--------------------------------------------------------------------------
+| Buy Airtime (Mock)
+|--------------------------------------------------------------------------
+*/
+
+app.post("/api/buy-airtime", async (req, res) => {
+
+    try {
+
+        const {
+
+            uid,
+
+            network,
+
+            phone,
+
+            amount
+
+        } = req.body;
+
+        if (
+
+            !uid ||
+
+            !network ||
+
+            !phone ||
+
+            !amount
+
+        ) {
+
+            return res.status(400).json({
+
+                success: false,
+
+                message: "Missing required fields."
+
+            });
+
+        }
+
+        const userRef = db.collection("users").doc(uid);
+
+const userDoc = await userRef.get();
+
+if (!userDoc.exists) {
+
+    return res.status(404).json({
+
+        success: false,
+
+        message: "User not found."
+
+    });
+
+}
+
+const userData = userDoc.data();
+
+const walletBalance =
+    Number(userData.walletBalance || 0); 
+    if (walletBalance < Number(amount)) {
+
+    return res.status(400).json({
+
+        success: false,
+
+        message: "Insufficient wallet balance."
+
+    });
+
+}
+
+        const newBalance =
+    walletBalance - Number(amount);
+
+await userRef.update({
+
+    walletBalance: newBalance,
+
+    updatedAt:
+        admin.firestore.FieldValue.serverTimestamp()
+
+});
+
+const reference =
+    "NP-" + Date.now();
+
+await db.collection("transactions").add({
+
+    uid,
+
+    type: "AIRTIME",
+
+    network,
+
+    phone,
+
+    amount: Number(amount),
+
+    status: "SUCCESS",
+
+    reference,
+
+    createdAt:
+        admin.firestore.FieldValue.serverTimestamp()
+
+});
+
+return res.json({
+
+    success: true,
+
+    message: "Mock airtime purchase successful.",
+
+    newBalance,
+
+    reference
+
+});
+
+    } catch (error) {
+
+        console.error(error);
+
+        return res.status(500).json({
+
+            success: false,
+
+            message: "Unable to process airtime purchase."
+
+        });
+
+    }
+
+});
 
 /*
 |--------------------------------------------------------------------------
