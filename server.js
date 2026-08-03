@@ -10,7 +10,10 @@ const {
     CONTRACT_CODE,
     BASE_URL
 } = require("./monnify");
-
+const {
+    getVTUToken,
+    VTU_BASE_URL
+} = require("./vtu");
 console.log("BASE_URL:", BASE_URL);
 console.log("CONTRACT_CODE:", CONTRACT_CODE);
 
@@ -471,7 +474,9 @@ return res.json({
 
 });
 
-/*
+/*app.get("/api/vtu/test", async (req, res) => {
+    ...
+});
 |--------------------------------------------------------------------------
 | Start Server
 |--------------------------------------------------------------------------
