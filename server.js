@@ -519,9 +519,15 @@ app.get("/api/vtu/wallet", async (req, res) => {
 
         const response = await axios.get(
 
-            `${VTU_BASE_URL}/api/v2/wallet`,
+    `${VTU_BASE_URL}/api/v2/balance`,
 
-            {
+    {
+        headers: {
+            Authorization: `Bearer ${token}`
+        }
+    }
+
+);
 
                 headers: {
 
