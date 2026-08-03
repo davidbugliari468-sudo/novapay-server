@@ -505,6 +505,51 @@ app.get("/api/vtu/test", async (req, res) => {
     }
 
 });
+/*
+|--------------------------------------------------------------------------
+| VTU Wallet Balance
+|--------------------------------------------------------------------------
+*/
+
+app.get("/api/vtu/wallet", async (req, res) => {
+
+    try {
+
+        const token = await getVTUToken();
+
+        const response = await axios.get(
+
+            `${VTU_BASE_URL}/api/v2/wallet`,
+
+            {
+
+                headers: {
+
+                    Authorization: `Bearer ${token}`
+
+                }
+
+            }
+
+        );
+
+        return res.json(response.data);
+
+    } catch (error) {
+
+        console.error(error.response?.data || error.message);
+
+        return res.status(500).json({
+
+            success: false,
+
+            error: error.response?.data || error.message
+
+        });
+
+    }
+
+});
 
 /*
 |--------------------------------------------------------------------------
