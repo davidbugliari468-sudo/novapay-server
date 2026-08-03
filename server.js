@@ -519,22 +519,12 @@ app.get("/api/vtu/wallet", async (req, res) => {
 
         const response = await axios.get(
 
-    `${VTU_BASE_URL}/api/v2/balance`,
+            `${VTU_BASE_URL}/api/v2/balance`,
 
-    {
-        headers: {
-            Authorization: `Bearer ${token}`
-        }
-    }
-
-);
-
+            {
                 headers: {
-
                     Authorization: `Bearer ${token}`
-
                 }
-
             }
 
         );
@@ -543,13 +533,16 @@ app.get("/api/vtu/wallet", async (req, res) => {
 
     } catch (error) {
 
-        console.error(error.response?.data || error.message);
+        console.error(
+            error.response?.data || error.message
+        );
 
         return res.status(500).json({
 
             success: false,
 
-            error: error.response?.data || error.message
+            error:
+                error.response?.data || error.message
 
         });
 
