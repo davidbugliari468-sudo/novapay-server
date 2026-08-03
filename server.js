@@ -474,9 +474,39 @@ return res.json({
 
 });
 
-/*app.get("/api/vtu/test", async (req, res) => {
-    ...
+/*
+|--------------------------------------------------------------------------
+| Test VTU Authentication
+|--------------------------------------------------------------------------
+*/
+
+app.get("/api/vtu/test", async (req, res) => {
+
+    try {
+
+        const token = await getVTUToken();
+
+        return res.json({
+            success: true,
+            message: "VTU authentication successful.",
+            token
+        });
+
+    } catch (error) {
+
+        console.error(error.response?.data || error.message);
+
+        return res.status(500).json({
+            success: false,
+            message: "VTU authentication failed.",
+            error: error.response?.data || error.message
+        });
+
+    }
+
 });
+
+/*
 |--------------------------------------------------------------------------
 | Start Server
 |--------------------------------------------------------------------------
@@ -485,7 +515,5 @@ return res.json({
 const PORT = process.env.PORT || 10000;
 
 app.listen(PORT, () => {
-
     console.log(`🚀 NovaPay Backend running on port ${PORT}`);
-
 });
