@@ -342,76 +342,82 @@ app.post("/api/monnify/webhook", async (req, res) => {
 
 app.post("/api/buy-airtime", async (req, res) => {
 
-    try {
+        try {
 
         const {
-
             uid,
-
-            network,
-
             phone,
-
+            network,
             amount
-
         } = req.body;
 
-        if (
-
-            !uid ||
-
-            !network ||
-
-            !phone ||
-
-            !amount
-
-        ) {
+        if (!uid || !phone || !network || !amount) {
 
             return res.status(400).json({
-
                 success: false,
-
                 message: "Missing required fields."
-
             });
 
         }
 
         const userRef = db.collection("users").doc(uid);
+        const userDoc = await userRef.get();
 
-const userDoc = await userRef.get();
+        if (!userDoc.exists) {
 
-if (!userDoc.exists) {
+            return res.status(404).json({
+                success: false,
+                message: "User not found."
+            });
 
-    return res.status(404).json({
+        }
 
-        success: false,
+        const userData = userDoc.data();
 
-        message: "User not found."
+        const walletBalance = Number(
+            userData.walletBalance || 0
+        );
 
-    });
+        if (walletBalance < Number(amount)) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Insufficient wallet balance."
+            });
+
+        }
+
+        const token = await getVTUToken();
+
+        const request_id = "NP-" + Date.now();
+const response = await axios.post(
+
+    `${VTU_BASE_URL}/api/v2/airtime`,
+
+    {
+        request_id,
+        phone,
+        service_id: network.toLowerCase(),
+        amount: Number(amount)
+    },
+
+    {
+        headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json"
+        }
+    }
+
+);
+
+const result = response.data;
+if (result.code !== "success") {
+
+    return res.status(400).json(result);
 
 }
 
-const userData = userDoc.data();
-
-const walletBalance =
-    Number(userData.walletBalance || 0); 
-    if (walletBalance < Number(amount)) {
-
-    return res.status(400).json({
-
-        success: false,
-
-        message: "Insufficient wallet balance."
-
-    });
-
-}
-
-        const newBalance =
-    walletBalance - Number(amount);
+const newBalance = walletBalance - Number(amount);
 
 await userRef.update({
 
@@ -421,9 +427,6 @@ await userRef.update({
         admin.firestore.FieldValue.serverTimestamp()
 
 });
-
-const reference =
-    "NP-" + Date.now();
 
 await db.collection("transactions").add({
 
@@ -439,7 +442,9 @@ await db.collection("transactions").add({
 
     status: "SUCCESS",
 
-    reference,
+    reference: request_id,
+
+    provider: "VTU.ng",
 
     createdAt:
         admin.firestore.FieldValue.serverTimestamp()
@@ -450,30 +455,31 @@ return res.json({
 
     success: true,
 
-    message: "Mock airtime purchase successful.",
+    message: "Airtime purchase successful.",
 
-    newBalance,
+    walletBalance: newBalance,
 
-    reference
-
-});
-
-    } catch (error) {
-
-        console.error(error);
-
-        return res.status(500).json({
-
-            success: false,
-
-            message: "Unable to process airtime purchase."
-
-        });
-
-    }
+    vtu: result
 
 });
 
+} catch (error) {
+
+    console.error(error.response?.data || error.message);
+
+    return res.status(500).json({
+
+        success: false,
+
+        message: "Unable to purchase airtime.",
+
+        error: error.response?.data || error.message
+
+    });
+
+}
+
+});
 /*
 |--------------------------------------------------------------------------
 | Test VTU Authentication
