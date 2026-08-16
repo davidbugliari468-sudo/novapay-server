@@ -13,4 +13,53 @@ if (!admin.apps.length) {
 
 const db = admin.firestore();
 
-module.exports = { admin, db };
+/**
+ * Verify Firebase ID token sent by the frontend.
+ *
+ * The frontend must send:
+ * Authorization: Bearer <Firebase ID token>
+ */
+async function verifyFirebaseToken(req, res, next) {
+  try {
+    const authHeader = req.headers.authorization || "";
+
+    if (!authHeader.startsWith("Bearer ")) {
+      return res.status(401).json({
+        success: false,
+        message: "Authentication required",
+      });
+    }
+
+    const idToken = authHeader.substring(7).trim();
+
+    if (!idToken) {
+      return res.status(401).json({
+        success: false,
+        message: "Authentication token missing",
+      });
+    }
+
+    const decodedToken = await admin.auth().verifyIdToken(idToken);
+
+    // IMPORTANT:
+    // We get the UID from Firebase's verified token.
+    // We do NOT trust a UID supplied by the frontend.
+    req.user = decodedToken;
+    req.uid = decodedToken.uid;
+
+    next();
+  } catch (error) {
+    console.error("Firebase authentication error:", error.message);
+
+    return res.status(401).json({
+      success: false,
+      message: "Invalid or expired authentication token",
+    });
+  }
+}
+
+module.exports = {
+  admin,
+  db,
+  verifyFirebaseToken,
+};
