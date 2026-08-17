@@ -162,6 +162,7 @@ app.get("/", (req, res) => {
         message:
             "NovaPay Backend V2 is running 🚀"
     });
+
 });
 
 app.get("/health", (req, res) => {
@@ -176,6 +177,7 @@ app.get("/health", (req, res) => {
             "NovaPay Backend V2"
 
     });
+
 });
 
 // ==========================================
@@ -207,6 +209,7 @@ app.post(
                         "Invalid payment amount."
 
                 });
+
             }
 
             const paymentAmount =
@@ -240,6 +243,7 @@ app.post(
                         "Authenticated user information is incomplete."
 
                 });
+
             }
 
             // ------------------------------
@@ -342,6 +346,7 @@ app.post(
                         timeout: 15000
 
                     }
+
                 );
 
             const checkoutUrl =
@@ -379,6 +384,7 @@ app.post(
                         "Unable to create payment."
 
                 });
+
             }
 
             return res.json({
@@ -403,7 +409,9 @@ app.post(
                     "Unable to create payment right now. Please try again."
 
             });
+
         }
+
     }
 );
 
@@ -436,6 +444,7 @@ app.post(
                         "Payment reference is required."
 
                 });
+
             }
 
             // ------------------------------
@@ -462,6 +471,7 @@ app.post(
                         "Payment not found."
 
                 });
+
             }
 
             const paymentData =
@@ -484,6 +494,7 @@ app.post(
                         "You are not authorized to access this payment."
 
                 });
+
             }
 
             // ------------------------------
@@ -508,6 +519,7 @@ app.post(
                         true
 
                 });
+
             }
 
             // ------------------------------
@@ -534,6 +546,7 @@ app.post(
                         timeout: 15000
 
                     }
+
                 );
 
             const transaction =
@@ -550,6 +563,7 @@ app.post(
                         "Unable to verify payment."
 
                 });
+
             }
 
             const paidAmount =
@@ -565,6 +579,14 @@ app.post(
             // ------------------------------
             // PAYMENT MUST BE PAID
             // AND AMOUNT MUST MATCH
+            //
+            // IMPORTANT:
+            // This endpoint ONLY verifies.
+            //
+            // It does NOT credit the wallet.
+            //
+            // The Monnify webhook is responsible
+            // for the authoritative wallet credit.
             // ------------------------------
 
             if (
@@ -586,6 +608,7 @@ app.post(
                     transaction
 
                 });
+
             }
 
             return res.json({
@@ -614,10 +637,11 @@ app.post(
                     "Unable to verify payment right now."
 
             });
-        }
-    }
-);
 
+        }
+
+    }
+); 
 // ==========================================
 // MONNIFY WEBHOOK
 // ==========================================
@@ -626,6 +650,12 @@ app.post(
 // Firebase authentication is NOT used here.
 //
 // Instead we verify Monnify's signature.
+//
+// IMPORTANT:
+// The webhook is the authoritative place where
+// a successful Monnify payment credits the wallet.
+//
+// /api/verify-payment NEVER credits the wallet.
 // ==========================================
 
 app.post(
@@ -653,10 +683,12 @@ app.post(
                     );
             }
 
+
             const {
                 eventType,
                 eventData
             } = req.body;
+
 
             // ------------------------------
             // ONLY PROCESS SUCCESS EVENTS
@@ -672,6 +704,7 @@ app.post(
                     .send("IGNORED");
             }
 
+
             if (
                 !eventData ||
                 eventData.paymentStatus !==
@@ -683,8 +716,10 @@ app.post(
                     .send("IGNORED");
             }
 
+
             const paymentReference =
                 eventData.paymentReference;
+
 
             if (!paymentReference) {
 
@@ -695,12 +730,14 @@ app.post(
                     );
             }
 
+
             const paymentRef =
                 db
                     .collection(
                         "paymentReferences"
                     )
                     .doc(paymentReference);
+
 
             // ------------------------------
             // ATOMIC PAYMENT PROCESSING
@@ -714,6 +751,7 @@ app.post(
                             paymentRef
                         );
 
+
                     if (
                         !paymentDoc.exists
                     ) {
@@ -723,8 +761,10 @@ app.post(
                         );
                     }
 
+
                     const paymentData =
                         paymentDoc.data();
+
 
                     // --------------------------
                     // DUPLICATE PROTECTION
@@ -738,6 +778,7 @@ app.post(
                         return;
                     }
 
+
                     // --------------------------
                     // VERIFY AMOUNT
                     // --------------------------
@@ -747,10 +788,12 @@ app.post(
                             paymentData.amount
                         );
 
+
                     const paidAmount =
                         normalizeAmount(
                             eventData.amountPaid
                         );
+
 
                     if (
                         paidAmount !==
@@ -762,8 +805,10 @@ app.post(
                         );
                     }
 
+
                     const uid =
                         paymentData.uid;
+
 
                     if (!uid) {
 
@@ -772,15 +817,18 @@ app.post(
                         );
                     }
 
+
                     const userRef =
                         db
                             .collection("users")
                             .doc(uid);
 
+
                     const userDoc =
                         await transaction.get(
                             userRef
                         );
+
 
                     if (
                         !userDoc.exists
@@ -791,8 +839,10 @@ app.post(
                         );
                     }
 
+
                     const userData =
                         userDoc.data();
+
 
                     const currentBalance =
                         normalizeAmount(
@@ -800,11 +850,13 @@ app.post(
                             0
                         );
 
+
                     const newBalance =
                         normalizeAmount(
                             currentBalance +
                             paidAmount
                         );
+
 
                     // --------------------------
                     // CREDIT WALLET
@@ -824,6 +876,7 @@ app.post(
 
                         }
                     );
+
 
                     // --------------------------
                     // MARK PAYMENT COMPLETED
@@ -855,6 +908,7 @@ app.post(
                         }
                     );
 
+
                     // --------------------------
                     // CREATE DETERMINISTIC
                     // DEPOSIT TRANSACTION
@@ -868,6 +922,7 @@ app.post(
                             .doc(
                                 `deposit_${paymentReference}`
                             );
+
 
                     transaction.set(
                         depositRef,
@@ -904,12 +959,15 @@ app.post(
                             merge: false
                         }
                     );
+
                 }
             );
+
 
             return res
                 .status(200)
                 .send("OK");
+
 
         } catch (error) {
 
@@ -922,6 +980,7 @@ app.post(
                     .status(200)
                     .send("NOT FOUND");
             }
+
 
             if (
                 error.message ===
@@ -939,6 +998,7 @@ app.post(
                     );
             }
 
+
             if (
                 error.message ===
                 "USER_NOT_FOUND"
@@ -951,10 +1011,29 @@ app.post(
                     );
             }
 
+
+            if (
+                error.message ===
+                "USER_MISSING"
+            ) {
+
+                console.error(
+                    "Monnify payment has no associated user."
+                );
+
+                return res
+                    .status(500)
+                    .send(
+                        "User missing"
+                    );
+            }
+
+
             console.error(
                 "MONNIFY WEBHOOK ERROR:",
                 error.message
             );
+
 
             return res
                 .status(500)
@@ -962,8 +1041,10 @@ app.post(
                     "Webhook Error"
                 );
         }
+
     }
 );
+
 
 // ==========================================
 // BUY AIRTIME
@@ -971,19 +1052,21 @@ app.post(
 //
 // IMPORTANT:
 //
-// We reserve/debit the user's wallet BEFORE
-// calling the provider.
+// 1. Authenticate Firebase user.
+// 2. Validate request.
+// 3. Check wallet balance.
+// 4. Debit wallet atomically.
+// 5. Create PENDING transaction.
+// 6. Call VTU provider.
 //
-// If the provider response is unknown,
-// we keep the transaction PENDING instead
-// of automatically refunding.
+// The provider is called ONLY AFTER the wallet
+// debit succeeds.
 //
-// This prevents us from accidentally giving
-// airtime and refunding the user when the
-// provider actually completed the purchase.
+// If provider result is uncertain, transaction
+// remains PENDING.
 //
-// A reconciliation system can resolve
-// PENDING transactions later.
+// The reconciliation worker added later will
+// check VTU.ng and resolve the transaction.
 // ==========================================
 
 app.post(
@@ -992,7 +1075,9 @@ app.post(
     async (req, res) => {
 
         let transactionId = null;
+
         let userRef = null;
+
 
         try {
 
@@ -1002,17 +1087,21 @@ app.post(
                 amount
             } = req.body;
 
+
             const cleanPhone =
                 String(phone || "")
                     .trim();
+
 
             const cleanNetwork =
                 String(network || "")
                     .trim()
                     .toLowerCase();
 
+
             const purchaseAmount =
                 normalizeAmount(amount);
+
 
             // ------------------------------
             // VALIDATE PHONE
@@ -1034,16 +1123,23 @@ app.post(
                 });
             }
 
+
             // ------------------------------
             // VALIDATE NETWORK
             // ------------------------------
 
             const allowedNetworks = [
+
                 "mtn",
+
                 "glo",
+
                 "airtel",
+
                 "9mobile"
+
             ];
+
 
             if (
                 !allowedNetworks.includes(
@@ -1060,6 +1156,7 @@ app.post(
 
                 });
             }
+
 
             // ------------------------------
             // VALIDATE AMOUNT
@@ -1082,13 +1179,16 @@ app.post(
                 });
             }
 
+
             const uid =
                 req.uid;
+
 
             userRef =
                 db
                     .collection("users")
                     .doc(uid);
+
 
             // ------------------------------
             // CREATE UNIQUE REFERENCE
@@ -1096,6 +1196,7 @@ app.post(
 
             transactionId =
                 `airtime_${crypto.randomUUID()}`;
+
 
             // ------------------------------
             // RESERVE WALLET FUNDS
@@ -1109,6 +1210,7 @@ app.post(
                             userRef
                         );
 
+
                     if (
                         !userDoc.exists
                     ) {
@@ -1118,14 +1220,17 @@ app.post(
                         );
                     }
 
+
                     const userData =
                         userDoc.data();
+
 
                     const balance =
                         normalizeAmount(
                             userData.walletBalance ||
                             0
                         );
+
 
                     if (
                         balance <
@@ -1137,11 +1242,13 @@ app.post(
                         );
                     }
 
+
                     const newBalance =
                         normalizeAmount(
                             balance -
                             purchaseAmount
                         );
+
 
                     // --------------------------
                     // DEBIT WALLET
@@ -1162,8 +1269,10 @@ app.post(
                         }
                     );
 
+
                     // --------------------------
-                    // CREATE PENDING TRANSACTION
+                    // CREATE PENDING
+                    // TRANSACTION
                     // --------------------------
 
                     const transactionRef =
@@ -1174,6 +1283,7 @@ app.post(
                             .doc(
                                 transactionId
                             );
+
 
                     transaction.set(
                         transactionRef,
@@ -1209,8 +1319,10 @@ app.post(
 
                         }
                     );
+
                 }
             );
+
 
             // ------------------------------
             // CALL VTU PROVIDER
@@ -1218,6 +1330,7 @@ app.post(
 
             const token =
                 await getVTUToken();
+
 
             const providerResponse =
                 await axios.post(
@@ -1255,145 +1368,27 @@ app.post(
                         timeout: 20000
 
                     }
+
                 );
+
 
             const result =
                 providerResponse.data;
 
-            // ------------------------------
-            // PROVIDER SUCCESS
-            // ------------------------------
-
-            if (
-                result?.code ===
-                "success"
-            ) {
-
-                await db.runTransaction(
-                    async (transaction) => {
-
-                        const transactionRef =
-                            db
-                                .collection(
-                                    "transactions"
-                                )
-                                .doc(
-                                    transactionId
-                                );
-
-                        const transactionDoc =
-                            await transaction.get(
-                                transactionRef
-                            );
-
-                        if (
-                            !transactionDoc.exists
-                        ) {
-
-                            throw new Error(
-                                "TRANSACTION_NOT_FOUND"
-                            );
-                        }
-
-                        const transactionData =
-                            transactionDoc.data();
-
-                        /*
-                         * Idempotency:
-                         * if already successful,
-                         * don't process again.
-                         */
-                        if (
-                            transactionData.status ===
-                            "SUCCESS"
-                        ) {
-
-                            return;
-                        }
-
-                        transaction.update(
-                            transactionRef,
-                            {
-
-                                status:
-                                    "SUCCESS",
-
-                                providerResponse:
-                                    {
-                                        code:
-                                            result.code
-                                    },
-
-                                completedAt:
-                                    admin.firestore
-                                        .FieldValue
-                                        .serverTimestamp()
-
-                            }
-                        );
-                    }
-                );
-
-                /*
-                 * Wallet was already safely
-                 * reserved before provider call.
-                 *
-                 * Return success.
-                 */
-                const latestUser =
-                    await userRef.get();
-
-                const latestBalance =
-                    normalizeAmount(
-                        latestUser.data()
-                            ?.walletBalance || 0
-                    );
-
-                return res.json({
-
-                    success: true,
-
-                    message:
-                        "Airtime purchase successful.",
-
-                    walletBalance:
-                        latestBalance,
-
-                    reference:
-                        transactionId
-
-                });
-            }
 
             // ------------------------------
-            // UNKNOWN / NON-SUCCESS RESPONSE
-            // ------------------------------
-            //
-            // We DO NOT automatically refund here.
-            //
-            // We don't have enough information from
-            // the provider module to safely classify
-            // every non-success response as a final
-            // failure.
-            //
-            // Keep the transaction PENDING for
-            // reconciliation.
+            // STORE PROVIDER RESPONSE
             // ------------------------------
 
             await db
-                .collection("transactions")
+                .collection(
+                    "transactions"
+                )
                 .doc(transactionId)
                 .update({
 
-                    status:
-                        "PENDING",
-
                     providerResponse:
-                        {
-                            code:
-                                result?.code ||
-                                null
-                        },
+                        result || null,
 
                     updatedAt:
                         admin.firestore
@@ -1401,6 +1396,29 @@ app.post(
                             .serverTimestamp()
 
                 });
+
+
+            // ------------------------------
+            // IMPORTANT
+            // ------------------------------
+            //
+            // DO NOT mark SUCCESS merely because
+            // VTU returned:
+            //
+            //     code: "success"
+            //
+            // VTU can return success while the
+            // order is still processing.
+            //
+            // The next section of the rebuilt
+            // backend will inspect the provider
+            // status and only finalize the purchase
+            // when the provider confirms completion.
+            //
+            // Otherwise the transaction remains
+            // PENDING for reconciliation.
+            // ------------------------------
+
 
             return res.status(202).json({
 
@@ -1415,6 +1433,7 @@ app.post(
                     transactionId
 
             });
+
 
         } catch (error) {
 
@@ -1437,6 +1456,7 @@ app.post(
                 });
             }
 
+
             // ------------------------------
             // INSUFFICIENT BALANCE
             // ------------------------------
@@ -1456,21 +1476,27 @@ app.post(
                 });
             }
 
-            /*
-             * IMPORTANT:
-             *
-             * If transactionId exists, the wallet
-             * may already have been reserved.
-             *
-             * We DO NOT automatically refund here
-             * because the provider request may have
-             * reached VTU before a timeout/error.
-             *
-             * Keep it PENDING for reconciliation.
-             */
-            if (
-                transactionId
-            ) {
+
+            // ------------------------------
+            // PROVIDER ERROR
+            // ------------------------------
+            //
+            // IMPORTANT:
+            // The wallet was already debited and
+            // the transaction is already PENDING.
+            //
+            // We DO NOT refund here because we do
+            // not yet know whether VTU processed
+            // the order.
+            //
+            // The reconciliation worker will
+            // requery VTU using transactionId.
+            // ------------------------------
+
+            safeProviderError(error);
+
+
+            if (transactionId) {
 
                 try {
 
@@ -1484,6 +1510,11 @@ app.post(
                             status:
                                 "PENDING",
 
+                            providerError:
+                                error?.response?.data ||
+                                error?.message ||
+                                "Provider request failed",
+
                             updatedAt:
                                 admin.firestore
                                     .FieldValue
@@ -1492,45 +1523,774 @@ app.post(
                         });
 
                 } catch (
-                    transactionUpdateError
+                    updateError
                 ) {
 
                     console.error(
-                        "Unable to mark transaction pending:",
-                        transactionUpdateError.message
+                        "Unable to update pending airtime transaction:",
+                        updateError
                     );
+
                 }
 
-                safeProviderError(error);
-
-                return res.status(202).json({
-
-                    success: false,
-
-                    pending: true,
-
-                    message:
-                        "Your airtime request is being processed. Please check your transaction history shortly.",
-
-                    reference:
-                        transactionId
-
-                });
             }
 
-            safeProviderError(error);
 
-            return res.status(500).json({
+            return res.status(202).json({
 
                 success: false,
 
+                pending: true,
+
                 message:
-                    "Unable to complete airtime purchase."
+                    "Your airtime request is being processed. Please check your transaction history shortly.",
+
+                reference:
+                    transactionId
 
             });
+
         }
+
     }
+); 
+// ==========================================
+// AUTOMATIC AIRTIME RECONCILIATION
+// ==========================================
+//
+// Purpose:
+//
+// A user's wallet is debited BEFORE the VTU
+// provider is called.
+//
+// If the provider does not give us a definite
+// final result, the NovaPay transaction remains
+// PENDING.
+//
+// This worker periodically asks VTU.ng for the
+// actual order status using the original
+// request_id.
+//
+// FINAL SUCCESS:
+//     completed-api
+//
+// FINAL FAILURE / REFUND:
+//     refunded
+//     failed
+//     cancelled
+//
+// STILL PROCESSING:
+//     processing-api
+//     queued-api
+//     initiated-api
+//     pending
+//     on-hold
+//
+// We NEVER refund merely because a request
+// timed out or because requery temporarily fails.
+// ==========================================
+
+
+const RECONCILIATION_INTERVAL_MS =
+    60 * 1000;
+
+
+const RECONCILIATION_START_DELAY_MS =
+    10 * 1000;
+
+
+const RECONCILIATION_BATCH_SIZE =
+    25;
+
+
+// ==========================================
+// PROVIDER STATUS HELPERS
+// ==========================================
+
+function getProviderOrderStatus(
+    providerResponse
+) {
+
+    const status =
+        providerResponse
+            ?.data
+            ?.status;
+
+    return String(
+        status || ""
+    )
+        .trim()
+        .toLowerCase();
+
+}
+
+
+function isProviderSuccessStatus(
+    status
+) {
+
+    return (
+        status ===
+        "completed-api"
+    );
+
+}
+
+
+function isProviderFailureStatus(
+    status
+) {
+
+    return [
+
+        "refunded",
+
+        "failed",
+
+        "cancelled"
+
+    ].includes(status);
+
+}
+
+
+function isProviderStillProcessingStatus(
+    status
+) {
+
+    return [
+
+        "processing-api",
+
+        "queued-api",
+
+        "initiated-api",
+
+        "pending",
+
+        "on-hold"
+
+    ].includes(status);
+
+}
+
+
+// ==========================================
+// RECONCILE ONE AIRTIME TRANSACTION
+// ==========================================
+
+async function reconcileAirtimeTransaction(
+    transactionId,
+    transactionData,
+    providerToken
+) {
+
+    try {
+
+        // --------------------------------------
+        // The reference used when the order was
+        // sent to VTU.ng.
+        //
+        // We store the same value in `reference`.
+        // --------------------------------------
+
+        const requestId =
+            transactionData.reference ||
+            transactionId;
+
+
+        if (!requestId) {
+
+            console.error(
+                "Cannot reconcile Airtime transaction without request_id:",
+                transactionId
+            );
+
+            return;
+
+        }
+
+
+        // --------------------------------------
+        // REQUERY VTU
+        // --------------------------------------
+
+        const response =
+            await axios.post(
+
+                `${VTU_BASE_URL}/api/v2/requery`,
+
+                {
+                    request_id:
+                        requestId
+                },
+
+                {
+
+                    headers: {
+
+                        Authorization:
+                            `Bearer ${providerToken}`,
+
+                        "Content-Type":
+                            "application/json"
+
+                    },
+
+                    timeout: 15000
+
+                }
+
+            );
+
+
+        const providerResult =
+            response.data;
+
+
+        const providerStatus =
+            getProviderOrderStatus(
+                providerResult
+            );
+
+
+        console.log(
+            `Airtime reconciliation ${transactionId}: ${providerStatus || "UNKNOWN"}`
+        );
+
+
+        // ======================================
+        // SUCCESS
+        // ======================================
+
+        if (
+            isProviderSuccessStatus(
+                providerStatus
+            )
+        ) {
+
+            await db.runTransaction(
+                async (transaction) => {
+
+                    const transactionRef =
+                        db
+                            .collection(
+                                "transactions"
+                            )
+                            .doc(
+                                transactionId
+                            );
+
+
+                    const transactionDoc =
+                        await transaction.get(
+                            transactionRef
+                        );
+
+
+                    if (
+                        !transactionDoc.exists
+                    ) {
+
+                        return;
+
+                    }
+
+
+                    const currentTransaction =
+                        transactionDoc.data();
+
+
+                    // --------------------------------
+                    // IDEMPOTENCY
+                    //
+                    // If another process already
+                    // completed it, do nothing.
+                    // --------------------------------
+
+                    if (
+                        currentTransaction.status !==
+                        "PENDING"
+                    ) {
+
+                        return;
+
+                    }
+
+
+                    transaction.update(
+                        transactionRef,
+                        {
+
+                            status:
+                                "SUCCESS",
+
+                            providerResponse:
+                                providerResult,
+
+                            completedAt:
+                                admin.firestore
+                                    .FieldValue
+                                    .serverTimestamp(),
+
+                            updatedAt:
+                                admin.firestore
+                                    .FieldValue
+                                    .serverTimestamp()
+
+                        }
+                    );
+
+                }
+            );
+
+
+            console.log(
+                `Airtime transaction ${transactionId} reconciled as SUCCESS.`
+            );
+
+
+            return;
+
+        }
+
+
+        // ======================================
+        // FAILURE / REFUND
+        // ======================================
+
+        if (
+            isProviderFailureStatus(
+                providerStatus
+            )
+        ) {
+
+            await db.runTransaction(
+                async (transaction) => {
+
+                    const transactionRef =
+                        db
+                            .collection(
+                                "transactions"
+                            )
+                            .doc(
+                                transactionId
+                            );
+
+
+                    const transactionDoc =
+                        await transaction.get(
+                            transactionRef
+                        );
+
+
+                    if (
+                        !transactionDoc.exists
+                    ) {
+
+                        return;
+
+                    }
+
+
+                    const currentTransaction =
+                        transactionDoc.data();
+
+
+                    // --------------------------------
+                    // DOUBLE-REFUND PROTECTION
+                    //
+                    // Only a still-PENDING
+                    // transaction can be refunded.
+                    // --------------------------------
+
+                    if (
+                        currentTransaction.status !==
+                        "PENDING"
+                    ) {
+
+                        return;
+
+                    }
+
+
+                    const uid =
+                        currentTransaction.uid;
+
+
+                    if (!uid) {
+
+                        throw new Error(
+                            "Airtime transaction has no user UID."
+                        );
+
+                    }
+
+
+                    const userRef =
+                        db
+                            .collection(
+                                "users"
+                            )
+                            .doc(uid);
+
+
+                    const userDoc =
+                        await transaction.get(
+                            userRef
+                        );
+
+
+                    if (
+                        !userDoc.exists
+                    ) {
+
+                        throw new Error(
+                            "USER_NOT_FOUND"
+                        );
+
+                    }
+
+
+                    const userData =
+                        userDoc.data();
+
+
+                    const currentBalance =
+                        normalizeAmount(
+                            userData.walletBalance ||
+                            0
+                        );
+
+
+                    // --------------------------------
+                    // IMPORTANT:
+                    //
+                    // NovaPay originally debited the
+                    // FULL amount from the user's wallet.
+                    //
+                    // Therefore we return the FULL
+                    // amount when the provider confirms
+                    // that the order failed/refunded.
+                    // --------------------------------
+
+                    const refundAmount =
+                        normalizeAmount(
+                            currentTransaction.amount
+                        );
+
+
+                    const newBalance =
+                        normalizeAmount(
+                            currentBalance +
+                            refundAmount
+                        );
+
+
+                    // --------------------------------
+                    // REFUND WALLET
+                    // --------------------------------
+
+                    transaction.update(
+                        userRef,
+                        {
+
+                            walletBalance:
+                                newBalance,
+
+                            updatedAt:
+                                admin.firestore
+                                    .FieldValue
+                                    .serverTimestamp()
+
+                        }
+                    );
+
+
+                    // --------------------------------
+                    // MARK TRANSACTION FAILED
+                    // --------------------------------
+
+                    transaction.update(
+                        transactionRef,
+                        {
+
+                            status:
+                                "FAILED",
+
+                            providerResponse:
+                                providerResult,
+
+                            refundAmount,
+
+                            refundedAt:
+                                admin.firestore
+                                    .FieldValue
+                                    .serverTimestamp(),
+
+                            updatedAt:
+                                admin.firestore
+                                    .FieldValue
+                                    .serverTimestamp()
+
+                        }
+                    );
+
+
+                }
+            );
+
+
+            console.log(
+                `Airtime transaction ${transactionId} reconciled as FAILED and refunded.`
+            );
+
+
+            return;
+
+        }
+
+
+        // ======================================
+        // STILL PROCESSING
+        // ======================================
+
+        if (
+            isProviderStillProcessingStatus(
+                providerStatus
+            )
+        ) {
+
+            await db
+                .collection(
+                    "transactions"
+                )
+                .doc(transactionId)
+                .update({
+
+                    status:
+                        "PENDING",
+
+                    providerResponse:
+                        providerResult,
+
+                    updatedAt:
+                        admin.firestore
+                            .FieldValue
+                            .serverTimestamp()
+
+                });
+
+
+            return;
+
+        }
+
+
+        // ======================================
+        // UNKNOWN PROVIDER STATUS
+        // ======================================
+        //
+        // Do NOT refund.
+        //
+        // Keep PENDING and try again during
+        // the next reconciliation cycle.
+        // ======================================
+
+        console.warn(
+            `Unknown VTU status for ${transactionId}:`,
+            providerStatus
+        );
+
+
+        await db
+            .collection(
+                "transactions"
+            )
+            .doc(transactionId)
+            .update({
+
+                status:
+                    "PENDING",
+
+                providerResponse:
+                    providerResult,
+
+                updatedAt:
+                    admin.firestore
+                        .FieldValue
+                        .serverTimestamp()
+
+            });
+
+
+    } catch (error) {
+
+        // --------------------------------------
+        // IMPORTANT:
+        //
+        // A requery failure is NOT proof that
+        // the Airtime order failed.
+        //
+        // Therefore:
+        //
+        // NO REFUND.
+        // NO SUCCESS.
+        //
+        // Leave it PENDING and try again later.
+        // --------------------------------------
+
+        console.error(
+            `Airtime reconciliation failed for ${transactionId}:`,
+            error?.response?.data ||
+            error?.message ||
+            error
+        );
+
+    }
+
+}
+
+
+// ==========================================
+// RUN AIRTIME RECONCILIATION
+// ==========================================
+
+async function runAirtimeReconciliation() {
+
+    try {
+
+        console.log(
+            "🔄 Starting Airtime reconciliation cycle..."
+        );
+
+
+        // --------------------------------------
+        // GET VTU TOKEN ONCE FOR THIS CYCLE
+        // --------------------------------------
+
+        const providerToken =
+            await getVTUToken();
+
+
+        // --------------------------------------
+        // FIND PENDING AIRTIME TRANSACTIONS
+        // --------------------------------------
+
+        const snapshot =
+            await db
+                .collection(
+                    "transactions"
+                )
+                .where(
+                    "type",
+                    "==",
+                    "AIRTIME"
+                )
+                .where(
+                    "status",
+                    "==",
+                    "PENDING"
+                )
+                .limit(
+                    RECONCILIATION_BATCH_SIZE
+                )
+                .get();
+
+
+        if (
+            snapshot.empty
+        ) {
+
+            console.log(
+                "🔄 No pending Airtime transactions to reconcile."
+            );
+
+            return;
+
+        }
+
+
+        console.log(
+            `🔄 Found ${snapshot.size} pending Airtime transaction(s).`
+        );
+
+
+        // --------------------------------------
+        // PROCESS EACH TRANSACTION
+        // --------------------------------------
+
+        for (
+            const document
+            of snapshot.docs
+        ) {
+
+            const transactionId =
+                document.id;
+
+
+            const transactionData =
+                document.data();
+
+
+            await reconcileAirtimeTransaction(
+
+                transactionId,
+
+                transactionData,
+
+                providerToken
+
+            );
+
+        }
+
+
+        console.log(
+            "✅ Airtime reconciliation cycle completed."
+        );
+
+
+    } catch (error) {
+
+        console.error(
+            "AIRTIME RECONCILIATION ERROR:",
+            error?.response?.data ||
+            error?.message ||
+            error
+        );
+
+    }
+
+}
+
+
+// ==========================================
+// START RECONCILIATION WORKER
+// ==========================================
+//
+// Wait briefly after server startup so Render
+// has time to finish starting the application.
+//
+// Then run once immediately and every 60 seconds.
+// ==========================================
+
+setTimeout(
+    async () => {
+
+        await runAirtimeReconciliation();
+
+
+        setInterval(
+            runAirtimeReconciliation,
+            RECONCILIATION_INTERVAL_MS
+        );
+
+    },
+
+    RECONCILIATION_START_DELAY_MS
 );
+
 
 // ==========================================
 // VTU PROVIDER BALANCE
@@ -1550,6 +2310,7 @@ app.get(
             const token =
                 await getVTUToken();
 
+
             const response =
                 await axios.get(
 
@@ -1567,15 +2328,19 @@ app.get(
                         timeout: 15000
 
                     }
+
                 );
+
 
             return res.json(
                 response.data
             );
 
+
         } catch (error) {
 
             safeProviderError(error);
+
 
             return res.status(502).json({
 
@@ -1585,12 +2350,259 @@ app.get(
                     "Unable to retrieve provider balance."
 
             });
+
         }
+
+    }
+); 
+// ==========================================
+// SECURE TRANSACTION HISTORY
+// ==========================================
+//
+// Security:
+// - Firebase authentication is required.
+// - UID comes ONLY from the verified Firebase
+//   token.
+// - Frontend does NOT provide a UID.
+// - Backend returns ONLY transactions belonging
+//   to the authenticated user.
+//
+// Query:
+//   GET /api/transactions?limit=50
+//
+// Maximum:
+//   100 transactions per request.
+// ==========================================
+
+app.get(
+    "/api/transactions",
+    verifyFirebaseToken,
+    async (req, res) => {
+
+        try {
+
+            // --------------------------------------
+            // AUTHENTICATED USER
+            // --------------------------------------
+
+            const uid =
+                req.uid;
+
+
+            if (!uid) {
+
+                return res.status(401).json({
+
+                    success: false,
+
+                    message:
+                        "Authentication required."
+
+                });
+
+            }
+
+
+            // --------------------------------------
+            // SAFE LIMIT
+            // --------------------------------------
+
+            let limit =
+                Number(
+                    req.query.limit || 50
+                );
+
+
+            if (
+                !Number.isInteger(limit)
+            ) {
+
+                limit = 50;
+
+            }
+
+
+            limit =
+                Math.min(
+                    Math.max(
+                        limit,
+                        1
+                    ),
+                    100
+                );
+
+
+            // --------------------------------------
+            // QUERY ONLY THIS USER
+            // --------------------------------------
+
+            const snapshot =
+                await db
+                    .collection(
+                        "transactions"
+                    )
+                    .where(
+                        "uid",
+                        "==",
+                        uid
+                    )
+                    .limit(
+                        limit
+                    )
+                    .get();
+
+
+            // --------------------------------------
+            // BUILD RESPONSE
+            // --------------------------------------
+
+            const transactions = [];
+
+
+            snapshot.forEach(
+                (doc) => {
+
+                    transactions.push({
+
+                        id:
+                            doc.id,
+
+                        ...doc.data()
+
+                    });
+
+                }
+            );
+
+
+            // --------------------------------------
+            // NEWEST FIRST
+            // --------------------------------------
+
+            transactions.sort(
+                (a, b) => {
+
+                    const getTime =
+                        (transaction) => {
+
+                            const timestamp =
+                                transaction.completedAt ||
+                                transaction.createdAt;
+
+
+                            if (!timestamp) {
+
+                                return 0;
+
+                            }
+
+
+                            if (
+                                typeof timestamp.toMillis ===
+                                "function"
+                            ) {
+
+                                return timestamp.toMillis();
+
+                            }
+
+
+                            if (
+                                typeof timestamp.toDate ===
+                                "function"
+                            ) {
+
+                                return timestamp
+                                    .toDate()
+                                    .getTime();
+
+                            }
+
+
+                            if (
+                                timestamp.seconds !==
+                                undefined
+                            ) {
+
+                                return (
+                                    timestamp.seconds *
+                                    1000
+                                );
+
+                            }
+
+
+                            const date =
+                                new Date(
+                                    timestamp
+                                );
+
+
+                            return isNaN(
+                                date.getTime()
+                            )
+                                ? 0
+                                : date.getTime();
+
+                        };
+
+
+                    return (
+                        getTime(b) -
+                        getTime(a)
+                    );
+
+                }
+            );
+
+
+            // --------------------------------------
+            // SUCCESS
+            // --------------------------------------
+
+            return res.json({
+
+                success: true,
+
+                count:
+                    transactions.length,
+
+                transactions
+
+            });
+
+
+        } catch (error) {
+
+            console.error(
+                "TRANSACTION HISTORY ERROR:",
+                error?.message ||
+                error
+            );
+
+
+            return res.status(500).json({
+
+                success: false,
+
+                message:
+                    "Unable to load transaction history."
+
+            });
+
+        }
+
     }
 );
 
+
 // ==========================================
 // START SERVER
+// ==========================================
+//
+// IMPORTANT:
+// All routes and background workers are
+// registered BEFORE app.listen().
 // ==========================================
 
 app.listen(
@@ -1598,7 +2610,23 @@ app.listen(
     () => {
 
         console.log(
-            `🚀 NovaPay Backend V2 running on port ${PORT}`
+            `🚀 NovaPay Backend V3 running on port ${PORT}`
+        );
+
+        console.log(
+            `BASE_URL: ${BASE_URL}`
+        );
+
+        console.log(
+            `CONTRACT_CODE: ${CONTRACT_CODE}`
+        );
+
+        console.log(
+            "🔐 Secure transaction history enabled."
+        );
+
+        console.log(
+            "🔄 Automatic Airtime reconciliation enabled."
         );
 
     }
