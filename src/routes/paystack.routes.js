@@ -5,7 +5,8 @@ const {
 } = require("../middleware/auth");
 
 const {
-  createPermanentAccount
+  createPermanentAccount,
+  initializePayment
 } = require("../controllers/paystack.controller");
 
 const {
@@ -13,6 +14,7 @@ const {
 } = require("../controllers/paystack.webhook.controller");
 
 const router = express.Router();
+
 
 /**
  * Authenticated NovaPay user:
@@ -24,13 +26,24 @@ router.post(
   createPermanentAccount
 );
 
+
+/**
+ * Authenticated NovaPay user:
+ * Initialize a Paystack wallet-funding payment.
+ */
+router.post(
+  "/initialize",
+  verifyFirebaseToken,
+  initializePayment
+);
+
+
 /**
  * Paystack webhook.
  *
  * IMPORTANT:
- * This route must receive the raw request body.
- * We will configure that correctly in server.js
- * before activating the webhook.
+ * This route receives the raw request body
+ * so the webhook signature can be verified.
  */
 router.post(
   "/webhook",
@@ -39,5 +52,6 @@ router.post(
   }),
   handlePaystackWebhook
 );
+
 
 module.exports = router;
