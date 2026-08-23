@@ -7,5 +7,8 @@
     "start": "node server.js",
     "dev": "node server.js"
   },
-  "private": true
+  "private": true,
+  "dependencies": {
+    "helmet": "^8.3.0"
+  }
 }
