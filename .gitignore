@@ -2,4 +2,6 @@ node_modules/
 .env
 .env.*
 !.env.example
-npm-debug.log*
+npm-debug.log*secrets/
+secrets/n
+secrets/

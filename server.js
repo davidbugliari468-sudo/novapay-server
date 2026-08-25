@@ -5,6 +5,7 @@ const helmet = require("helmet");
 const cors = require("cors");
 const rateLimit = require("express-rate-limit");
 const { requireAuth } = require("./auth");
+const { db, auth: adminAuth } = require("./firebase-admin");
 require("dotenv").config();
 
 const app = express();
@@ -98,7 +99,6 @@ app.get("/api", (req, res) => {
     requestId: req.requestId,
   });
 });
-
 // =====================================================
 // PROTECTED AUTH TEST ROUTE
 // =====================================================
@@ -110,6 +110,128 @@ app.get("/api/protected", requireAuth, (req, res) => {
     user: req.user,
     requestId: req.requestId,
   });
+});// =====================================================
+// REGISTRATION — SECURE PHONE CLAIM
+// =====================================================
+
+app.post("/api/registration/claim-phone", requireAuth, async (req, res) => {
+  try {
+    const uid = req.user.uid;
+    const phone = String(req.body.phone || "").trim();
+
+    if (!phone) {
+      return res.status(400).json({
+        success: false,
+        error: "Phone number is required.",
+        requestId: req.requestId,
+      });
+    }
+
+    // Normalize phone number.
+    // Keep digits only so formatting differences don't create duplicates.
+    const normalizedPhone = phone.replace(/\D/g, "");
+
+    if (normalizedPhone.length < 7 || normalizedPhone.length > 15) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid phone number.",
+        requestId: req.requestId,
+      });
+    }
+
+    // Never use the raw phone number as a Firestore document ID.
+    const phoneKey = crypto
+      .createHash("sha256")
+      .update(normalizedPhone)
+      .digest("hex");
+
+    const phoneRef = db.collection("phoneRegistry").doc(phoneKey);
+    const userRef = db.collection("users").doc(uid);
+
+    await db.runTransaction(async (transaction) => {
+      const phoneSnapshot = await transaction.get(phoneRef);
+
+      // Phone already belongs to another account.
+      if (phoneSnapshot.exists) {
+        const existingUid = phoneSnapshot.data().uid;
+
+        if (existingUid !== uid) {
+          const error = new Error("PHONE_ALREADY_REGISTERED");
+          error.code = "PHONE_ALREADY_REGISTERED";
+          throw error;
+        }
+
+        // Same user is retrying registration.
+        transaction.set(
+          userRef,
+          {
+            phone: normalizedPhone,
+            phoneVerified: false,
+            updatedAt: new Date(),
+          },
+          { merge: true }
+        );
+
+        return;
+      }
+
+      // Claim the phone number.
+      transaction.create(phoneRef, {
+        uid,
+        createdAt: new Date(),
+      });
+
+      // Save the normalized phone on the user's profile.
+      transaction.set(
+        userRef,
+        {
+          phone: normalizedPhone,
+          phoneVerified: false,
+          updatedAt: new Date(),
+        },
+        { merge: true }
+      );
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "Phone number registered successfully.",
+      requestId: req.requestId,
+    });
+
+  } catch (error) {
+
+    if (error.code === "PHONE_ALREADY_REGISTERED") {
+
+      // Delete the newly-created Firebase account because
+      // the phone number is already owned by another account.
+      try {
+        await adminAuth.deleteUser(req.user.uid);
+      } catch (deleteError) {
+        console.error(
+          "Failed to remove duplicate registration:",
+          deleteError
+        );
+      }
+
+      return res.status(409).json({
+        success: false,
+        error: "This phone number is already registered.",
+        requestId: req.requestId,
+      });
+    }
+
+    console.error(
+      "Phone registration error:",
+      error
+    );
+
+    return res.status(500).json({
+      success: false,
+      error: "Unable to complete registration.",
+      requestId: req.requestId,
+    });
+  }
 });
 
 // =====================================================
