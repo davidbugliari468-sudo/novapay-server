@@ -3,18 +3,13 @@
 /**
  * NovaPay Paystack Payment Provider
  *
- * This file contains ALL Paystack-specific Add Money logic.
- *
- * routes.js does not need to know how Paystack works.
- *
- * Pay with Transfer:
- * - Creates a temporary bank account for one transaction.
- * - The account expires according to the expiry time.
- * - The returned account details are passed back to routes.js.
+ * Handles all Paystack-specific Add Money operations.
  *
  * IMPORTANT:
- * PAYSTACK_SECRET_KEY must exist in the server environment.
- * Never put the secret key directly in this file.
+ * PAYSTACK_SECRET_KEY must be configured in the
+ * Render environment variables.
+ *
+ * NEVER expose the secret key to the browser.
  */
 
 const PAYSTACK_API_URL =
@@ -25,24 +20,32 @@ const PAYSTACK_API_URL =
 // CONFIGURATION
 // =====================================================
 
-const PAYSTACK_SECRET_KEY =
-    String(
-        process.env.PAYSTACK_SECRET_KEY || ""
-    ).trim();
+const PAYSTACK_REQUEST_TIMEOUT =
+    15000;
 
 
 // =====================================================
-// VALIDATE CONFIGURATION
+// SECRET KEY
 // =====================================================
 
-function requirePaystackSecretKey() {
+function getPaystackSecretKey() {
 
-    if (!PAYSTACK_SECRET_KEY) {
+    const key =
+        String(
+            process.env.PAYSTACK_SECRET_KEY || ""
+        ).trim();
+
+
+    if (!key) {
 
         throw new Error(
-            "PAYSTACK_SECRET_KEY is not configured."
+            "PAYSTACK_SECRET_KEY is not configured on the backend."
         );
+
     }
+
+
+    return key;
 
 }
 
@@ -56,37 +59,109 @@ async function paystackRequest(
     options = {}
 ) {
 
-    requirePaystackSecretKey();
+    const secretKey =
+        getPaystackSecretKey();
 
 
-    const response =
-        await fetch(
-            `${PAYSTACK_API_URL}${endpoint}`,
-            {
-                method:
-                    options.method ||
-                    "GET",
+    const controller =
+        new AbortController();
 
-                headers: {
 
-                    "Authorization":
-                        `Bearer ${PAYSTACK_SECRET_KEY}`,
+    const timeoutId =
+        setTimeout(
+            () => {
 
-                    "Content-Type":
-                        "application/json",
+                controller.abort();
 
-                    "Accept":
-                        "application/json"
-                },
-
-                body:
-                    options.body
-                        ? JSON.stringify(
-                            options.body
-                        )
-                        : undefined
-            }
+            },
+            PAYSTACK_REQUEST_TIMEOUT
         );
+
+
+    let response;
+
+
+    try {
+
+        response =
+            await fetch(
+                `${PAYSTACK_API_URL}${endpoint}`,
+                {
+
+                    method:
+                        options.method ||
+                        "GET",
+
+                    headers: {
+
+                        "Authorization":
+                            `Bearer ${secretKey}`,
+
+                        "Content-Type":
+                            "application/json",
+
+                        "Accept":
+                            "application/json"
+
+                    },
+
+                    body:
+                        options.body !== undefined
+                            ? JSON.stringify(
+                                options.body
+                            )
+                            : undefined,
+
+                    signal:
+                        controller.signal
+
+                }
+            );
+
+    }
+
+    catch (error) {
+
+        if (
+            error?.name ===
+            "AbortError"
+        ) {
+
+            const timeoutError =
+                new Error(
+                    "Paystack API request timed out."
+                );
+
+            timeoutError.code =
+                "PAYSTACK_TIMEOUT";
+
+            throw timeoutError;
+
+        }
+
+
+        const connectionError =
+            new Error(
+                "Unable to connect to Paystack."
+            );
+
+        connectionError.code =
+            "PAYSTACK_CONNECTION_ERROR";
+
+        connectionError.cause =
+            error;
+
+        throw connectionError;
+
+    }
+
+    finally {
+
+        clearTimeout(
+            timeoutId
+        );
+
+    }
 
 
     let result = null;
@@ -97,31 +172,39 @@ async function paystackRequest(
         result =
             await response.json();
 
-    } catch {
+    }
+
+    catch {
 
         result =
             null;
+
     }
 
 
     if (!response.ok) {
 
-        const message =
-            result?.message ||
-            "Paystack request failed.";
-
         const error =
             new Error(
-                message
+                result?.message ||
+                `Paystack request failed (${response.status}).`
             );
+
+
+        error.code =
+            "PAYSTACK_HTTP_ERROR";
+
 
         error.status =
             response.status;
 
+
         error.response =
             result;
 
+
         throw error;
+
     }
 
 
@@ -136,14 +219,22 @@ async function paystackRequest(
                 "Paystack rejected the request."
             );
 
+
+        error.code =
+            "PAYSTACK_REJECTED";
+
+
         error.response =
             result;
 
+
         throw error;
+
     }
 
 
     return result;
+
 }
 
 
@@ -153,8 +244,8 @@ async function paystackRequest(
 //
 // Creates a Paystack Pay-with-Transfer charge.
 //
-// The account generated by Paystack is temporary and
-// belongs to this specific transaction.
+// The resulting temporary bank account is associated
+// with the transaction reference.
 //
 // =====================================================
 
@@ -167,13 +258,30 @@ async function createPaymentSession(
     }
 ) {
 
-    if (!email) {
+    // -----------------------------------------------
+    // Validate email
+    // -----------------------------------------------
+
+    const normalizedEmail =
+        String(
+            email || ""
+        )
+            .trim()
+            .toLowerCase();
+
+
+    if (!normalizedEmail) {
 
         throw new Error(
             "Payment email is required."
         );
+
     }
 
+
+    // -----------------------------------------------
+    // Validate amount
+    // -----------------------------------------------
 
     if (
         !Number.isSafeInteger(
@@ -185,24 +293,32 @@ async function createPaymentSession(
         throw new Error(
             "Payment amount must be a valid positive integer in kobo."
         );
+
     }
 
 
-    if (!reference) {
+    // -----------------------------------------------
+    // Validate reference
+    // -----------------------------------------------
+
+    const normalizedReference =
+        String(
+            reference || ""
+        ).trim();
+
+
+    if (!normalizedReference) {
 
         throw new Error(
             "Payment reference is required."
         );
+
     }
 
 
-    /*
-     * Paystack requires the expiry to be at least
-     * 15 minutes from the current time and no more
-     * than 8 hours from the current time.
-     *
-     * We use 1 hour by default.
-     */
+    // -----------------------------------------------
+    // Calculate account expiry
+    // -----------------------------------------------
 
     let expiry =
         accountExpiresAt;
@@ -215,40 +331,69 @@ async function createPaymentSession(
                 Date.now() +
                 60 * 60 * 1000
             ).toISOString();
+
     }
 
+
+    const expiryDate =
+        new Date(
+            expiry
+        );
+
+
+    if (
+        Number.isNaN(
+            expiryDate.getTime()
+        )
+    ) {
+
+        throw new Error(
+            "Invalid temporary account expiry time."
+        );
+
+    }
+
+
+    // -----------------------------------------------
+    // Paystack charge request
+    // -----------------------------------------------
 
     const result =
         await paystackRequest(
             "/charge",
             {
+
                 method:
                     "POST",
 
                 body: {
 
-                    email,
+                    email:
+                        normalizedEmail,
 
                     amount:
                         String(
                             amount
                         ),
 
-                    reference,
+                    reference:
+                        normalizedReference,
 
                     bank_transfer: {
 
                         account_expires_at:
-                            expiry
+                            expiryDate.toISOString()
 
                     }
+
                 }
+
             }
         );
 
 
     const payment =
-        result.data;
+        result?.data;
 
 
     if (!payment) {
@@ -256,57 +401,91 @@ async function createPaymentSession(
         throw new Error(
             "Paystack returned an empty payment response."
         );
+
     }
 
 
-    /*
-     * Make sure Paystack actually created
-     * the temporary transfer account.
-     */
+    // -----------------------------------------------
+    // Validate temporary account
+    // -----------------------------------------------
+
+    const accountNumber =
+        String(
+            payment.account_number ||
+            ""
+        ).trim();
+
+
+    const accountName =
+        String(
+            payment.account_name ||
+            ""
+        ).trim();
+
+
+    const bankName =
+        String(
+            payment.bank?.name ||
+            ""
+        ).trim();
+
 
     if (
-        !payment.account_number ||
-        !payment.account_name ||
-        !payment.bank
+        !accountNumber ||
+        !accountName ||
+        !bankName
     ) {
 
-        throw new Error(
-            "Paystack did not return temporary transfer account details."
-        );
+        const error =
+            new Error(
+                "Paystack did not return temporary transfer account details."
+            );
+
+
+        error.code =
+            "PAYSTACK_MISSING_TRANSFER_ACCOUNT";
+
+
+        error.response =
+            payment;
+
+
+        throw error;
+
     }
 
+
+    // -----------------------------------------------
+    // Return normalized payment object
+    // -----------------------------------------------
 
     return {
 
         reference:
             payment.reference ||
-            reference,
+            normalizedReference,
 
         status:
             payment.status ||
             "pending_bank_transfer",
 
-        accountName:
-            payment.account_name ||
-            null,
+        accountName,
 
-        accountNumber:
-            payment.account_number ||
-            null,
+        accountNumber,
 
-        bankName:
-            payment.bank?.name ||
-            null,
+        bankName,
 
         bankCode:
             payment.bank?.slug ||
+            payment.bank?.code ||
             null,
 
         accountExpiresAt:
             payment.account_expires_at ||
-            expiry
+            expiryDate.toISOString()
 
     };
+
 }
 
 
@@ -314,29 +493,35 @@ async function createPaymentSession(
 // VERIFY PAYMENT
 // =====================================================
 //
-// This is intentionally separate from creating the
-// payment.
+// Used to independently verify a Paystack transaction.
 //
-// Later the webhook/crediting system can call this
-// function when it needs to confirm a transaction.
-//
+// IMPORTANT:
+// Verification does NOT itself credit the wallet.
+// Wallet crediting must remain idempotent and server-side.
 // =====================================================
 
 async function verifyPayment(
     reference
 ) {
 
-    if (!reference) {
+    const normalizedReference =
+        String(
+            reference || ""
+        ).trim();
+
+
+    if (!normalizedReference) {
 
         throw new Error(
             "Payment reference is required."
         );
+
     }
 
 
     const encodedReference =
         encodeURIComponent(
-            reference
+            normalizedReference
         );
 
 
@@ -344,14 +529,16 @@ async function verifyPayment(
         await paystackRequest(
             `/transaction/verify/${encodedReference}`,
             {
+
                 method:
                     "GET"
+
             }
         );
 
 
     const transaction =
-        result.data;
+        result?.data;
 
 
     if (!transaction) {
@@ -359,6 +546,7 @@ async function verifyPayment(
         throw new Error(
             "Paystack returned an empty verification response."
         );
+
     }
 
 
@@ -366,7 +554,7 @@ async function verifyPayment(
 
         reference:
             transaction.reference ||
-            reference,
+            normalizedReference,
 
         status:
             transaction.status ||
@@ -394,6 +582,7 @@ async function verifyPayment(
             null
 
     };
+
 }
 
 
