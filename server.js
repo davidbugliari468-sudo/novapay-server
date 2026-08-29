@@ -8,6 +8,10 @@ const cors = require("cors");
 const rateLimit = require("express-rate-limit");
 const { requireAuth } = require("./auth");
 const { db, auth: adminAuth } = require("./firebase-admin");
+const {
+  getWallet
+} = require("./wallet.js/wallet");
+
 const addMoneyRoutes = require("./add-money/routes");
 const {
   handlePaystackWebhook
@@ -134,7 +138,75 @@ app.get("/api", (req, res) => {
     status: "online",
     requestId: req.requestId,
   });
-});
+}); 
+// =====================================================
+// WALLET
+// =====================================================
+//
+// The frontend gets the wallet balance through the
+// authenticated backend.
+//
+// The UID comes from the verified Firebase ID token.
+// The frontend never supplies the UID.
+// =====================================================
+
+app.get(
+  "/api/wallet",
+  requireAuth,
+  async (req, res) => {
+
+    try {
+
+      const uid =
+        req.user.uid;
+
+      const wallet =
+        await getWallet(uid);
+
+      return res.status(200).json({
+
+        success: true,
+
+        wallet: {
+
+          balanceKobo:
+            wallet.balanceKobo,
+
+          currency:
+            wallet.currency ||
+            "NGN"
+
+        },
+
+        requestId:
+          req.requestId
+
+      });
+
+    } catch (error) {
+
+      console.error(
+        "NovaPay wallet retrieval error:",
+        error
+      );
+
+      return res.status(500).json({
+
+        success: false,
+
+        error:
+          "Unable to retrieve wallet balance.",
+
+        requestId:
+          req.requestId
+
+      });
+
+    }
+
+  }
+);
+
 // =====================================================
 // ADD MONEY
 // =====================================================
