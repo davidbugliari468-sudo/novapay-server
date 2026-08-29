@@ -1,4 +1,6 @@
 // NovaPay backend deployment update
+require("dotenv").config();
+
 const crypto = require("crypto");
 const express = require("express");
 const helmet = require("helmet");
@@ -6,8 +8,10 @@ const cors = require("cors");
 const rateLimit = require("express-rate-limit");
 const { requireAuth } = require("./auth");
 const { db, auth: adminAuth } = require("./firebase-admin");
-require("dotenv").config();
-
+const addMoneyRoutes = require("./add-money/routes");
+const {
+  handlePaystackWebhook
+} = require("./add-money/paystack/webhook");
 const app = express();
 
 const PORT = Number(process.env.PORT) || 3000;
@@ -37,8 +41,40 @@ app.use((req, res, next) => {
   next();
 });
 
-// JSON body limit
-app.use(express.json({ limit: "100kb" }));
+// =====================================================
+// JSON BODY LIMIT
+// =====================================================
+//
+// Keep the original request body available for
+// Paystack webhook signature verification.
+//
+// All normal JSON API requests continue to work
+// exactly as before.
+// =====================================================
+
+app.use(
+  express.json({
+    limit: "100kb",
+
+    verify: (req, res, buffer) => {
+
+      if (
+        req.originalUrl ===
+        "/api/add-money/paystack/webhook"
+      ) {
+
+        req.rawBody =
+          Buffer.from(buffer);
+
+      }
+
+    }
+  })
+);
+app.post(
+  "/api/add-money/paystack/webhook",
+  handlePaystackWebhook
+);
 
 // URL-encoded body limit
 app.use(
@@ -99,6 +135,15 @@ app.get("/api", (req, res) => {
     requestId: req.requestId,
   });
 });
+// =====================================================
+// ADD MONEY
+// =====================================================
+
+app.use(
+  "/api/add-money",
+  addMoneyRoutes
+);
+
 // =====================================================
 // PROTECTED AUTH TEST ROUTE
 // =====================================================
