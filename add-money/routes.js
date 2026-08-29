@@ -1,4 +1,7 @@
-// add-money/routes.js
+// =====================================================
+// NovaPay Add Money Routes
+// Secure Paystack Version
+// =====================================================
 
 const express = require("express");
 const crypto = require("crypto");
@@ -9,7 +12,8 @@ const { db } = require("../firebase-admin");
 const paymentProvider =
     require("./paystack/provider");
 
-const router = express.Router();
+const router =
+    express.Router();
 
 
 // =====================================================
@@ -25,44 +29,33 @@ const MAXIMUM_DEPOSIT_NAIRA = 5000000;
 // MONEY → KOBO
 // =====================================================
 
-function nairaToKobo(
-    amount
-) {
+function nairaToKobo(amount) {
 
     const numericAmount =
         Number(amount);
-
 
     if (
         !Number.isFinite(
             numericAmount
         )
     ) {
-
         return null;
-
     }
-
 
     const kobo =
         Math.round(
             numericAmount * 100
         );
 
-
     if (
         !Number.isSafeInteger(
             kobo
         )
     ) {
-
         return null;
-
     }
 
-
     return kobo;
-
 }
 
 
@@ -70,9 +63,7 @@ function nairaToKobo(
 // UNIQUE DEPOSIT REFERENCE
 // =====================================================
 
-function createDepositReference(
-    uid
-) {
+function createDepositReference(uid) {
 
     const uidPart =
         String(uid)
@@ -85,17 +76,14 @@ function createDepositReference(
                 12
             );
 
-
     const randomPart =
         crypto
             .randomBytes(12)
             .toString("hex");
 
-
     return (
         `NPDEP_${uidPart}_${Date.now()}_${randomPart}`
     );
-
 }
 
 
@@ -103,8 +91,14 @@ function createDepositReference(
 // POST /api/add-money/create
 // =====================================================
 //
-// Creates a pending deposit and then requests
-// temporary transfer account details from Paystack.
+// Creates a pending wallet deposit.
+//
+// IMPORTANT:
+//
+// This route does NOT credit the wallet.
+//
+// Wallet crediting happens only after a verified
+// Paystack payment/webhook event.
 //
 // =====================================================
 
@@ -113,10 +107,33 @@ router.post(
     requireAuth,
     async (req, res) => {
 
+        let depositRef = null;
+
         try {
+
+            // -----------------------------------------
+            // AUTHENTICATED USER
+            // -----------------------------------------
 
             const uid =
                 req.user.uid;
+
+
+            if (!uid) {
+
+                return res.status(401).json({
+
+                    success: false,
+
+                    error:
+                        "Authentication required.",
+
+                    requestId:
+                        req.requestId
+
+                });
+
+            }
 
 
             // -----------------------------------------
@@ -125,7 +142,7 @@ router.post(
 
             const amount =
                 Number(
-                    req.body.amount
+                    req.body?.amount
                 );
 
 
@@ -192,6 +209,10 @@ router.post(
             }
 
 
+            // -----------------------------------------
+            // CONVERT TO KOBO
+            // -----------------------------------------
+
             const amountKobo =
                 nairaToKobo(
                     amount
@@ -219,7 +240,7 @@ router.post(
 
 
             // -----------------------------------------
-            // GET USER
+            // GET USER PROFILE
             // -----------------------------------------
 
             const userRef =
@@ -252,8 +273,12 @@ router.post(
 
 
             const userData =
-                userSnapshot.data();
+                userSnapshot.data() || {};
 
+
+            // -----------------------------------------
+            // PAYMENT EMAIL
+            // -----------------------------------------
 
             const email =
                 String(
@@ -294,7 +319,7 @@ router.post(
                 );
 
 
-            const depositRef =
+            depositRef =
                 db
                     .collection("deposits")
                     .doc(reference);
@@ -302,14 +327,6 @@ router.post(
 
             // -----------------------------------------
             // CREATE PENDING DEPOSIT
-            // -----------------------------------------
-            //
-            // IMPORTANT:
-            //
-            // Balance is NOT changed here.
-            //
-            // This is only a pending deposit record.
-            //
             // -----------------------------------------
 
             await depositRef.create({
@@ -356,8 +373,8 @@ router.post(
             try {
 
                 payment =
-    await paymentProvider
-        .createPaymentSession({
+                    await paymentProvider
+                        .createPaymentSession({
 
                             email,
 
@@ -372,8 +389,28 @@ router.post(
 
             catch (providerError) {
 
+                console.error(
+                    "NovaPay Paystack provider error:",
+                    {
+
+                        message:
+                            providerError?.message,
+
+                        status:
+                            providerError?.status,
+
+                        response:
+                            providerError?.response,
+
+                        stack:
+                            providerError?.stack
+
+                    }
+                );
+
+
                 // -------------------------------------
-                // MARK FAILED
+                // MARK DEPOSIT AS FAILED
                 // -------------------------------------
 
                 await depositRef.update({
@@ -382,7 +419,18 @@ router.post(
                         "provider_error",
 
                     providerError:
-                        providerError.message,
+                        String(
+                            providerError?.message ||
+                            "Paystack provider error."
+                        )
+                            .slice(
+                                0,
+                                500
+                            ),
+
+                    providerStatusCode:
+                        providerError?.status ||
+                        null,
 
                     updatedAt:
                         new Date()
@@ -390,13 +438,92 @@ router.post(
                 });
 
 
-                throw providerError;
+                // -------------------------------------
+                // RETURN SAFE ERROR TO FRONTEND
+                // -------------------------------------
+
+                const statusCode =
+                    Number(
+                        providerError?.status
+                    );
+
+
+                const safeStatus =
+                    Number.isInteger(
+                        statusCode
+                    ) &&
+                    statusCode >= 400 &&
+                    statusCode < 500
+                        ? statusCode
+                        : 502;
+
+
+                return res.status(
+                    safeStatus
+                ).json({
+
+                    success: false,
+
+                    error:
+                        providerError?.message ||
+                        "Paystack payment service is unavailable.",
+
+                    requestId:
+                        req.requestId
+
+                });
 
             }
 
 
             // -----------------------------------------
-            // SAVE PROVIDER DETAILS
+            // VALIDATE PAYMENT RESPONSE
+            // -----------------------------------------
+
+            if (
+                !payment ||
+                !payment.accountNumber ||
+                !payment.accountName ||
+                !payment.bankName
+            ) {
+
+                console.error(
+                    "NovaPay invalid Paystack payment response:",
+                    payment
+                );
+
+
+                await depositRef.update({
+
+                    status:
+                        "provider_error",
+
+                    providerError:
+                        "Paystack did not return valid transfer account details.",
+
+                    updatedAt:
+                        new Date()
+
+                });
+
+
+                return res.status(502).json({
+
+                    success: false,
+
+                    error:
+                        "Paystack did not return valid transfer account details.",
+
+                    requestId:
+                        req.requestId
+
+                });
+
+            }
+
+
+            // -----------------------------------------
+            // SAVE PAYSTACK DETAILS
             // -----------------------------------------
 
             await depositRef.update({
@@ -436,7 +563,7 @@ router.post(
 
 
             // -----------------------------------------
-            // RETURN PAYMENT DETAILS
+            // SUCCESS
             // -----------------------------------------
 
             return res.status(201).json({
@@ -452,6 +579,11 @@ router.post(
 
                     amount,
 
+                    amountNaira:
+                        amount,
+
+                    amountKobo,
+
                     currency:
                         "NGN",
 
@@ -459,16 +591,13 @@ router.post(
                         "pending",
 
                     accountName:
-                        payment.accountName ||
-                        null,
+                        payment.accountName,
 
                     accountNumber:
-                        payment.accountNumber ||
-                        null,
+                        payment.accountNumber,
 
                     bankName:
-                        payment.bankName ||
-                        null,
+                        payment.bankName,
 
                     accountExpiresAt:
                         payment.accountExpiresAt ||
@@ -487,8 +616,66 @@ router.post(
 
             console.error(
                 "NovaPay Add Money creation error:",
-                error
+                {
+
+                    message:
+                        error?.message,
+
+                    status:
+                        error?.status,
+
+                    response:
+                        error?.response,
+
+                    stack:
+                        error?.stack
+
+                }
             );
+
+
+            // -----------------------------------------
+            // TRY TO MARK DEPOSIT AS FAILED
+            // -----------------------------------------
+
+            if (
+                depositRef
+            ) {
+
+                try {
+
+                    await depositRef.update({
+
+                        status:
+                            "provider_error",
+
+                        providerError:
+                            String(
+                                error?.message ||
+                                "Unknown payment error."
+                            )
+                                .slice(
+                                    0,
+                                    500
+                                ),
+
+                        updatedAt:
+                            new Date()
+
+                    });
+
+                }
+
+                catch (updateError) {
+
+                    console.error(
+                        "Failed to update deposit after error:",
+                        updateError
+                    );
+
+                }
+
+            }
 
 
             return res.status(500).json({
@@ -513,12 +700,10 @@ router.post(
 // GET /api/add-money/status/:reference
 // =====================================================
 //
-// Returns the current state of a deposit.
+// Returns the status of a user's own deposit.
 //
-// This endpoint does NOT credit the wallet.
+// This endpoint NEVER credits the wallet.
 //
-// Wallet crediting will be handled separately with
-// idempotency protection.
 // =====================================================
 
 router.get(
@@ -589,11 +774,11 @@ router.get(
 
 
             const deposit =
-                depositSnapshot.data();
+                depositSnapshot.data() || {};
 
 
             // -----------------------------------------
-            // NEVER expose another user's deposit
+            // USER OWNERSHIP CHECK
             // -----------------------------------------
 
             if (
@@ -615,6 +800,10 @@ router.get(
             }
 
 
+            // -----------------------------------------
+            // RETURN STATUS
+            // -----------------------------------------
+
             return res.status(200).json({
 
                 success: true,
@@ -626,12 +815,24 @@ router.get(
                     amountNaira:
                         deposit.amountNaira,
 
+                    amountKobo:
+                        deposit.amountKobo,
+
                     currency:
                         deposit.currency ||
                         "NGN",
 
                     status:
-                        deposit.status,
+                        deposit.status ||
+                        "pending",
+
+                    provider:
+                        deposit.provider ||
+                        "paystack",
+
+                    providerReference:
+                        deposit.providerReference ||
+                        null,
 
                     accountName:
                         deposit.accountName ||
@@ -651,6 +852,10 @@ router.get(
 
                     createdAt:
                         deposit.createdAt ||
+                        null,
+
+                    updatedAt:
+                        deposit.updatedAt ||
                         null,
 
                     creditedAt:
@@ -692,4 +897,9 @@ router.get(
 );
 
 
-module.exports = router;
+// =====================================================
+// EXPORT
+// =====================================================
+
+module.exports =
+    router;

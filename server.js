@@ -18,6 +18,7 @@ const {
 } = require("./add-money/paystack/webhook");
 const app = express();
 
+app.set("trust proxy", 1);
 const PORT = Number(process.env.PORT) || 3000;
 const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || false;
 
