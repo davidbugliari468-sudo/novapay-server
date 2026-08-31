@@ -1,6 +1,7 @@
 // NovaPay backend deployment update
 require("dotenv").config();
-
+const transactionRoutes =
+  require("./transactions/routes.js");
 const crypto = require("crypto");
 const express = require("express");
 const helmet = require("helmet");
@@ -217,6 +218,10 @@ app.use(
   addMoneyRoutes
 );
 
+app.use(
+  "/api/transactions",
+  transactionRoutes
+);
 // =====================================================
 // PROTECTED AUTH TEST ROUTE
 // =====================================================

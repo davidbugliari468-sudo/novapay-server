@@ -12,26 +12,43 @@ const { db } = require("../firebase-admin");
 // The backend is the authority for wallet balances.
 //
 // IMPORTANT:
+//
 // - Frontend must never directly change balance.
 // - All money amounts are stored in KOBO.
-// - Every balance-changing operation must have a
-//   corresponding immutable ledger entry.
-// - Deposit credits use an idempotency key/reference.
+// - Every balance-changing operation creates a ledger
+//   entry inside the user's wallet.
+// - Ledger entries are immutable from the client.
+// - Deposit credits use a deterministic idempotency ID.
+// - Wallet balance + ledger entry are written atomically.
 // =====================================================
 
 
 // =====================================================
-// WALLET COLLECTION
+// COLLECTIONS
 // =====================================================
 
-const WALLETS_COLLECTION = "wallets";
+const WALLETS_COLLECTION =
+    "wallets";
+
+const LEDGER_SUBCOLLECTION =
+    "ledger";
 
 
 // =====================================================
-// LEDGER COLLECTION
+// CONSTANTS
 // =====================================================
 
-const LEDGER_SUBCOLLECTION = "ledger";
+const DEFAULT_CURRENCY =
+    "NGN";
+
+const DEPOSIT_TYPE =
+    "deposit";
+
+const CREDIT_DIRECTION =
+    "credit";
+
+const SUCCESSFUL_STATUS =
+    "successful";
 
 
 // =====================================================
@@ -40,14 +57,16 @@ const LEDGER_SUBCOLLECTION = "ledger";
 
 function getWalletRef(uid) {
 
-    if (!uid) {
+    if (
+        typeof uid !== "string" ||
+        !uid.trim()
+    ) {
 
         throw new Error(
             "Wallet user ID is required."
         );
 
     }
-
 
     return db
         .collection(WALLETS_COLLECTION)
@@ -65,33 +84,123 @@ function getLedgerRef(
     ledgerId
 ) {
 
+    if (
+        typeof ledgerId !== "string" ||
+        !ledgerId.trim()
+    ) {
+
+        throw new Error(
+            "Ledger ID is required."
+        );
+
+    }
+
     return getWalletRef(uid)
-        .collection(LEDGER_SUBCOLLECTION)
+        .collection(
+            LEDGER_SUBCOLLECTION
+        )
         .doc(ledgerId);
 
 }
 
 
 // =====================================================
-// CREATE DETERMINISTIC LEDGER ID
+// CREATE DETERMINISTIC DEPOSIT LEDGER ID
 // =====================================================
 //
-// The same payment reference always produces the
-// same ledger ID.
+// The same payment reference always generates the same
+// Firestore ledger document ID.
 //
-// This gives us another layer of duplicate protection.
+// This gives us idempotency protection.
+//
+// Example:
+//
+// deposit reference:
+// NPDEP_12345
+//
+// becomes a SHA-256 ledger document ID.
 // =====================================================
 
 function createDepositLedgerId(
     reference
 ) {
 
+    const normalizedReference =
+        String(
+            reference
+        )
+            .trim();
+
+
+    if (!normalizedReference) {
+
+        throw new Error(
+            "Deposit reference is required."
+        );
+
+    }
+
+
     return crypto
         .createHash("sha256")
         .update(
-            `deposit:${String(reference)}`
+            `deposit:${normalizedReference}`
         )
         .digest("hex");
+
+}
+
+
+// =====================================================
+// VALIDATE MONEY AMOUNT
+// =====================================================
+
+function validateAmountKobo(
+    amountKobo
+) {
+
+    if (
+        !Number.isSafeInteger(
+            amountKobo
+        ) ||
+        amountKobo <= 0
+    ) {
+
+        throw new Error(
+            "Amount must be a positive integer in kobo."
+        );
+
+    }
+
+
+    return amountKobo;
+
+}
+
+
+// =====================================================
+// VALIDATE BALANCE
+// =====================================================
+
+function validateBalanceKobo(
+    balanceKobo
+) {
+
+    if (
+        !Number.isSafeInteger(
+            balanceKobo
+        ) ||
+        balanceKobo < 0
+    ) {
+
+        throw new Error(
+            "Wallet contains an invalid balance."
+        );
+
+    }
+
+
+    return balanceKobo;
 
 }
 
@@ -100,9 +209,10 @@ function createDepositLedgerId(
 // ENSURE WALLET EXISTS
 // =====================================================
 //
-// Creates an empty wallet when one does not exist.
+// Creates an empty wallet if the user does not already
+// have one.
 //
-// Existing wallets are never reset.
+// Existing wallets are NEVER reset.
 // =====================================================
 
 async function ensureWallet(
@@ -117,36 +227,40 @@ async function ensureWallet(
         await walletRef.get();
 
 
-    if (snapshot.exists) {
+    if (
+        snapshot.exists
+    ) {
 
         const data =
             snapshot.data();
 
 
-        if (
-            !Number.isSafeInteger(
+        const balanceKobo =
+            validateBalanceKobo(
                 data.balanceKobo
-            ) ||
-            data.balanceKobo < 0
-        ) {
-
-            throw new Error(
-                "Wallet contains an invalid balance."
             );
-
-        }
 
 
         return {
 
             uid,
 
-            balanceKobo:
-                data.balanceKobo
+            balanceKobo,
+
+            currency:
+                String(
+                    data.currency ||
+                    DEFAULT_CURRENCY
+                )
+                    .toUpperCase()
 
         };
 
     }
+
+
+    const now =
+        new Date();
 
 
     await walletRef.create({
@@ -157,13 +271,13 @@ async function ensureWallet(
             0,
 
         currency:
-            "NGN",
+            DEFAULT_CURRENCY,
 
         createdAt:
-            new Date(),
+            now,
 
         updatedAt:
-            new Date()
+            now
 
     });
 
@@ -173,7 +287,10 @@ async function ensureWallet(
         uid,
 
         balanceKobo:
-            0
+            0,
+
+        currency:
+            DEFAULT_CURRENCY
 
     };
 
@@ -196,7 +313,9 @@ async function getWallet(
         await walletRef.get();
 
 
-    if (!snapshot.exists) {
+    if (
+        !snapshot.exists
+    ) {
 
         return {
 
@@ -206,7 +325,13 @@ async function getWallet(
                 0,
 
             currency:
-                "NGN"
+                DEFAULT_CURRENCY,
+
+            createdAt:
+                null,
+
+            updatedAt:
+                null
 
         };
 
@@ -217,30 +342,24 @@ async function getWallet(
         snapshot.data();
 
 
-    if (
-        !Number.isSafeInteger(
+    const balanceKobo =
+        validateBalanceKobo(
             wallet.balanceKobo
-        ) ||
-        wallet.balanceKobo < 0
-    ) {
-
-        throw new Error(
-            "Wallet contains an invalid balance."
         );
-
-    }
 
 
     return {
 
         uid,
 
-        balanceKobo:
-            wallet.balanceKobo,
+        balanceKobo,
 
         currency:
-            wallet.currency ||
-            "NGN",
+            String(
+                wallet.currency ||
+                DEFAULT_CURRENCY
+            )
+                .toUpperCase(),
 
         createdAt:
             wallet.createdAt ||
@@ -259,29 +378,35 @@ async function getWallet(
 // CREDIT DEPOSIT
 // =====================================================
 //
-// This is the ONLY function we will use to credit money
-// from a verified Add Money deposit.
+// This is the controlled backend operation used after a
+// payment provider confirms a successful deposit.
 //
-// The operation is atomic:
+// ATOMIC OPERATION:
 //
 // 1. Read wallet.
-// 2. Read ledger.
-// 3. If ledger already exists → do nothing.
-// 4. Increase wallet balance.
-// 5. Create ledger entry.
+// 2. Read deterministic ledger document.
+// 3. If ledger exists → duplicate, do nothing.
+// 4. Validate current balance.
+// 5. Calculate new balance.
+// 6. Update wallet.
+// 7. Create immutable ledger entry.
 //
-// Firestore transaction guarantees these changes happen
-// together.
+// Firestore transaction guarantees the wallet update and
+// ledger creation happen together.
 // =====================================================
 
 async function creditDeposit({
     uid,
     reference,
     amountKobo,
-    provider
+    provider,
+    currency
 }) {
 
-    if (!uid) {
+    if (
+        typeof uid !== "string" ||
+        !uid.trim()
+    ) {
 
         throw new Error(
             "Wallet user ID is required."
@@ -290,7 +415,14 @@ async function creditDeposit({
     }
 
 
-    if (!reference) {
+    const normalizedReference =
+        String(
+            reference || ""
+        )
+            .trim();
+
+
+    if (!normalizedReference) {
 
         throw new Error(
             "Deposit reference is required."
@@ -299,15 +431,37 @@ async function creditDeposit({
     }
 
 
-    if (
-        !Number.isSafeInteger(
+    const validatedAmountKobo =
+        validateAmountKobo(
             amountKobo
-        ) ||
-        amountKobo <= 0
+        );
+
+
+    const normalizedProvider =
+        String(
+            provider ||
+            "unknown"
+        )
+            .trim()
+            .toLowerCase();
+
+
+    const normalizedCurrency =
+        String(
+            currency ||
+            DEFAULT_CURRENCY
+        )
+            .trim()
+            .toUpperCase();
+
+
+    if (
+        normalizedCurrency !==
+        DEFAULT_CURRENCY
     ) {
 
         throw new Error(
-            "Deposit amount must be a positive integer in kobo."
+            "Unsupported wallet currency."
         );
 
     }
@@ -319,7 +473,7 @@ async function creditDeposit({
 
     const ledgerId =
         createDepositLedgerId(
-            reference
+            normalizedReference
         );
 
 
@@ -334,11 +488,19 @@ async function creditDeposit({
         await db.runTransaction(
             async transaction => {
 
+                // -----------------------------------------
+                // READ WALLET
+                // -----------------------------------------
+
                 const walletSnapshot =
                     await transaction.get(
                         walletRef
                     );
 
+
+                // -----------------------------------------
+                // READ LEDGER
+                // -----------------------------------------
 
                 const ledgerSnapshot =
                     await transaction.get(
@@ -358,6 +520,13 @@ async function creditDeposit({
                         ledgerSnapshot.data();
 
 
+                    const existingBalance =
+                        validateBalanceKobo(
+                            existingLedger
+                                .balanceAfterKobo
+                        );
+
+
                     return {
 
                         credited:
@@ -367,8 +536,7 @@ async function creditDeposit({
                             true,
 
                         balanceKobo:
-                            existingLedger
-                                .balanceAfterKobo
+                            existingBalance
 
                     };
 
@@ -376,7 +544,7 @@ async function creditDeposit({
 
 
                 // -----------------------------------------
-                // INITIAL BALANCE
+                // CURRENT BALANCE
                 // -----------------------------------------
 
                 let currentBalanceKobo =
@@ -392,18 +560,27 @@ async function creditDeposit({
 
 
                     currentBalanceKobo =
-                        wallet.balanceKobo;
+                        validateBalanceKobo(
+                            wallet.balanceKobo
+                        );
+
+
+                    const walletCurrency =
+                        String(
+                            wallet.currency ||
+                            DEFAULT_CURRENCY
+                        )
+                            .trim()
+                            .toUpperCase();
 
 
                     if (
-                        !Number.isSafeInteger(
-                            currentBalanceKobo
-                        ) ||
-                        currentBalanceKobo < 0
+                        walletCurrency !==
+                        normalizedCurrency
                     ) {
 
                         throw new Error(
-                            "Wallet contains an invalid balance."
+                            "Wallet currency mismatch."
                         );
 
                     }
@@ -417,7 +594,7 @@ async function creditDeposit({
 
                 const newBalanceKobo =
                     currentBalanceKobo +
-                    amountKobo;
+                    validatedAmountKobo;
 
 
                 if (
@@ -434,7 +611,15 @@ async function creditDeposit({
 
 
                 // -----------------------------------------
-                // CREATE WALLET IF NEEDED
+                // TRANSACTION TIME
+                // -----------------------------------------
+
+                const now =
+                    new Date();
+
+
+                // -----------------------------------------
+                // UPDATE WALLET
                 // -----------------------------------------
 
                 transaction.set(
@@ -447,10 +632,10 @@ async function creditDeposit({
                             newBalanceKobo,
 
                         currency:
-                            "NGN",
+                            normalizedCurrency,
 
                         updatedAt:
-                            new Date()
+                            now
 
                     },
                     {
@@ -463,6 +648,10 @@ async function creditDeposit({
                 // -----------------------------------------
                 // CREATE LEDGER ENTRY
                 // -----------------------------------------
+                //
+                // This is the permanent financial history
+                // record for the wallet credit.
+                // -----------------------------------------
 
                 transaction.create(
                     ledgerRef,
@@ -471,18 +660,25 @@ async function creditDeposit({
                         uid,
 
                         type:
-                            "deposit",
+                            DEPOSIT_TYPE,
+
+                        direction:
+                            CREDIT_DIRECTION,
+
+                        status:
+                            SUCCESSFUL_STATUS,
 
                         provider:
-                            provider ||
-                            "unknown",
+                            normalizedProvider,
 
                         reference:
-                            String(
-                                reference
-                            ),
+                            normalizedReference,
 
-                        amountKobo,
+                        amountKobo:
+                            validatedAmountKobo,
+
+                        currency:
+                            normalizedCurrency,
 
                         balanceBeforeKobo:
                             currentBalanceKobo,
@@ -491,7 +687,7 @@ async function creditDeposit({
                             newBalanceKobo,
 
                         createdAt:
-                            new Date()
+                            now
 
                     }
                 );
@@ -518,9 +714,11 @@ async function creditDeposit({
 
         uid,
 
-        reference,
+        reference:
+            normalizedReference,
 
-        amountKobo,
+        amountKobo:
+            validatedAmountKobo,
 
         credited:
             result.credited,
@@ -548,4 +746,4 @@ module.exports = {
 
     creditDeposit
 
-};
+}; 
