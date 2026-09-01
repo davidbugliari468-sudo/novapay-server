@@ -14,7 +14,7 @@ const { db, auth: adminAuth } = require("./firebase-admin");
 const {
   getWallet
 } = require("./wallet.js/wallet");
-
+const airtimeRoutes = require("./airtime/routes");
 const addMoneyRoutes = require("./add-money/routes");
 const {
   handlePaystackWebhook
@@ -227,6 +227,10 @@ app.use(
 app.use(
     "/api/notifications",
     notificationRoutes
+);
+app.use(
+  "/api/airtime",
+  airtimeRoutes
 );
 // =====================================================
 // PROTECTED AUTH TEST ROUTE
