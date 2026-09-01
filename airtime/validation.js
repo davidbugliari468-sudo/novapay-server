@@ -1,74 +1,51 @@
-// airtime/validation.js
-
-// =====================================================
-// NOVAPAY — AIRTIME VALIDATION
-// =====================================================
-//
-// Purpose:
-//
-// This module validates and normalizes all Airtime
-// purchase input before it reaches the transaction
-// service or VTU provider.
-//
-// IMPORTANT:
-//
-// - Frontend input is never trusted.
-// - Amounts are converted to kobo here.
-// - Phone numbers are normalized to Nigerian format.
-// - Networks are normalized to canonical internal names.
-// - No wallet logic belongs in this file.
-// - No provider logic belongs in this file.
-//
-// Canonical networks:
-//
-//   mtn
-//   glo
-//   airtel
-//   9mobile
-//
-// Canonical phone format:
-//
-//   08012345678
-//
-// Canonical money format:
-//
-//   integer kobo
-//
-// Example:
-//
-//   "100"     → 10000
-//   "100.50"  → 10050
-//
-// =====================================================
+"use strict";
 
 
 // =====================================================
-// CONSTANTS
+// NOVAPAY — AIRTIME REQUEST VALIDATION
 // =====================================================
-
-const MIN_AIRTIME_NAIRA = 50;
-
-const MAX_AIRTIME_NAIRA = 50000;
-
-const MIN_AIRTIME_KOBO =
-    MIN_AIRTIME_NAIRA * 100;
-
-const MAX_AIRTIME_KOBO =
-    MAX_AIRTIME_NAIRA * 100;
+//
+// RESPONSIBILITY
+//
+// This module validates and normalizes Airtime requests.
+//
+// It is deliberately independent from:
+//
+// - Firestore
+// - wallet balances
+// - wallet reservations
+// - VTU.ng
+// - transaction creation
+// - authentication
+//
+// The service layer will receive only validated values.
+//
+// FLOW:
+//
+// HTTP request
+//     ↓
+// validation.js
+//     ↓
+// normalized Airtime request
+//     ↓
+// airtime/service.js
+//
+// =====================================================
 
 
 // =====================================================
 // SUPPORTED NETWORKS
 // =====================================================
 //
-// These are NovaPay's internal canonical names.
+// These are the network identifiers NovaPay sends to
+// the provider adapter.
 //
-// Provider-specific network IDs must NOT be placed
-// here. Those belong in the VTU provider adapter.
+// Keep provider-specific HTTP details OUT of this file.
+//
 // =====================================================
 
 const SUPPORTED_NETWORKS =
-    Object.freeze([
+    new Set([
         "mtn",
         "glo",
         "airtel",
@@ -77,106 +54,134 @@ const SUPPORTED_NETWORKS =
 
 
 // =====================================================
-// NETWORK ALIASES
+// DEFAULT LIMITS
 // =====================================================
 //
-// Multiple frontend/provider naming conventions can map
-// into one canonical NovaPay network name.
+// Amounts are represented internally in kobo.
 //
-// IMPORTANT:
+// Defaults:
 //
-// The lookup keys are already normalized to lowercase.
+// minimum = ₦50
+// maximum = ₦50,000
+//
+// Environment variables may override these limits.
+//
 // =====================================================
 
-const NETWORK_ALIASES =
-    Object.freeze({
+const DEFAULT_MIN_AMOUNT_KOBO =
+    5000;
 
-        mtn:
-            "mtn",
+const DEFAULT_MAX_AMOUNT_KOBO =
+    5000000;
 
-        "mtn-ng":
-            "mtn",
 
-        glo:
-            "glo",
+function getConfiguredAmountLimit(
+    environmentName,
+    fallback
+) {
 
-        "glo-ng":
-            "glo",
+    const configured =
+        Number(
+            process.env[
+                environmentName
+            ]
+        );
 
-        airtel:
-            "airtel",
 
-        "airtel-ng":
-            "airtel",
+    if (
+        Number.isSafeInteger(
+            configured
+        ) &&
+        configured > 0
+    ) {
 
-        "9mobile":
-            "9mobile",
+        return configured;
 
-        "9mobile-ng":
-            "9mobile",
+    }
 
-        etisalat:
-            "9mobile",
 
-        "etisalat-ng":
-            "9mobile"
+    return fallback;
 
-    });
+}
+
+
+const MIN_AIRTIME_AMOUNT_KOBO =
+    getConfiguredAmountLimit(
+        "MIN_AIRTIME_AMOUNT_KOBO",
+        DEFAULT_MIN_AMOUNT_KOBO
+    );
+
+
+const MAX_AIRTIME_AMOUNT_KOBO =
+    getConfiguredAmountLimit(
+        "MAX_AIRTIME_AMOUNT_KOBO",
+        DEFAULT_MAX_AMOUNT_KOBO
+    );
+
+
+// =====================================================
+// BASIC ERROR FACTORY
+// =====================================================
+
+function createValidationError(
+    message
+) {
+
+    const error =
+        new Error(
+            message
+        );
+
+    error.statusCode =
+        400;
+
+    error.code =
+        "INVALID_AIRTIME_REQUEST";
+
+    return error;
+
+}
 
 
 // =====================================================
 // NORMALIZE NETWORK
 // =====================================================
 
-function normalizeNetwork(value) {
+function normalizeNetwork(
+    network
+) {
 
-    const network =
+    const normalized =
         String(
-            value ?? ""
+            network ?? ""
         )
             .trim()
             .toLowerCase();
 
 
-    if (!network) {
+    if (!normalized) {
 
-        return "";
+        throw createValidationError(
+            "Airtime network is required."
+        );
 
     }
 
 
-    return (
-        NETWORK_ALIASES[network] ||
-        network
-    );
-
-}
-
-
-// =====================================================
-// VALIDATE NETWORK
-// =====================================================
-
-function validateNetwork(value) {
-
-    const network =
-        normalizeNetwork(value);
-
-
     if (
-        !SUPPORTED_NETWORKS.includes(
-            network
+        !SUPPORTED_NETWORKS.has(
+            normalized
         )
     ) {
 
-        throw new Error(
+        throw createValidationError(
             "Unsupported Airtime network."
         );
 
     }
 
 
-    return network;
+    return normalized;
 
 }
 
@@ -185,211 +190,275 @@ function validateNetwork(value) {
 // NORMALIZE PHONE NUMBER
 // =====================================================
 //
-// Accepted:
+// Accepted examples:
 //
-//   08012345678
-//   07012345678
-//   08112345678
-//   +2348012345678
-//   2348012345678
+// 08012345678
+// 08123456789
+// 09012345678
+// 09112345678
 //
-// Internal result:
+// Also accepts:
 //
-//   08012345678
+// +2348012345678
+// 2348012345678
 //
-// Spaces, brackets and hyphens are removed.
+// Everything is normalized to:
+//
+// 08012345678
+//
+// This prevents different representations of the same
+// Nigerian number from reaching the business layer.
+//
 // =====================================================
 
-function normalizePhoneNumber(value) {
+function normalizePhoneNumber(
+    phoneNumber
+) {
 
-    let phone =
+    const raw =
         String(
-            value ?? ""
+            phoneNumber ?? ""
+        ).trim();
+
+
+    if (!raw) {
+
+        throw createValidationError(
+            "Airtime phone number is required."
+        );
+
+    }
+
+
+    /*
+     * Remove harmless formatting characters.
+     *
+     * We intentionally do NOT blindly remove arbitrary
+     * characters because malformed input should be rejected.
+     */
+
+    const cleaned =
+        raw.replace(
+            /[\s()-]/g,
+            ""
+        );
+
+
+    let normalized =
+        cleaned;
+
+
+    /*
+     * +234XXXXXXXXXX
+     */
+
+    if (
+        normalized.startsWith(
+            "+234"
         )
-            .trim()
-            .replace(
-                /[\s()-]/g,
-                ""
+    ) {
+
+        normalized =
+            "0" +
+            normalized.slice(
+                4
             );
 
-
-    if (!phone) {
-
-        return "";
-
     }
 
-
-    // ---------------------------------------------
-    // INTERNATIONAL NIGERIAN FORMAT
-    // +2348012345678
-    // ---------------------------------------------
-
-    if (
-        phone.startsWith("+234")
-    ) {
-
-        phone =
-            "0" +
-            phone.slice(4);
-
-    }
-
-
-    // ---------------------------------------------
-    // INTERNATIONAL NIGERIAN FORMAT WITHOUT +
-    // 2348012345678
-    // ---------------------------------------------
+    /*
+     * 234XXXXXXXXXX
+     */
 
     else if (
-        phone.startsWith("234") &&
-        phone.length === 13
-    ) {
-
-        phone =
-            "0" +
-            phone.slice(3);
-
-    }
-
-
-    return phone;
-
-}
-
-
-// =====================================================
-// VALIDATE PHONE NUMBER
-// =====================================================
-//
-// Nigerian mobile numbers:
-//
-//   070xxxxxxxx
-//   080xxxxxxxx
-//   081xxxxxxxx
-//   090xxxxxxxx
-//   091xxxxxxxx
-//
-// The second digit after the leading 0 must be one
-// of 7, 8 or 9.
-//
-// The third digit must be 0 or 1.
-//
-// Total length = 11 digits.
-// =====================================================
-
-function validatePhoneNumber(value) {
-
-    const phone =
-        normalizePhoneNumber(value);
-
-
-    if (
-        !/^0[789][01]\d{8}$/.test(
-            phone
+        normalized.startsWith(
+            "234"
         )
     ) {
 
-        throw new Error(
+        normalized =
+            "0" +
+            normalized.slice(
+                3
+            );
+
+    }
+
+
+    /*
+     * Nigerian local format:
+     *
+     * 0 + 10 digits
+     */
+
+    if (
+        !/^0\d{10}$/.test(
+            normalized
+        )
+    ) {
+
+        throw createValidationError(
             "Enter a valid Nigerian Airtime phone number."
         );
 
     }
 
 
-    return phone;
+    /*
+     * Nigerian mobile numbers currently use mobile
+     * prefixes beginning with 070–079, 080–089,
+     * 090–099 and 081–091 ranges.
+     *
+     * This deliberately validates the structure rather
+     * than trying to determine the subscriber's actual
+     * network from the number.
+     *
+     * The selected network remains a separate request
+     * field.
+     */
+
+    const prefix =
+        normalized.slice(
+            0,
+            4
+        );
+
+
+    const validMobilePrefix =
+        /^(070|071|080|081|090|091|080|081|082|083|084|085|086|087|088|089|092|093|094|095|096|097|098|099)$/
+            .test(
+                prefix
+            );
+
+
+    if (
+        !validMobilePrefix
+    ) {
+
+        throw createValidationError(
+            "Enter a valid Nigerian phone number."
+        );
+
+    }
+
+
+    return normalized;
 
 }
 
 
 // =====================================================
-// NAIRA → KOBO
+// PARSE WHOLE NAIRA AMOUNT
 // =====================================================
 //
-// We intentionally parse the decimal string instead of
-// relying on floating-point multiplication.
+// Public API requests use whole naira.
 //
-// Good:
+// Examples:
 //
-//   "100"       → 10000
-//   "100.5"     → 10050
-//   "100.50"    → 10050
-//   "50.01"     → 5001
+// "100"   → 10000 kobo
+// 100     → 10000 kobo
+// "100.00" is accepted
 //
-// Invalid:
+// Decimal fractions of a naira are rejected.
 //
-//   "100.123"
-//   "₦100"
-//   "1,000"
-//   "-100"
-//   "abc"
-//   ""
+// We do not use floating point arithmetic for the final
+// financial value.
 //
 // =====================================================
 
-function nairaToKobo(amountNaira) {
-
-    const normalized =
-        String(
-            amountNaira ?? ""
-        )
-            .trim();
-
+function parseAmountKobo(
+    amount
+) {
 
     if (
-        !/^\d+(\.\d{1,2})?$/.test(
-            normalized
-        )
+        typeof amount ===
+        "number"
     ) {
 
-        throw new Error(
+        if (
+            !Number.isSafeInteger(
+                amount
+            ) ||
+            amount <= 0
+        ) {
+
+            throw createValidationError(
+                "Invalid Airtime amount."
+            );
+
+        }
+
+
+        return amount * 100;
+
+    }
+
+
+    const text =
+        String(
+            amount ?? ""
+        ).trim();
+
+
+    if (!text) {
+
+        throw createValidationError(
             "Invalid Airtime amount."
         );
 
     }
 
 
-    const parts =
-        normalized.split(".");
+    /*
+     * Whole naira or exactly .00.
+     */
+
+    if (
+        !/^\d+(?:\.00)?$/.test(
+            text
+        )
+    ) {
+
+        throw createValidationError(
+            "Airtime amount must be a valid whole-naira amount."
+        );
+
+    }
 
 
-    const nairaPart =
-        parts[0];
-
-
-    const decimalPart =
-        parts[1] || "";
+    const nairaText =
+        text.endsWith(
+            ".00"
+        )
+            ? text.slice(
+                0,
+                -3
+            )
+            : text;
 
 
     const naira =
         Number(
-            nairaPart
+            nairaText
         );
 
 
     if (
         !Number.isSafeInteger(
             naira
-        )
+        ) ||
+        naira <= 0
     ) {
 
-        throw new Error(
-            "Airtime amount is too large."
+        throw createValidationError(
+            "Invalid Airtime amount."
         );
 
     }
 
 
-    const koboPart =
-        Number(
-            (decimalPart + "00")
-                .slice(0, 2)
-        );
-
-
     const amountKobo =
-        naira * 100 +
-        koboPart;
+        naira * 100;
 
 
     if (
@@ -398,8 +467,8 @@ function nairaToKobo(amountNaira) {
         )
     ) {
 
-        throw new Error(
-            "Airtime amount is too large."
+        throw createValidationError(
+            "Invalid Airtime amount."
         );
 
     }
@@ -411,33 +480,20 @@ function nairaToKobo(amountNaira) {
 
 
 // =====================================================
-// VALIDATE AMOUNT
-// =====================================================
-//
-// Returns integer kobo.
-//
-// Minimum:
-//
-//   ₦50
-//
-// Maximum:
-//
-//   ₦50,000
+// VALIDATE AMOUNT LIMITS
 // =====================================================
 
-function validateAmountNaira(value) {
-
-    const amountKobo =
-        nairaToKobo(value);
-
+function validateAmountLimits(
+    amountKobo
+) {
 
     if (
         amountKobo <
-        MIN_AIRTIME_KOBO
+        MIN_AIRTIME_AMOUNT_KOBO
     ) {
 
-        throw new Error(
-            `Minimum Airtime amount is ₦${MIN_AIRTIME_NAIRA}.`
+        throw createValidationError(
+            `Minimum Airtime amount is ₦${MIN_AIRTIME_AMOUNT_KOBO / 100}.`
         );
 
     }
@@ -445,11 +501,11 @@ function validateAmountNaira(value) {
 
     if (
         amountKobo >
-        MAX_AIRTIME_KOBO
+        MAX_AIRTIME_AMOUNT_KOBO
     ) {
 
-        throw new Error(
-            `Maximum Airtime amount is ₦${MAX_AIRTIME_NAIRA.toLocaleString()}.`
+        throw createValidationError(
+            `Maximum Airtime amount is ₦${MAX_AIRTIME_AMOUNT_KOBO / 100}.`
         );
 
     }
@@ -461,10 +517,37 @@ function validateAmountNaira(value) {
 
 
 // =====================================================
-// VALIDATE REQUEST
+// VALIDATE REQUEST OBJECT
+// =====================================================
+
+function validateRequestObject(
+    request
+) {
+
+    if (
+        !request ||
+        typeof request !==
+        "object" ||
+        Array.isArray(request)
+    ) {
+
+        throw createValidationError(
+            "Airtime request is required."
+        );
+
+    }
+
+
+    return request;
+
+}
+
+
+// =====================================================
+// PUBLIC VALIDATOR
 // =====================================================
 //
-// Expected input:
+// Input:
 //
 // {
 //     phoneNumber: "08012345678",
@@ -472,59 +555,54 @@ function validateAmountNaira(value) {
 //     amount: "100"
 // }
 //
-// Also accepts:
+// Output:
 //
-// body.phone
+// {
+//     phoneNumber: "08012345678",
+//     network: "mtn",
+//     amountKobo: 10000
+// }
 //
-// and:
-//
-// body.serviceId
-//
-// for compatibility with existing frontend payloads.
-//
-// Returns only normalized, trusted values.
 // =====================================================
 
-function validateAirtimeRequest(body) {
+function validateAirtimeRequest(
+    request
+) {
 
-    if (
-        !body ||
-        typeof body !== "object" ||
-        Array.isArray(body)
-    ) {
-
-        throw new Error(
-            "Airtime request is required."
-        );
-
-    }
-
-
-    const phoneNumber =
-        validatePhoneNumber(
-            body.phoneNumber ??
-            body.phone
+    const body =
+        validateRequestObject(
+            request
         );
 
 
     const network =
-        validateNetwork(
-            body.network ??
-            body.serviceId
+        normalizeNetwork(
+            body.network
+        );
+
+
+    const phoneNumber =
+        normalizePhoneNumber(
+            body.phoneNumber
         );
 
 
     const amountKobo =
-        validateAmountNaira(
+        parseAmountKobo(
             body.amount
         );
 
 
+    validateAmountLimits(
+        amountKobo
+    );
+
+
     return {
 
-        phoneNumber,
-
         network,
+
+        phoneNumber,
 
         amountKobo
 
@@ -539,28 +617,20 @@ function validateAirtimeRequest(body) {
 
 module.exports = {
 
-    MIN_AIRTIME_NAIRA,
-
-    MAX_AIRTIME_NAIRA,
-
-    MIN_AIRTIME_KOBO,
-
-    MAX_AIRTIME_KOBO,
-
-    SUPPORTED_NETWORKS,
+    validateAirtimeRequest,
 
     normalizeNetwork,
 
-    validateNetwork,
-
     normalizePhoneNumber,
 
-    validatePhoneNumber,
+    parseAmountKobo,
 
-    nairaToKobo,
+    validateAmountLimits,
 
-    validateAmountNaira,
+    SUPPORTED_NETWORKS,
 
-    validateAirtimeRequest
+    MIN_AIRTIME_AMOUNT_KOBO,
+
+    MAX_AIRTIME_AMOUNT_KOBO
 
 };

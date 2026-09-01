@@ -2,17 +2,16 @@
 
 const express = require("express");
 
-const router =
-    express.Router();
+const router = express.Router();
 
 
 // =====================================================
-// NOVAPAY AIRTIME ROUTES
+// NOVAPAY — AIRTIME HTTP ROUTES
 // =====================================================
 //
 // RESPONSIBILITY
 //
-// This file is the HTTP/API layer for Airtime.
+// This file is ONLY the HTTP/API boundary for Airtime.
 //
 // Flow:
 //
@@ -26,21 +25,28 @@ const router =
 //    ↓
 // Airtime service
 //    ↓
-// VTU.ng adapter
+// Wallet reservation
 //    ↓
-// Wallet reservation/commit/release
+// VTU.ng
+//    ↓
+// Commit / release / pending
 //
-// IMPORTANT:
+// IMPORTANT
 //
-// The frontend must NEVER:
+// This file MUST NOT:
 //
+// - debit wallets
+// - reserve wallet funds directly
+// - release wallet funds directly
+// - call Firestore financial operations directly
 // - call VTU.ng directly
-// - provide provider credentials
-// - provide provider cost
-// - decide transaction status
-// - debit the wallet
-// - release wallet funds
-// - create financial transactions
+// - trust frontend wallet balances
+// - accept provider cost from frontend
+// - accept transaction status from frontend
+// - accept provider credentials from frontend
+//
+// Those responsibilities belong to the service and
+// reservation/provider layers.
 //
 // =====================================================
 
@@ -51,8 +57,7 @@ const router =
 
 const {
     validateAirtimeRequest
-} =
-    require("./validation");
+} = require("./validation");
 
 
 // =====================================================
@@ -66,24 +71,28 @@ const airtimeService =
 // =====================================================
 // IMPORT VTU PROVIDER
 // =====================================================
+//
+// The service may use the provider adapter internally.
+//
+// The route does not call VTU directly.
+//
+// =====================================================
 
 const vtu =
     require("./vtu");
 
 
 // =====================================================
-// AUTHENTICATION
+// AUTHENTICATION RESOLUTION
 // =====================================================
 //
-// NovaPay authentication may already be implemented by
-// the application's root auth middleware.
+// NovaPay may expose its authentication middleware under
+// different names depending on the existing auth module.
 //
-// We deliberately resolve the middleware dynamically so
-// this route can work with the existing auth.js export
-// naming without duplicating Firebase authentication
-// logic here.
+// We resolve the existing middleware instead of creating
+// a second authentication implementation here.
 //
-// Authentication MUST happen before the Airtime service.
+// Authentication must happen BEFORE the Airtime service.
 //
 // =====================================================
 
@@ -99,7 +108,7 @@ function getAuthenticationMiddleware() {
 
     }
 
-    catch {
+    catch (error) {
 
         throw new Error(
             "NovaPay authentication module could not be loaded."
@@ -146,6 +155,11 @@ function getAuthenticationMiddleware() {
     }
 
 
+    /*
+     * Support an auth module that exports the middleware
+     * directly as the module itself.
+     */
+
     if (
         typeof authModule ===
         "function"
@@ -164,14 +178,14 @@ function getAuthenticationMiddleware() {
 
 
 // =====================================================
-// AUTHENTICATED USER ID
+// AUTHENTICATED UID
 // =====================================================
 //
 // Different authentication middleware implementations
-// may place the Firebase user in different request
-// properties.
+// can attach the authenticated Firebase user to different
+// request properties.
 //
-// We normalize those possibilities here.
+// Normalize those possibilities into one UID.
 //
 // =====================================================
 
@@ -188,8 +202,7 @@ function getAuthenticatedUid(
 
 
     if (
-        typeof uid !== "string" ||
-        !uid.trim()
+        typeof uid !== "string"
     ) {
 
         return null;
@@ -197,7 +210,12 @@ function getAuthenticatedUid(
     }
 
 
-    return uid.trim();
+    const normalized =
+        uid.trim();
+
+
+    return normalized ||
+        null;
 
 }
 
@@ -206,13 +224,17 @@ function getAuthenticatedUid(
 // SAFE ERROR MESSAGE
 // =====================================================
 //
-// Do not expose:
+// Never expose:
 //
 // - provider credentials
-// - JWT tokens
-// - raw provider payloads
+// - access tokens
+// - JWTs
 // - stack traces
-// - internal database information
+// - Firestore internals
+// - raw provider payloads
+// - internal database paths
+//
+// Only deliberately safe business messages are returned.
 //
 // =====================================================
 
@@ -233,10 +255,6 @@ function getSafeErrorMessage(
 
     }
 
-
-    /*
-     * Known business/application errors are safe to return.
-     */
 
     const safeMessages = new Set([
 
@@ -262,7 +280,9 @@ function getSafeErrorMessage(
 
         "Unable to reserve wallet funds.",
 
-        "Your wallet balance is insufficient."
+        "Your wallet balance is insufficient.",
+
+        "Insufficient wallet balance."
 
     ]);
 
@@ -279,8 +299,7 @@ function getSafeErrorMessage(
 
 
     /*
-     * Keep common validation/configuration messages that
-     * are already intended for API consumers.
+     * Preserve configured Airtime limit messages.
      */
 
     if (
@@ -306,7 +325,8 @@ function getSafeErrorMessage(
 
 
     /*
-     * Everything else receives a generic response.
+     * Provider errors and unexpected internal errors
+     * must not be exposed directly to the client.
      */
 
     return "Unable to process Airtime request.";
@@ -315,46 +335,55 @@ function getSafeErrorMessage(
 
 
 // =====================================================
-// HTTP STATUS FROM ERROR
+// HTTP ERROR STATUS
+// =====================================================
+//
+// Service errors may carry statusCode/status.
+//
+// Only valid client-error status codes are accepted.
+//
+// Everything else becomes HTTP 500.
+//
 // =====================================================
 
 function getErrorStatus(
     error
 ) {
 
+    const statusCode =
+        Number(
+            error?.statusCode
+        );
+
+
     if (
-        error?.statusCode &&
         Number.isInteger(
-            Number(
-                error.statusCode
-            )
-        )
+            statusCode
+        ) &&
+        statusCode >= 400 &&
+        statusCode <= 499
     ) {
 
-        const status =
-            Number(
-                error.statusCode
-            );
-
-
-        if (
-            status >= 400 &&
-            status <= 499
-        ) {
-
-            return status;
-
-        }
+        return statusCode;
 
     }
 
 
+    const status =
+        Number(
+            error?.status
+        );
+
+
     if (
-        error?.status >= 400 &&
-        error?.status <= 499
+        Number.isInteger(
+            status
+        ) &&
+        status >= 400 &&
+        status <= 499
     ) {
 
-        return error.status;
+        return status;
 
     }
 
@@ -365,24 +394,22 @@ function getErrorStatus(
 
 
 // =====================================================
-// PURCHASE AIRTIME
+// POST /purchase
 // =====================================================
 //
-// POST /airtime/purchase
+// Purchase Airtime.
 //
-// Expected body:
+// Expected frontend body:
 //
 // {
 //     "phoneNumber": "08012345678",
-//     "network": "mtn",
-//     "amount": "100"
+//     "network": "glo",
+//     "amount": "50"
 // }
 //
-// The validation layer converts:
+// The frontend supplies ONLY the customer request.
 //
-// N100
-// ↓
-// 10000 kobo
+// The server calculates the financial amount.
 //
 // =====================================================
 
@@ -394,11 +421,9 @@ router.post(
         res
     ) => {
 
-        /*
-         * -------------------------------------------------
-         * AUTHENTICATION
-         * -------------------------------------------------
-         */
+        // -------------------------------------------------
+        // AUTHENTICATED UID
+        // -------------------------------------------------
 
         const uid =
             getAuthenticatedUid(
@@ -423,13 +448,15 @@ router.post(
         }
 
 
-        /*
-         * -------------------------------------------------
-         * REQUEST VALIDATION
-         * -------------------------------------------------
-         *
-         * Validation happens before the business service.
-         */
+        // -------------------------------------------------
+        // VALIDATE REQUEST
+        // -------------------------------------------------
+        //
+        // Validation happens before the financial service.
+        //
+        // This prevents malformed requests from reaching
+        // wallet reservation or VTU.ng.
+        //
 
         let validated;
 
@@ -446,7 +473,9 @@ router.post(
         catch (error) {
 
             return res.status(
-                400
+                getErrorStatus(
+                    error
+                )
             ).json({
 
                 success:
@@ -462,20 +491,15 @@ router.post(
         }
 
 
-        /*
-         * -------------------------------------------------
-         * EXECUTE AIRTIME PURCHASE
-         * -------------------------------------------------
-         *
-         * The service owns:
-         *
-         * - transaction creation
-         * - wallet reservation
-         * - provider call
-         * - provider interpretation
-         * - wallet commit/release
-         * - pending state
-         */
+        // -------------------------------------------------
+        // EXECUTE PURCHASE
+        // -------------------------------------------------
+        //
+        // The Airtime service owns the complete business
+        // workflow.
+        //
+        // The route does NOT perform financial operations.
+        //
 
         try {
 
@@ -499,13 +523,12 @@ router.post(
                 });
 
 
-            /*
-             * ------------------------------------------------
-             * SUCCESSFUL AIRTIME
-             * ------------------------------------------------
-             */
+            // =============================================
+            // SUCCESS
+            // =============================================
 
             if (
+                result &&
                 result.status ===
                 "successful"
             ) {
@@ -546,19 +569,18 @@ router.post(
             }
 
 
-            /*
-             * ------------------------------------------------
-             * PENDING AIRTIME
-             * ------------------------------------------------
-             *
-             * Pending is NOT an error.
-             *
-             * The frontend must show that the transaction
-             * is being processed and must NOT automatically
-             * submit another Airtime request.
-             */
+            // =============================================
+            // PENDING
+            // =============================================
+            //
+            // A pending provider result is NOT a failure.
+            //
+            // Most importantly, the frontend must not be
+            // encouraged to submit the same purchase again.
+            //
 
             if (
+                result &&
                 result.status ===
                 "pending"
             ) {
@@ -577,7 +599,7 @@ router.post(
                         result.transactionId,
 
                     status:
-                        result.status,
+                        "pending",
 
                     message:
                         result.message ||
@@ -588,13 +610,12 @@ router.post(
             }
 
 
-            /*
-             * ------------------------------------------------
-             * CONFIRMED FAILURE
-             * ------------------------------------------------
-             */
+            // =============================================
+            // CONFIRMED FAILURE
+            // =============================================
 
             if (
+                result &&
                 result.status ===
                 "failed"
             ) {
@@ -613,7 +634,7 @@ router.post(
                         result.transactionId,
 
                     status:
-                        result.status,
+                        "failed",
 
                     message:
                         result.message ||
@@ -624,14 +645,15 @@ router.post(
             }
 
 
-            /*
-             * ------------------------------------------------
-             * UNKNOWN SERVICE RESULT
-             * ------------------------------------------------
-             *
-             * Never assume success or failure if the service
-             * gives an unexpected status.
-             */
+            // =============================================
+            // UNKNOWN RESULT
+            // =============================================
+            //
+            // Never turn an unexpected service result into
+            // an assumed success or assumed failure.
+            //
+            // Financial state belongs to the service.
+            //
 
             return res.status(
                 202
@@ -644,7 +666,7 @@ router.post(
                     true,
 
                 transactionId:
-                    result.transactionId ||
+                    result?.transactionId ||
                     null,
 
                 status:
@@ -659,23 +681,26 @@ router.post(
 
         catch (error) {
 
-            /*
-             * ------------------------------------------------
-             * IMPORTANT
-             * ------------------------------------------------
-             *
-             * If the service throws after creating a pending
-             * transaction, we do not attempt to manually refund
-             * anything here.
-             *
-             * Wallet financial state belongs to the service
-             * and reservation layer.
-             */
+            // -------------------------------------------------
+            // SERVER LOG
+            // -------------------------------------------------
+            //
+            // Log only controlled diagnostic information.
+            //
+            // Do not log:
+            //
+            // - authorization tokens
+            // - provider passwords
+            // - provider JWT
+            // - complete provider response
+            //
 
             console.error(
                 "Airtime purchase error:",
                 {
+
                     uid,
+
                     message:
                         String(
                             error?.message ||
@@ -684,9 +709,14 @@ router.post(
                             0,
                             300
                         )
+
                 }
             );
 
+
+            // -------------------------------------------------
+            // CLIENT RESPONSE
+            // -------------------------------------------------
 
             return res.status(
                 getErrorStatus(
@@ -711,17 +741,18 @@ router.post(
 
 
 // =====================================================
-// GET AIRTIME TRANSACTION
+// GET /transaction/:transactionId
 // =====================================================
 //
-// GET /airtime/transaction/:transactionId
+// Retrieve one Airtime transaction.
 //
-// This allows the authenticated user to check the state
-// of their own Airtime transaction.
+// SECURITY:
 //
-// IMPORTANT:
+// The authenticated UID MUST match the transaction UID.
 //
-// A user may ONLY retrieve their own transaction.
+// A transaction belonging to another user is returned as
+// 404 instead of 403 so the endpoint does not disclose
+// whether another user's transaction exists.
 //
 // =====================================================
 
@@ -732,6 +763,10 @@ router.get(
         req,
         res
     ) => {
+
+        // -------------------------------------------------
+        // AUTHENTICATION
+        // -------------------------------------------------
 
         const uid =
             getAuthenticatedUid(
@@ -755,6 +790,10 @@ router.get(
 
         }
 
+
+        // -------------------------------------------------
+        // TRANSACTION ID
+        // -------------------------------------------------
 
         const transactionId =
             String(
@@ -780,6 +819,34 @@ router.get(
         }
 
 
+        /*
+         * Basic identifier length protection.
+         */
+
+        if (
+            transactionId.length >
+            200
+        ) {
+
+            return res.status(
+                400
+            ).json({
+
+                success:
+                    false,
+
+                error:
+                    "Airtime transaction ID is invalid."
+
+            });
+
+        }
+
+
+        // -------------------------------------------------
+        // LOAD TRANSACTION
+        // -------------------------------------------------
+
         try {
 
             const transaction =
@@ -787,6 +854,10 @@ router.get(
                     transactionId
                 );
 
+
+            // -------------------------------------------------
+            // NOT FOUND
+            // -------------------------------------------------
 
             if (!transaction) {
 
@@ -805,14 +876,12 @@ router.get(
             }
 
 
-            /*
-             * ------------------------------------------------
-             * OWNERSHIP CHECK
-             * ------------------------------------------------
-             *
-             * Never allow one authenticated user to inspect
-             * another user's transaction.
-             */
+            // -------------------------------------------------
+            // OWNERSHIP CHECK
+            // -------------------------------------------------
+            //
+            // Never expose another user's transaction.
+            //
 
             if (
                 transaction.uid !==
@@ -834,15 +903,13 @@ router.get(
             }
 
 
-            /*
-             * ------------------------------------------------
-             * SAFE FRONTEND RESPONSE
-             * ------------------------------------------------
-             *
-             * Do not expose internal reconciliation fields,
-             * provider errors, wallet reservation IDs, or
-             * internal accounting information.
-             */
+            // -------------------------------------------------
+            // SAFE RESPONSE
+            // -------------------------------------------------
+            //
+            // Internal wallet reservation/accounting fields
+            // are deliberately excluded.
+            //
 
             return res.status(
                 200
@@ -882,6 +949,10 @@ router.get(
                         transaction.rewardPoints ||
                         0,
 
+                    gainKobo:
+                        transaction.gainKobo ??
+                        null,
+
                     createdAt:
                         transaction.createdAt ||
                         null,
@@ -901,8 +972,11 @@ router.get(
             console.error(
                 "Airtime transaction lookup error:",
                 {
+
                     uid,
+
                     transactionId,
+
                     message:
                         String(
                             error?.message ||
@@ -911,6 +985,7 @@ router.get(
                             0,
                             300
                         )
+
                 }
             );
 

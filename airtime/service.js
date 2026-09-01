@@ -2,32 +2,58 @@
 
 const crypto = require("crypto");
 
-const { db } = require("../firebase-admin");
-const reservation = require("../wallet/reservation");
+const { db } =
+    require("../firebase-admin");
+
+const {
+    reserveFunds,
+    commitReservation,
+    releaseReservation,
+    getReservation
+} =
+    require("../wallet/reservation");
 
 
 // =====================================================
 // NOVAPAY — AIRTIME SERVICE
 // =====================================================
 //
-// RESPONSIBILITIES
+// RESPONSIBILITY
 //
-// 1. Validate Airtime request.
-// 2. Create an idempotent transaction.
-// 3. Reserve wallet funds.
-// 4. Call the provider adapter.
-// 5. Commit funds ONLY after confirmed success.
-// 6. Release funds ONLY after confirmed failure.
-// 7. Keep uncertain provider results pending.
-// 8. Maintain an auditable transaction record.
-// 9. Support secure reconciliation.
+// This module is the business orchestration layer for
+// Airtime purchases.
 //
-// IMPORTANT
+// Flow:
 //
-// The provider implementation is injected through
-// providerClient.
+//     authenticated route
+//             ↓
+//     validate request
+//             ↓
+//     create transaction
+//             ↓
+//     reserve wallet funds
+//             ↓
+//     link reservation to transaction
+//             ↓
+//     call VTU.ng adapter
+//             ↓
+//     ┌───────────────┬────────────────┬───────────────┐
+//     ↓               ↓                ↓
+//   SUCCESS         FAILURE          UNKNOWN
+//     ↓               ↓                ↓
+//   COMMIT         RELEASE          PENDING
+//     ↓               ↓                ↓
+//   completed       failed          reconciliation
 //
-// This service NEVER contains VTU.ng-specific API logic.
+// IMPORTANT FINANCIAL RULE:
+//
+// The service NEVER decides that an unknown provider
+// response is a failure.
+//
+// Only an explicit provider failure can release funds.
+//
+// Only an explicit provider success can commit funds.
+//
 // =====================================================
 
 
@@ -35,7 +61,7 @@ const reservation = require("../wallet/reservation");
 // COLLECTION
 // =====================================================
 
-const AIRTIME_TRANSACTIONS_COLLECTION =
+const TRANSACTIONS_COLLECTION =
     "airtimeTransactions";
 
 
@@ -43,11 +69,11 @@ const AIRTIME_TRANSACTIONS_COLLECTION =
 // CONSTANTS
 // =====================================================
 
+const SERVICE =
+    "airtime";
+
 const CURRENCY =
     "NGN";
-
-const SERVICE_TYPE =
-    "airtime";
 
 const STATUS_PENDING =
     "pending";
@@ -58,50 +84,49 @@ const STATUS_SUCCESSFUL =
 const STATUS_FAILED =
     "failed";
 
-const PROVIDER_SUCCESS =
-    "success";
 
-const PROVIDER_FAILURE =
-    "failure";
+// =====================================================
+// ERROR FACTORY
+// =====================================================
 
-const PROVIDER_UNKNOWN =
-    "unknown";
+function createError(
+    message,
+    statusCode = 500
+) {
+
+    const error =
+        new Error(
+            message
+        );
+
+    error.statusCode =
+        statusCode;
+
+    return error;
+
+}
 
 
 // =====================================================
-// REWARD CONFIGURATION
+// VALIDATE UID
 // =====================================================
 
-const configuredPointsPerNaira =
-    Number(
-        process.env.AIRTIME_POINTS_PER_NAIRA
-    );
-
-const POINTS_PER_NAIRA =
-    Number.isSafeInteger(
-        configuredPointsPerNaira
-    ) &&
-    configuredPointsPerNaira > 0
-        ? configuredPointsPerNaira
-        : 0;
-
-
-// =====================================================
-// VALIDATION
-// =====================================================
-
-function requireUid(uid) {
+function requireUid(
+    uid
+) {
 
     if (
         typeof uid !== "string" ||
         !uid.trim()
     ) {
 
-        throw new Error(
-            "Authenticated user ID is required."
+        throw createError(
+            "Authenticated user ID is required.",
+            401
         );
 
     }
+
 
     return uid.trim();
 
@@ -109,7 +134,49 @@ function requireUid(uid) {
 
 
 // =====================================================
-// AMOUNT
+// VALIDATE TRANSACTION ID
+// =====================================================
+
+function requireTransactionId(
+    transactionId
+) {
+
+    const normalized =
+        String(
+            transactionId || ""
+        ).trim();
+
+
+    if (!normalized) {
+
+        throw createError(
+            "Airtime transaction ID is required.",
+            400
+        );
+
+    }
+
+
+    if (
+        normalized.length >
+        200
+    ) {
+
+        throw createError(
+            "Airtime transaction ID is too long.",
+            400
+        );
+
+    }
+
+
+    return normalized;
+
+}
+
+
+// =====================================================
+// VALIDATE AMOUNT
 // =====================================================
 
 function validateAmountKobo(
@@ -123,12 +190,15 @@ function validateAmountKobo(
 
 
     if (
-        !Number.isSafeInteger(amount) ||
+        !Number.isSafeInteger(
+            amount
+        ) ||
         amount <= 0
     ) {
 
-        throw new Error(
-            "Airtime amount must be a positive integer in kobo."
+        throw createError(
+            "Airtime amount must be a positive integer in kobo.",
+            400
         );
 
     }
@@ -140,83 +210,14 @@ function validateAmountKobo(
 
 
 // =====================================================
-// PHONE
-// =====================================================
-
-function normalizePhoneNumber(
-    phoneNumber
-) {
-
-    let phone =
-        String(
-            phoneNumber || ""
-        )
-            .trim()
-            .replace(
-                /[\s\-()]/g,
-                ""
-            );
-
-
-    if (!phone) {
-
-        throw new Error(
-            "Airtime phone number is required."
-        );
-
-    }
-
-
-    if (
-        phone.startsWith("+234")
-    ) {
-
-        phone =
-            "0" +
-            phone.slice(4);
-
-    }
-
-
-    if (
-        phone.startsWith("234") &&
-        phone.length === 13
-    ) {
-
-        phone =
-            "0" +
-            phone.slice(3);
-
-    }
-
-
-    if (
-        !/^0[789][01]\d{8}$/.test(
-            phone
-        )
-    ) {
-
-        throw new Error(
-            "Enter a valid Nigerian Airtime phone number."
-        );
-
-    }
-
-
-    return phone;
-
-}
-
-
-// =====================================================
-// NETWORK
+// NORMALIZE NETWORK
 // =====================================================
 
 function normalizeNetwork(
     network
 ) {
 
-    const value =
+    const normalized =
         String(
             network || ""
         )
@@ -224,44 +225,24 @@ function normalizeNetwork(
             .toLowerCase();
 
 
-    const aliases = {
+    if (!normalized) {
 
-        "etisalat":
-            "9mobile",
+        throw createError(
+            "Airtime network is required.",
+            400
+        );
 
-        "9mobile-ng":
-            "9mobile",
-
-        "mtn-ng":
-            "mtn",
-
-        "glo-ng":
-            "glo",
-
-        "airtel-ng":
-            "airtel"
-
-    };
-
-
-    const normalized =
-        aliases[value] ||
-        value;
+    }
 
 
     if (
-        ![
-            "mtn",
-            "glo",
-            "airtel",
-            "9mobile"
-        ].includes(
-            normalized
-        )
+        normalized.length >
+        50
     ) {
 
-        throw new Error(
-            "Unsupported Airtime network."
+        throw createError(
+            "Airtime network is too long.",
+            400
         );
 
     }
@@ -273,7 +254,58 @@ function normalizeNetwork(
 
 
 // =====================================================
-// TRANSACTION ID
+// NORMALIZE PHONE
+// =====================================================
+
+function normalizePhone(
+    phoneNumber
+) {
+
+    const normalized =
+        String(
+            phoneNumber || ""
+        ).trim();
+
+
+    if (!normalized) {
+
+        throw createError(
+            "Airtime phone number is required.",
+            400
+        );
+
+    }
+
+
+    if (
+        normalized.length >
+        30
+    ) {
+
+        throw createError(
+            "Airtime phone number is too long.",
+            400
+        );
+
+    }
+
+
+    return normalized;
+
+}
+
+
+// =====================================================
+// CREATE TRANSACTION ID
+// =====================================================
+//
+// This ID is generated by NovaPay.
+//
+// It is NOT the VTU.ng request_id.
+//
+// vtu.js derives a provider-safe request ID from this
+// transaction ID.
+//
 // =====================================================
 
 function createTransactionId() {
@@ -283,7 +315,7 @@ function createTransactionId() {
         Date.now() +
         "_" +
         crypto
-            .randomBytes(12)
+            .randomBytes(16)
             .toString("hex")
     );
 
@@ -291,440 +323,72 @@ function createTransactionId() {
 
 
 // =====================================================
-// PROVIDER REFERENCE
+// TRANSACTION REFERENCE
+// =====================================================
+//
+// The transaction ID itself is used as the wallet
+// reservation reference.
+//
+// This gives us deterministic idempotency.
+//
 // =====================================================
 
-function normalizeProviderReference(
-    value
+function getReservationReference(
+    transactionId
 ) {
 
-    if (
-        value === undefined ||
-        value === null
-    ) {
-
-        return null;
-
-    }
-
-
-    const reference =
-        String(
-            value
-        )
-            .trim();
-
-
-    if (!reference) {
-
-        return null;
-
-    }
-
-
-    return reference.slice(
-        0,
-        200
+    return requireTransactionId(
+        transactionId
     );
 
 }
 
 
 // =====================================================
-// PROVIDER RESULT
+// TRANSACTION REFERENCE
+// =====================================================
+
+function getTransactionRef(
+    transactionId
+) {
+
+    return db
+        .collection(
+            TRANSACTIONS_COLLECTION
+        )
+        .doc(
+            requireTransactionId(
+                transactionId
+            )
+        );
+
+}
+
+
+// =====================================================
+// FIND EXISTING TRANSACTION
 // =====================================================
 //
-// Only normalized provider outcomes may control
-// reservation state.
+// This is the first idempotency barrier.
 //
-// success
-// failure
-// unknown
-// =====================================================
-
-function normalizeProviderResult(
-    result
-) {
-
-    if (
-        !result ||
-        typeof result !== "object"
-    ) {
-
-        return {
-
-            outcome:
-                PROVIDER_UNKNOWN,
-
-            providerReference:
-                null,
-
-            providerCostKobo:
-                null,
-
-            message:
-                "Provider response could not be verified."
-
-        };
-
-    }
-
-
-    const rawOutcome =
-        String(
-            result.outcome || ""
-        )
-            .trim()
-            .toLowerCase();
-
-
-    const outcome =
-        [
-            PROVIDER_SUCCESS,
-            PROVIDER_FAILURE,
-            PROVIDER_UNKNOWN
-        ].includes(
-            rawOutcome
-        )
-            ? rawOutcome
-            : PROVIDER_UNKNOWN;
-
-
-    let providerCostKobo =
-        null;
-
-
-    if (
-        result.providerCostKobo !==
-            undefined &&
-        result.providerCostKobo !==
-            null
-    ) {
-
-        const cost =
-            Number(
-                result.providerCostKobo
-            );
-
-
-        if (
-            Number.isSafeInteger(cost) &&
-            cost >= 0
-        ) {
-
-            providerCostKobo =
-                cost;
-
-        }
-
-    }
-
-
-    return {
-
-        outcome,
-
-        providerReference:
-            normalizeProviderReference(
-                result.providerReference
-            ),
-
-        providerCostKobo,
-
-        message:
-            String(
-                result.message || ""
-            )
-                .trim()
-                .slice(0, 500) ||
-            null
-
-    };
-
-}
-
-
-// =====================================================
-// GAIN
-// =====================================================
-
-function calculateGainKobo({
-    amountKobo,
-    providerCostKobo
-}) {
-
-    const amount =
-        validateAmountKobo(
-            amountKobo
-        );
-
-
-    if (
-        !Number.isSafeInteger(
-            providerCostKobo
-        ) ||
-        providerCostKobo < 0
-    ) {
-
-        return null;
-
-    }
-
-
-    const gain =
-        amount -
-        providerCostKobo;
-
-
-    if (
-        !Number.isSafeInteger(
-            gain
-        )
-    ) {
-
-        throw new Error(
-            "Unable to calculate Airtime gain."
-        );
-
-    }
-
-
-    return gain;
-
-}
-
-
-// =====================================================
-// REWARD POINTS
-// =====================================================
-
-function calculateRewardPoints(
-    amountKobo
-) {
-
-    const amount =
-        validateAmountKobo(
-            amountKobo
-        );
-
-
-    if (
-        POINTS_PER_NAIRA <= 0
-    ) {
-
-        return 0;
-
-    }
-
-
-    const amountNaira =
-        Math.floor(
-            amount / 100
-        );
-
-
-    const points =
-        amountNaira *
-        POINTS_PER_NAIRA;
-
-
-    if (
-        !Number.isSafeInteger(
-            points
-        )
-    ) {
-
-        throw new Error(
-            "Calculated reward points exceed supported limits."
-        );
-
-    }
-
-
-    return points;
-
-}
-
-
-// =====================================================
-// CREATE PENDING TRANSACTION
-// =====================================================
-
-async function createPendingTransaction({
-    uid,
-    transactionId,
-    network,
-    phoneNumber,
-    amountKobo
-}) {
-
-    const transactionRef =
-        db
-            .collection(
-                AIRTIME_TRANSACTIONS_COLLECTION
-            )
-            .doc(
-                transactionId
-            );
-
-
-    const now =
-        new Date();
-
-
-    const transactionData = {
-
-        id:
-            transactionId,
-
-        uid:
-            requireUid(uid),
-
-        service:
-            SERVICE_TYPE,
-
-        network,
-
-        phoneNumber,
-
-        amountKobo,
-
-        currency:
-            CURRENCY,
-
-        status:
-            STATUS_PENDING,
-
-        provider:
-            "vtu.ng",
-
-        providerReference:
-            null,
-
-        providerCostKobo:
-            null,
-
-        gainKobo:
-            null,
-
-        rewardPoints:
-            0,
-
-        reservationId:
-            null,
-
-        providerOutcome:
-            null,
-
-        reconciliationRequired:
-            false,
-
-        createdAt:
-            now,
-
-        updatedAt:
-            now
-
-    };
-
-
-    await transactionRef.create(
-        transactionData
-    );
-
-
-    return transactionData;
-
-}
-
-
-// =====================================================
-// UPDATE TRANSACTION
-// =====================================================
-
-async function updateTransaction(
-    transactionId,
-    updates
-) {
-
-    if (
-        typeof transactionId !==
-            "string" ||
-        !transactionId.trim()
-    ) {
-
-        throw new Error(
-            "Transaction ID is required."
-        );
-
-    }
-
-
-    if (
-        !updates ||
-        typeof updates !== "object"
-    ) {
-
-        throw new Error(
-            "Transaction updates are required."
-        );
-
-    }
-
-
-    const transactionRef =
-        db
-            .collection(
-                AIRTIME_TRANSACTIONS_COLLECTION
-            )
-            .doc(
-                transactionId
-            );
-
-
-    await transactionRef.update({
-
-        ...updates,
-
-        updatedAt:
-            new Date()
-
-    });
-
-}
-
-
-// =====================================================
-// GET TRANSACTION
+// A repeated purchase request must not create another
+// financial transaction when the same transaction ID is
+// already being processed.
+//
 // =====================================================
 
 async function getAirtimeTransaction(
     transactionId
 ) {
 
-    const id =
-        String(
-            transactionId || ""
-        )
-            .trim();
-
-
-    if (!id) {
-
-        throw new Error(
-            "Airtime transaction ID is required."
+    const ref =
+        getTransactionRef(
+            transactionId
         );
-
-    }
 
 
     const snapshot =
-        await db
-            .collection(
-                AIRTIME_TRANSACTIONS_COLLECTION
-            )
-            .doc(id)
-            .get();
+        await ref.get();
 
 
     if (
@@ -749,215 +413,1175 @@ async function getAirtimeTransaction(
 
 
 // =====================================================
-// RESERVATION HELPERS
+// CREATE INITIAL TRANSACTION
+// =====================================================
+//
+// This transaction record is created BEFORE wallet
+// reservation.
+//
+// Why?
+//
+// Because the Airtime operation needs a durable business
+// transaction ID before the provider call occurs.
+//
+// If reservation fails, the transaction is marked failed
+// without touching the wallet.
+//
 // =====================================================
 
-function ensureReservationModule() {
-
-    if (
-        !reservation ||
-        typeof reservation !==
-            "object"
-    ) {
-
-        throw new Error(
-            "Wallet reservation module is unavailable."
-        );
-
-    }
-
-}
-
-
-// =====================================================
-// RESERVE FUNDS
-// =====================================================
-
-async function reserveUserFunds({
+async function createInitialTransaction({
     uid,
-    amountKobo,
-    transactionId
+    transactionId,
+    network,
+    phoneNumber,
+    amountKobo
 }) {
 
-    ensureReservationModule();
-
-
-    if (
-        typeof reservation.reserveFunds !==
-        "function"
-    ) {
-
-        throw new Error(
-            "Wallet reservation service is not configured."
+    const authenticatedUid =
+        requireUid(
+            uid
         );
 
-    }
+
+    const normalizedTransactionId =
+        requireTransactionId(
+            transactionId
+        );
 
 
-    const result =
-        await reservation.reserveFunds({
+    const amount =
+        validateAmountKobo(
+            amountKobo
+        );
 
-            uid:
-                requireUid(uid),
 
-            reference:
-                transactionId,
+    const normalizedNetwork =
+        normalizeNetwork(
+            network
+        );
 
-            amountKobo:
-                validateAmountKobo(
-                    amountKobo
-                ),
 
-            currency:
-                CURRENCY,
+    const normalizedPhone =
+        normalizePhone(
+            phoneNumber
+        );
 
-            service:
-                SERVICE_TYPE,
 
-            metadata: {
+    const ref =
+        getTransactionRef(
+            normalizedTransactionId
+        );
 
-                transactionId,
 
-                source:
-                    "airtime"
+    const now =
+        new Date();
+
+
+    const transactionData = {
+
+        id:
+            normalizedTransactionId,
+
+        uid:
+            authenticatedUid,
+
+        service:
+            SERVICE,
+
+        network:
+            normalizedNetwork,
+
+        phoneNumber:
+            normalizedPhone,
+
+        amountKobo:
+            amount,
+
+        currency:
+            CURRENCY,
+
+        status:
+            STATUS_PENDING,
+
+        provider:
+            "vtu.ng",
+
+        providerReference:
+            null,
+
+        providerRequestId:
+            null,
+
+        providerStatus:
+            null,
+
+        providerCode:
+            null,
+
+        providerCostKobo:
+            null,
+
+        gainKobo:
+            null,
+
+        rewardPoints:
+            0,
+
+        reservationId:
+            null,
+
+        failureReason:
+            "",
+
+        providerOutcome:
+            null,
+
+        reconciliationRequired:
+            false,
+
+        createdAt:
+            now,
+
+        updatedAt:
+            now
+
+    };
+
+
+    try {
+
+        await db.runTransaction(
+            async firestoreTransaction => {
+
+                const snapshot =
+                    await firestoreTransaction.get(
+                        ref
+                    );
+
+
+                if (
+                    snapshot.exists
+                ) {
+
+                    const existing =
+                        snapshot.data();
+
+
+                    /*
+                     * Never allow one transaction ID to be
+                     * reused for a different user.
+                     */
+
+                    if (
+                        existing.uid !==
+                        authenticatedUid
+                    ) {
+
+                        throw createError(
+                            "Airtime transaction ownership mismatch.",
+                            403
+                        );
+
+                    }
+
+
+                    /*
+                     * Never allow the same transaction ID to
+                     * represent different financial details.
+                     */
+
+                    if (
+                        Number(
+                            existing.amountKobo
+                        ) !==
+                        amount ||
+                        String(
+                            existing.network ||
+                            ""
+                        ).toLowerCase() !==
+                        normalizedNetwork ||
+                        String(
+                            existing.phoneNumber ||
+                            ""
+                        ) !==
+                        normalizedPhone
+                    ) {
+
+                        throw createError(
+                            "Airtime transaction details do not match the existing transaction.",
+                            409
+                        );
+
+                    }
+
+
+                    return;
+
+                }
+
+
+                firestoreTransaction.create(
+                    ref,
+                    transactionData
+                );
 
             }
+        );
 
-        });
+    }
+
+    catch (error) {
+
+        throw error;
+
+    }
 
 
-    if (
-        !result ||
-        !result.reservationId
-    ) {
+    const created =
+        await getAirtimeTransaction(
+            normalizedTransactionId
+        );
+
+
+    if (!created) {
 
         throw new Error(
-            "Unable to reserve wallet funds."
+            "Airtime transaction could not be created."
         );
 
     }
 
 
-    return result;
+    return created;
 
 }
 
 
 // =====================================================
-// COMMIT FUNDS
+// UPDATE TRANSACTION
+// =====================================================
+//
+// All financial state transitions are performed through
+// wallet/reservation.js.
+//
+// This function only updates the Airtime business record.
+//
 // =====================================================
 
-async function commitReservedFunds({
+async function updateTransaction(
+    transactionId,
+    updates
+) {
+
+    const ref =
+        getTransactionRef(
+            transactionId
+        );
+
+
+    const safeUpdates =
+        {
+            ...updates,
+            updatedAt:
+                new Date()
+        };
+
+
+    await ref.update(
+        safeUpdates
+    );
+
+
+    return getAirtimeTransaction(
+        transactionId
+    );
+
+}
+
+
+// =====================================================
+// CALCULATE GAIN
+// =====================================================
+//
+// Customer amount:
+//
+// amountKobo
+//
+// Provider cost:
+//
+// providerCostKobo
+//
+// Gross gain:
+//
+// amountKobo - providerCostKobo
+//
+// The result can never be negative.
+//
+// If VTU does not provide a valid provider cost,
+// gain remains null.
+//
+// =====================================================
+
+function calculateGainKobo(
+    amountKobo,
+    providerCostKobo
+) {
+
+    const amount =
+        Number(
+            amountKobo
+        );
+
+
+    const providerCost =
+        Number(
+            providerCostKobo
+        );
+
+
+    if (
+        !Number.isSafeInteger(
+            amount
+        ) ||
+        amount < 0
+    ) {
+
+        return null;
+
+    }
+
+
+    if (
+        !Number.isSafeInteger(
+            providerCost
+        ) ||
+        providerCost < 0
+    ) {
+
+        return null;
+
+    }
+
+
+    if (
+        providerCost >
+        amount
+    ) {
+
+        /*
+         * Do not manufacture a negative "gain".
+         *
+         * A provider cost greater than the customer charge
+         * is an accounting anomaly that should be investigated.
+         */
+
+        return null;
+
+    }
+
+
+    return (
+        amount -
+        providerCost
+    );
+
+}
+
+
+// =====================================================
+// NORMALIZE PROVIDER RESULT
+// =====================================================
+//
+// vtu.js is responsible for translating VTU's response
+// into:
+//
+// success
+// failure
+// unknown
+//
+// The service trusts only those internal outcomes.
+//
+// =====================================================
+
+function normalizeProviderOutcome(
+    result
+) {
+
+    const outcome =
+        String(
+            result?.outcome ||
+            ""
+        )
+            .trim()
+            .toLowerCase();
+
+
+    if (
+        outcome ===
+        "success"
+    ) {
+
+        return "success";
+
+    }
+
+
+    if (
+        outcome ===
+        "failure"
+    ) {
+
+        return "failure";
+
+    }
+
+
+    return "unknown";
+
+}
+
+
+// =====================================================
+// HANDLE PROVIDER SUCCESS
+// =====================================================
+//
+// IMPORTANT:
+//
+// We commit the reservation ONLY after VTU explicitly
+// confirms success.
+//
+// =====================================================
+
+async function handleProviderSuccess({
     uid,
-    reservationId,
-    transactionId
+    transactionId,
+    providerResult
 }) {
 
-    ensureReservationModule();
+    const authenticatedUid =
+        requireUid(
+            uid
+        );
 
 
-    if (
-        typeof reservation.commitReservation !==
-        "function"
-    ) {
+    const normalizedTransactionId =
+        requireTransactionId(
+            transactionId
+        );
+
+
+    const transaction =
+        await getAirtimeTransaction(
+            normalizedTransactionId
+        );
+
+
+    if (!transaction) {
 
         throw new Error(
-            "Wallet reservation commit service is not configured."
+            "Airtime transaction not found while processing provider success."
         );
 
     }
 
 
-    const result =
-        await reservation.commitReservation({
-
-            uid:
-                requireUid(uid),
-
-            reservationId,
-
-            provider:
-                "vtu.ng"
-
-        });
-
-
     if (
-        !result ||
-        result.committed !== true
+        transaction.uid !==
+        authenticatedUid
     ) {
 
-        throw new Error(
-            "Unable to commit reserved wallet funds."
+        throw createError(
+            "Airtime transaction ownership mismatch.",
+            403
         );
 
     }
 
 
-    return result;
+    /*
+     * If the transaction was already successfully
+     * completed, do not commit the wallet again.
+     */
+
+    if (
+        transaction.status ===
+        STATUS_SUCCESSFUL
+    ) {
+
+        return {
+
+            status:
+                STATUS_SUCCESSFUL,
+
+            transactionId:
+                normalizedTransactionId,
+
+            amountKobo:
+                transaction.amountKobo,
+
+            network:
+                transaction.network,
+
+            phoneNumber:
+                transaction.phoneNumber,
+
+            rewardPoints:
+                transaction.rewardPoints ||
+                0,
+
+            gainKobo:
+                transaction.gainKobo ??
+                null
+
+        };
+
+    }
+
+
+    /*
+     * A confirmed provider success must not overwrite
+     * a terminal failed state.
+     */
+
+    if (
+        transaction.status ===
+        STATUS_FAILED
+    ) {
+
+        throw createError(
+            "Airtime transaction is already marked as failed.",
+            409
+        );
+
+    }
+
+
+    const reservationId =
+        transaction.reservationId;
+
+
+    if (!reservationId) {
+
+        /*
+         * This is a critical accounting condition.
+         *
+         * Never mark the Airtime successful without knowing
+         * which reservation must be committed.
+         */
+
+        throw new Error(
+            "Airtime transaction has no wallet reservation."
+        );
+
+    }
+
+
+    /*
+     * Commit is the ONLY operation that permanently
+     * decreases the user's wallet balance.
+     */
+
+    await commitReservation({
+
+        uid:
+            authenticatedUid,
+
+        reservationId,
+
+        provider:
+            "vtu.ng"
+
+    });
+
+
+    const gainKobo =
+        calculateGainKobo(
+            transaction.amountKobo,
+            providerResult?.providerCostKobo
+        );
+
+
+    const updated =
+        await updateTransaction(
+            normalizedTransactionId,
+            {
+
+                status:
+                    STATUS_SUCCESSFUL,
+
+                providerReference:
+                    providerResult?.providerReference ||
+                    null,
+
+                providerRequestId:
+                    providerResult?.providerRequestId ||
+                    null,
+
+                providerStatus:
+                    providerResult?.providerStatus ||
+                    null,
+
+                providerCode:
+                    providerResult?.providerCode ||
+                    null,
+
+                providerCostKobo:
+                    providerResult?.providerCostKobo ??
+                    null,
+
+                gainKobo,
+
+                providerOutcome:
+                    "success",
+
+                reservationId,
+
+                reconciliationRequired:
+                    false,
+
+                failureReason:
+                    ""
+
+            }
+        );
+
+
+    return {
+
+        status:
+            STATUS_SUCCESSFUL,
+
+        transactionId:
+            normalizedTransactionId,
+
+        amountKobo:
+            updated.amountKobo,
+
+        network:
+            updated.network,
+
+        phoneNumber:
+            updated.phoneNumber,
+
+        rewardPoints:
+            updated.rewardPoints ||
+            0,
+
+        gainKobo:
+            updated.gainKobo ??
+            null
+
+    };
 
 }
 
 
 // =====================================================
-// RELEASE FUNDS
+// HANDLE PROVIDER FAILURE
+// =====================================================
+//
+// IMPORTANT:
+//
+// Funds are released ONLY when VTU explicitly confirms
+// failure.
+//
 // =====================================================
 
-async function releaseReservedFunds({
+async function handleProviderFailure({
     uid,
-    reservationId,
-    reason
+    transactionId,
+    providerResult
 }) {
 
-    ensureReservationModule();
+    const authenticatedUid =
+        requireUid(
+            uid
+        );
 
 
-    if (
-        typeof reservation.releaseReservation !==
-        "function"
-    ) {
+    const normalizedTransactionId =
+        requireTransactionId(
+            transactionId
+        );
+
+
+    const transaction =
+        await getAirtimeTransaction(
+            normalizedTransactionId
+        );
+
+
+    if (!transaction) {
 
         throw new Error(
-            "Wallet reservation release service is not configured."
+            "Airtime transaction not found while processing provider failure."
         );
 
     }
 
 
-    const result =
-        await reservation.releaseReservation({
-
-            uid:
-                requireUid(uid),
-
-            reservationId,
-
-            reason:
-                reason ||
-                "airtime_provider_failure"
-
-        });
-
-
     if (
-        !result ||
-        result.released !== true
+        transaction.uid !==
+        authenticatedUid
     ) {
 
-        throw new Error(
-            "Unable to release reserved wallet funds."
+        throw createError(
+            "Airtime transaction ownership mismatch.",
+            403
         );
 
     }
 
 
-    return result;
+    /*
+     * Idempotent terminal failure.
+     */
+
+    if (
+        transaction.status ===
+        STATUS_FAILED
+    ) {
+
+        return {
+
+            status:
+                STATUS_FAILED,
+
+            transactionId:
+                normalizedTransactionId,
+
+            amountKobo:
+                transaction.amountKobo,
+
+            network:
+                transaction.network,
+
+            phoneNumber:
+                transaction.phoneNumber,
+
+            rewardPoints:
+                transaction.rewardPoints ||
+                0,
+
+            gainKobo:
+                null
+
+        };
+
+    }
+
+
+    if (
+        transaction.status ===
+        STATUS_SUCCESSFUL
+    ) {
+
+        throw createError(
+            "A successful Airtime transaction cannot be marked as failed.",
+            409
+        );
+
+    }
+
+
+    const reservationId =
+        transaction.reservationId;
+
+
+    if (!reservationId) {
+
+        throw new Error(
+            "Airtime transaction has no wallet reservation."
+        );
+
+    }
+
+
+    /*
+     * Release ONLY confirmed provider failure.
+     */
+
+    await releaseReservation({
+
+        uid:
+            authenticatedUid,
+
+        reservationId,
+
+        reason:
+            "vtu_provider_confirmed_failure"
+
+    });
+
+
+    const failureReason =
+        String(
+            providerResult?.message ||
+            "VTU.ng confirmed that the Airtime order failed."
+        )
+            .trim()
+            .slice(
+                0,
+                300
+            );
+
+
+    const updated =
+        await updateTransaction(
+            normalizedTransactionId,
+            {
+
+                status:
+                    STATUS_FAILED,
+
+                providerReference:
+                    providerResult?.providerReference ||
+                    null,
+
+                providerRequestId:
+                    providerResult?.providerRequestId ||
+                    null,
+
+                providerStatus:
+                    providerResult?.providerStatus ||
+                    null,
+
+                providerCode:
+                    providerResult?.providerCode ||
+                    null,
+
+                providerCostKobo:
+                    providerResult?.providerCostKobo ??
+                    null,
+
+                gainKobo:
+                    null,
+
+                providerOutcome:
+                    "failure",
+
+                reservationId,
+
+                reconciliationRequired:
+                    false,
+
+                failureReason
+
+            }
+        );
+
+
+    return {
+
+        status:
+            STATUS_FAILED,
+
+        transactionId:
+            normalizedTransactionId,
+
+        amountKobo:
+            updated.amountKobo,
+
+        network:
+            updated.network,
+
+        phoneNumber:
+            updated.phoneNumber,
+
+        rewardPoints:
+            updated.rewardPoints ||
+            0,
+
+        gainKobo:
+            null,
+
+        message:
+            failureReason
+
+    };
 
 }
 
 
 // =====================================================
-// EXECUTE AIRTIME PURCHASE
+// HANDLE UNKNOWN PROVIDER RESULT
+// =====================================================
+//
+// UNKNOWN means:
+//
+// - timeout
+// - network failure
+// - processing
+// - queued
+// - initiated
+// - pending
+// - on-hold
+// - unexpected provider response
+//
+// UNKNOWN MUST KEEP THE RESERVATION.
+//
+// =====================================================
+
+async function handleUnknownProviderResult({
+    uid,
+    transactionId,
+    providerResult
+}) {
+
+    const authenticatedUid =
+        requireUid(
+            uid
+        );
+
+
+    const normalizedTransactionId =
+        requireTransactionId(
+            transactionId
+        );
+
+
+    const transaction =
+        await getAirtimeTransaction(
+            normalizedTransactionId
+        );
+
+
+    if (!transaction) {
+
+        throw new Error(
+            "Airtime transaction not found while processing provider pending state."
+        );
+
+    }
+
+
+    if (
+        transaction.uid !==
+        authenticatedUid
+    ) {
+
+        throw createError(
+            "Airtime transaction ownership mismatch.",
+            403
+        );
+
+    }
+
+
+    /*
+     * If something already finalized the transaction,
+     * do not move it backwards to pending.
+     */
+
+    if (
+        transaction.status ===
+        STATUS_SUCCESSFUL ||
+        transaction.status ===
+        STATUS_FAILED
+    ) {
+
+        return {
+
+            status:
+                transaction.status,
+
+            transactionId:
+                normalizedTransactionId,
+
+            amountKobo:
+                transaction.amountKobo,
+
+            network:
+                transaction.network,
+
+            phoneNumber:
+                transaction.phoneNumber,
+
+            rewardPoints:
+                transaction.rewardPoints ||
+                0,
+
+            gainKobo:
+                transaction.gainKobo ??
+                null
+
+        };
+
+    }
+
+
+    const reservationId =
+        transaction.reservationId;
+
+
+    if (!reservationId) {
+
+        throw new Error(
+            "Airtime transaction has no wallet reservation."
+        );
+
+    }
+
+
+    /*
+     * Confirm that the reservation still belongs to
+     * this user and is still pending.
+     *
+     * We intentionally DO NOT release it.
+     */
+
+    const reservation =
+        await getReservation({
+
+            uid:
+                authenticatedUid,
+
+            reservationId
+
+        });
+
+
+    if (!reservation) {
+
+        throw new Error(
+            "Airtime wallet reservation could not be found."
+        );
+
+    }
+
+
+    if (
+        reservation.status !==
+        "pending"
+    ) {
+
+        /*
+         * The reservation has already reached a terminal
+         * state. Do not overwrite that financial state.
+         */
+
+        if (
+            reservation.status ===
+            "committed"
+        ) {
+
+            return {
+
+                status:
+                    STATUS_SUCCESSFUL,
+
+                transactionId:
+                    normalizedTransactionId,
+
+                amountKobo:
+                    transaction.amountKobo,
+
+                network:
+                    transaction.network,
+
+                phoneNumber:
+                    transaction.phoneNumber,
+
+                rewardPoints:
+                    transaction.rewardPoints ||
+                    0,
+
+                gainKobo:
+                    transaction.gainKobo ??
+                    null
+
+            };
+
+        }
+
+
+        throw new Error(
+            "Airtime reservation is no longer pending."
+        );
+
+    }
+
+
+    const updated =
+        await updateTransaction(
+            normalizedTransactionId,
+            {
+
+                status:
+                    STATUS_PENDING,
+
+                providerReference:
+                    providerResult?.providerReference ||
+                    transaction.providerReference ||
+                    null,
+
+                providerRequestId:
+                    providerResult?.providerRequestId ||
+                    transaction.providerRequestId ||
+                    null,
+
+                providerStatus:
+                    providerResult?.providerStatus ||
+                    transaction.providerStatus ||
+                    null,
+
+                providerCode:
+                    providerResult?.providerCode ||
+                    transaction.providerCode ||
+                    null,
+
+                providerCostKobo:
+                    providerResult?.providerCostKobo ??
+                    transaction.providerCostKobo ??
+                    null,
+
+                providerOutcome:
+                    "unknown",
+
+                reservationId,
+
+                reconciliationRequired:
+                    true,
+
+                failureReason:
+                    ""
+
+            }
+        );
+
+
+    return {
+
+        status:
+            STATUS_PENDING,
+
+        transactionId:
+            normalizedTransactionId,
+
+        amountKobo:
+            updated.amountKobo,
+
+        network:
+            updated.network,
+
+        phoneNumber:
+            updated.phoneNumber,
+
+        message:
+            providerResult?.message ||
+            "Your Airtime request is being processed. Please do not retry yet."
+
+    };
+
+}
+
+
+// =====================================================
+// PURCHASE AIRTIME
+// =====================================================
+//
+// This is the main service entry point.
+//
 // =====================================================
 
 async function purchaseAirtime({
@@ -981,16 +1605,23 @@ async function purchaseAirtime({
 
 
     const normalizedPhone =
-        normalizePhoneNumber(
+        normalizePhone(
             phoneNumber
         );
 
 
-    const validatedAmount =
+    const amount =
         validateAmountKobo(
             amountKobo
         );
 
+
+    /*
+     * Provider client must be injected by the route.
+//
+//     This keeps this service independent from the actual
+     * VTU.ng implementation and makes the boundary explicit.
+     */
 
     if (
         !providerClient ||
@@ -999,64 +1630,132 @@ async function purchaseAirtime({
     ) {
 
         throw new Error(
-            "Airtime provider is not configured."
+            "Airtime provider client is not available."
         );
 
     }
 
 
+    /*
+     * -----------------------------------------------------
+     * CREATE UNIQUE NOVAPAY TRANSACTION
+     * -----------------------------------------------------
+     */
+
     const transactionId =
         createTransactionId();
 
 
-    // -------------------------------------------------
-    // CREATE AUDIT RECORD FIRST
-    // -------------------------------------------------
+    /*
+     * -----------------------------------------------------
+     * CREATE BUSINESS TRANSACTION
+     * -----------------------------------------------------
+     */
 
-    await createPendingTransaction({
+    let transaction =
+        await createInitialTransaction({
 
-        uid:
-            authenticatedUid,
+            uid:
+                authenticatedUid,
 
-        transactionId,
+            transactionId,
 
-        network:
-            normalizedNetwork,
+            network:
+                normalizedNetwork,
 
-        phoneNumber:
-            normalizedPhone,
+            phoneNumber:
+                normalizedPhone,
 
-        amountKobo:
-            validatedAmount
+            amountKobo:
+                amount
 
-    });
+        });
 
 
-    // -------------------------------------------------
-    // RESERVE WALLET FUNDS
-    // -------------------------------------------------
+    /*
+     * -----------------------------------------------------
+     * RESERVE USER MONEY
+     * -----------------------------------------------------
+     *
+     * reservation.js changes:
+     *
+     * reservedKobo ↑
+     *
+     * balanceKobo remains unchanged.
+     *
+     * Therefore:
+     *
+     * availableKobo =
+     * balanceKobo - reservedKobo
+     *
+     * This is intentional.
+     *
+     * The actual permanent debit happens ONLY at commit.
+     * -----------------------------------------------------
+     */
 
-    let reservationResult;
+    let reservation;
 
 
     try {
 
-        reservationResult =
-            await reserveUserFunds({
+        reservation =
+            await reserveFunds({
 
                 uid:
                     authenticatedUid,
 
-                amountKobo:
-                    validatedAmount,
+                reference:
+                    getReservationReference(
+                        transactionId
+                    ),
 
-                transactionId
+                amountKobo:
+                    amount,
+
+                currency:
+                    CURRENCY,
+
+                service:
+                    SERVICE,
+
+                metadata: {
+
+                    transactionId,
+
+                    network:
+                        normalizedNetwork,
+
+                    phoneNumber:
+                        normalizedPhone
+
+                }
 
             });
 
     }
 
     catch (error) {
+
+        /*
+         * The wallet reservation did not happen.
+         *
+         * Therefore no money was locked.
+         *
+         * Mark the business transaction failed.
+         */
+
+        const message =
+            String(
+                error?.message ||
+                "Unable to reserve wallet funds."
+            )
+                .trim()
+                .slice(
+                    0,
+                    300
+                );
+
 
         await updateTransaction(
             transactionId,
@@ -1065,11 +1764,14 @@ async function purchaseAirtime({
                 status:
                     STATUS_FAILED,
 
-                failureReason:
-                    "wallet_reservation_failed",
+                providerOutcome:
+                    null,
 
                 reconciliationRequired:
-                    false
+                    false,
+
+                failureReason:
+                    message
 
             }
         );
@@ -1080,30 +1782,50 @@ async function purchaseAirtime({
     }
 
 
-    const reservationId =
-        reservationResult.reservationId;
+    /*
+     * -----------------------------------------------------
+     * LINK RESERVATION TO TRANSACTION
+     * -----------------------------------------------------
+     *
+     * This is critical.
+     *
+     * The Airtime transaction must permanently know which
+     * wallet reservation belongs to it.
+     * -----------------------------------------------------
+     */
+
+    transaction =
+        await updateTransaction(
+            transactionId,
+            {
+
+                reservationId:
+                    reservation.reservationId,
+
+                status:
+                    STATUS_PENDING
+
+            }
+        );
 
 
-    await updateTransaction(
-        transactionId,
-        {
+    /*
+     * -----------------------------------------------------
+     * PROVIDER CALL
+     * -----------------------------------------------------
+     *
+     * The provider adapter receives the NovaPay transaction
+     * ID and generates its own deterministic provider
+     * request ID.
+     * -----------------------------------------------------
+     */
 
-            reservationId
-
-        }
-    );
-
-
-    // -------------------------------------------------
-    // PROVIDER CALL
-    // -------------------------------------------------
-
-    let providerResponse;
+    let providerResult;
 
 
     try {
 
-        providerResponse =
+        providerResult =
             await providerClient.purchaseAirtime({
 
                 transactionId,
@@ -1115,11 +1837,7 @@ async function purchaseAirtime({
                     normalizedPhone,
 
                 amountKobo:
-                    validatedAmount,
-
-                amountNaira:
-                    validatedAmount /
-                    100
+                    amount
 
             });
 
@@ -1128,10 +1846,36 @@ async function purchaseAirtime({
     catch (error) {
 
         /*
-         * A transport error does not prove failure.
+         * IMPORTANT:
          *
-         * The reservation remains pending.
+         * We DO NOT release the reservation here.
+         *
+         * The provider adapter treats network errors,
+         * timeouts and unknown responses as uncertain.
+         *
+         * Therefore the customer's money remains reserved
+         * until reconciliation can determine the outcome.
          */
+
+        const providerStatus =
+            String(
+                error?.providerStatus ||
+                ""
+            )
+                .trim()
+                .toLowerCase() ||
+                null;
+
+
+        const providerReference =
+            error?.providerReference ||
+            null;
+
+
+        const providerCode =
+            error?.providerCode ||
+            null;
+
 
         await updateTransaction(
             transactionId,
@@ -1140,259 +1884,39 @@ async function purchaseAirtime({
                 status:
                     STATUS_PENDING,
 
+                providerReference,
+
+                providerStatus,
+
+                providerCode,
+
                 providerOutcome:
-                    PROVIDER_UNKNOWN,
+                    "unknown",
 
                 reconciliationRequired:
                     true,
 
-                lastProviderError:
-                    String(
-                        error?.message ||
-                        "Provider request could not be verified."
-                    )
-                        .slice(0, 500)
+                failureReason:
+                    ""
 
             }
         );
 
 
+        /*
+         * Return a pending result rather than exposing the
+         * provider's internal error to the frontend.
+         */
+
         return {
-
-            success:
-                false,
-
-            pending:
-                true,
-
-            transactionId,
 
             status:
                 STATUS_PENDING,
 
-            message:
-                "Your Airtime request is being processed. Please do not retry yet."
-
-        };
-
-    }
-
-
-    const providerResult =
-        normalizeProviderResult(
-            providerResponse
-        );
-
-
-    // =================================================
-    // CONFIRMED SUCCESS
-    // =================================================
-
-    if (
-        providerResult.outcome ===
-        PROVIDER_SUCCESS
-    ) {
-
-        /*
-         * We require a provider reference before
-         * considering the result safely identifiable.
-         */
-
-        if (
-            !providerResult.providerReference
-        ) {
-
-            await updateTransaction(
-                transactionId,
-                {
-
-                    status:
-                        STATUS_PENDING,
-
-                    providerOutcome:
-                        PROVIDER_UNKNOWN,
-
-                    reconciliationRequired:
-                        true,
-
-                    providerResponseWarning:
-                        "Provider reported success without a provider reference."
-
-                }
-            );
-
-
-            return {
-
-                success:
-                    false,
-
-                pending:
-                    true,
-
-                transactionId,
-
-                status:
-                    STATUS_PENDING,
-
-                message:
-                    "Your Airtime request is being verified. Please do not retry yet."
-
-            };
-
-        }
-
-
-        const gainKobo =
-            calculateGainKobo({
-
-                amountKobo:
-                    validatedAmount,
-
-                providerCostKobo:
-                    providerResult.providerCostKobo
-
-            });
-
-
-        const rewardPoints =
-            calculateRewardPoints(
-                validatedAmount
-            );
-
-
-        /*
-         * Provider succeeded.
-         *
-         * Now permanently debit the reservation.
-         */
-
-        try {
-
-            await commitReservedFunds({
-
-                uid:
-                    authenticatedUid,
-
-                reservationId,
-
-                transactionId
-
-            });
-
-        }
-
-        catch (error) {
-
-            /*
-             * NEVER release here.
-             *
-             * Provider already succeeded.
-             */
-
-            await updateTransaction(
-                transactionId,
-                {
-
-                    status:
-                        STATUS_PENDING,
-
-                    providerOutcome:
-                        PROVIDER_SUCCESS,
-
-                    providerReference:
-                        providerResult.providerReference,
-
-                    providerCostKobo:
-                        providerResult.providerCostKobo,
-
-                    gainKobo,
-
-                    rewardPoints,
-
-                    reconciliationRequired:
-                        true,
-
-                    walletCommitRequired:
-                        true,
-
-                    walletCommitError:
-                        String(
-                            error?.message ||
-                            "Wallet commit failed."
-                        )
-                            .slice(0, 500)
-
-                }
-            );
-
-
-            return {
-
-                success:
-                    false,
-
-                pending:
-                    true,
-
-                transactionId,
-
-                status:
-                    STATUS_PENDING,
-
-                message:
-                    "Your Airtime purchase was received and is being finalized."
-
-            };
-
-        }
-
-
-        await updateTransaction(
             transactionId,
-            {
-
-                status:
-                    STATUS_SUCCESSFUL,
-
-                providerOutcome:
-                    PROVIDER_SUCCESS,
-
-                providerReference:
-                    providerResult.providerReference,
-
-                providerCostKobo:
-                    providerResult.providerCostKobo,
-
-                gainKobo,
-
-                rewardPoints,
-
-                reconciliationRequired:
-                    false,
-
-                walletCommitRequired:
-                    false
-
-            }
-        );
-
-
-        return {
-
-            success:
-                true,
-
-            pending:
-                false,
-
-            transactionId,
-
-            status:
-                STATUS_SUCCESSFUL,
 
             amountKobo:
-                validatedAmount,
+                amount,
 
             network:
                 normalizedNetwork,
@@ -1400,688 +1924,109 @@ async function purchaseAirtime({
             phoneNumber:
                 normalizedPhone,
 
-            rewardPoints,
-
-            gainKobo
-
-        };
-
-    }
-
-
-    // =================================================
-    // CONFIRMED FAILURE
-    // =================================================
-
-    if (
-        providerResult.outcome ===
-        PROVIDER_FAILURE
-    ) {
-
-        try {
-
-            await releaseReservedFunds({
-
-                uid:
-                    authenticatedUid,
-
-                reservationId,
-
-                reason:
-                    "airtime_provider_confirmed_failure"
-
-            });
-
-        }
-
-        catch (error) {
-
-            /*
-             * Provider failure is known, but the wallet
-             * release failed.
-             *
-             * Keep the transaction pending for
-             * reconciliation.
-             */
-
-            await updateTransaction(
-                transactionId,
-                {
-
-                    status:
-                        STATUS_PENDING,
-
-                    providerOutcome:
-                        PROVIDER_FAILURE,
-
-                    providerReference:
-                        providerResult.providerReference,
-
-                    reconciliationRequired:
-                        true,
-
-                    walletReleaseRequired:
-                        true,
-
-                    walletReleaseError:
-                        String(
-                            error?.message ||
-                            "Wallet release failed."
-                        )
-                            .slice(0, 500)
-
-                }
-            );
-
-
-            return {
-
-                success:
-                    false,
-
-                pending:
-                    true,
-
-                transactionId,
-
-                status:
-                    STATUS_PENDING,
-
-                message:
-                    "The Airtime request could not be completed and your balance is being verified."
-
-            };
-
-        }
-
-
-        await updateTransaction(
-            transactionId,
-            {
-
-                status:
-                    STATUS_FAILED,
-
-                providerOutcome:
-                    PROVIDER_FAILURE,
-
-                providerReference:
-                    providerResult.providerReference,
-
-                failureReason:
-                    providerResult.message ||
-                    "Airtime provider confirmed failure.",
-
-                reconciliationRequired:
-                    false
-
-            }
-        );
-
-
-        return {
-
-            success:
-                false,
-
-            pending:
-                false,
-
-            transactionId,
-
-            status:
-                STATUS_FAILED,
-
             message:
-                "Airtime could not be completed. Your reserved balance has been released."
+                "Your Airtime request is being verified. Please do not retry yet."
 
         };
 
     }
 
 
-    // =================================================
-    // UNKNOWN
-    // =================================================
+    /*
+     * -----------------------------------------------------
+     * NORMALIZE PROVIDER OUTCOME
+     * -----------------------------------------------------
+     */
 
-    await updateTransaction(
-        transactionId,
-        {
-
-            status:
-                STATUS_PENDING,
-
-            providerOutcome:
-                PROVIDER_UNKNOWN,
-
-            providerReference:
-                providerResult.providerReference,
-
-            providerMessage:
-                providerResult.message,
-
-            reconciliationRequired:
-                true
-
-        }
-    );
-
-
-    return {
-
-        success:
-            false,
-
-        pending:
-            true,
-
-        transactionId,
-
-        status:
-            STATUS_PENDING,
-
-        message:
-            "Your Airtime request is being processed. Please do not retry yet."
-
-    };
-
-}
-
-
-// =====================================================
-// RECONCILIATION
-// =====================================================
-
-
-// =====================================================
-// FINALIZE SUCCESS
-// =====================================================
-
-async function finalizeSuccessfulTransaction({
-    transactionId,
-    providerReference,
-    providerCostKobo
-}) {
-
-    const transaction =
-        await getAirtimeTransaction(
-            transactionId
+    const outcome =
+        normalizeProviderOutcome(
+            providerResult
         );
 
 
-    if (!transaction) {
-
-        throw new Error(
-            "Airtime transaction not found."
-        );
-
-    }
-
+    /*
+     * -----------------------------------------------------
+     * CONFIRMED SUCCESS
+     * -----------------------------------------------------
+     */
 
     if (
-        transaction.status ===
-        STATUS_SUCCESSFUL
+        outcome ===
+        "success"
     ) {
 
-        return {
-
-            success:
-                true,
-
-            alreadyFinalized:
-                true,
-
-            transactionId
-
-        };
-
-    }
-
-
-    if (
-        transaction.status ===
-        STATUS_FAILED
-    ) {
-
-        throw new Error(
-            "A failed Airtime transaction cannot be finalized as successful."
-        );
-
-    }
-
-
-    const amountKobo =
-        validateAmountKobo(
-            transaction.amountKobo
-        );
-
-
-    const normalizedReference =
-        normalizeProviderReference(
-            providerReference
-        );
-
-
-    if (
-        !normalizedReference
-    ) {
-
-        throw new Error(
-            "Provider reference is required."
-        );
-
-    }
-
-
-    const cost =
-        Number(
-            providerCostKobo
-        );
-
-
-    if (
-        !Number.isSafeInteger(cost) ||
-        cost < 0
-    ) {
-
-        throw new Error(
-            "Valid provider cost is required."
-        );
-
-    }
-
-
-    const gainKobo =
-        calculateGainKobo({
-
-            amountKobo,
-
-            providerCostKobo:
-                cost
-
-        });
-
-
-    const rewardPoints =
-        calculateRewardPoints(
-            amountKobo
-        );
-
-
-    if (
-        !transaction.reservationId
-    ) {
-
-        throw new Error(
-            "Pending Airtime transaction has no wallet reservation."
-        );
-
-    }
-
-
-    try {
-
-        await commitReservedFunds({
+        return handleProviderSuccess({
 
             uid:
-                transaction.uid,
+                authenticatedUid,
 
-            reservationId:
-                transaction.reservationId,
+            transactionId,
 
-            transactionId
+            providerResult
 
         });
 
     }
 
-    catch (error) {
 
-        await updateTransaction(
-            transactionId,
-            {
-
-                status:
-                    STATUS_PENDING,
-
-                providerOutcome:
-                    PROVIDER_SUCCESS,
-
-                providerReference:
-                    normalizedReference,
-
-                providerCostKobo:
-                    cost,
-
-                gainKobo,
-
-                rewardPoints,
-
-                reconciliationRequired:
-                    true,
-
-                walletCommitRequired:
-                    true,
-
-                walletCommitError:
-                    String(
-                        error?.message ||
-                        "Wallet commit failed."
-                    )
-                        .slice(0, 500)
-
-            }
-        );
-
-
-        throw error;
-
-    }
-
-
-    await updateTransaction(
-        transactionId,
-        {
-
-            status:
-                STATUS_SUCCESSFUL,
-
-            providerOutcome:
-                PROVIDER_SUCCESS,
-
-            providerReference:
-                normalizedReference,
-
-            providerCostKobo:
-                cost,
-
-            gainKobo,
-
-            rewardPoints,
-
-            reconciliationRequired:
-                false,
-
-            walletCommitRequired:
-                false
-
-        }
-    );
-
-
-    return {
-
-        success:
-            true,
-
-        alreadyFinalized:
-            false,
-
-        transactionId,
-
-        gainKobo,
-
-        rewardPoints
-
-    };
-
-}
-
-
-// =====================================================
-// FINALIZE FAILURE
-// =====================================================
-
-async function finalizeFailedTransaction({
-    transactionId,
-    providerReference,
-    reason
-}) {
-
-    const transaction =
-        await getAirtimeTransaction(
-            transactionId
-        );
-
-
-    if (!transaction) {
-
-        throw new Error(
-            "Airtime transaction not found."
-        );
-
-    }
-
+    /*
+     * -----------------------------------------------------
+     * CONFIRMED FAILURE
+     * -----------------------------------------------------
+     */
 
     if (
-        transaction.status ===
-        STATUS_FAILED
+        outcome ===
+        "failure"
     ) {
 
-        return {
-
-            success:
-                true,
-
-            alreadyFinalized:
-                true,
-
-            transactionId
-
-        };
-
-    }
-
-
-    if (
-        transaction.status ===
-        STATUS_SUCCESSFUL
-    ) {
-
-        throw new Error(
-            "A successful Airtime transaction cannot be changed to failed."
-        );
-
-    }
-
-
-    if (
-        !transaction.reservationId
-    ) {
-
-        throw new Error(
-            "Pending Airtime transaction has no wallet reservation."
-        );
-
-    }
-
-
-    try {
-
-        await releaseReservedFunds({
+        return handleProviderFailure({
 
             uid:
-                transaction.uid,
+                authenticatedUid,
 
-            reservationId:
-                transaction.reservationId,
+            transactionId,
 
-            reason:
-                reason ||
-                "provider_confirmed_failure"
+            providerResult
 
         });
 
     }
 
-    catch (error) {
 
-        await updateTransaction(
-            transactionId,
-            {
+    /*
+     * -----------------------------------------------------
+     * UNKNOWN / PROCESSING
+     * -----------------------------------------------------
+     *
+     * Reservation remains active.
+     * Transaction remains pending.
+     * Reconciliation is required.
+     * -----------------------------------------------------
+     */
 
-                status:
-                    STATUS_PENDING,
+    return handleUnknownProviderResult({
 
-                providerOutcome:
-                    PROVIDER_FAILURE,
+        uid:
+            authenticatedUid,
 
-                providerReference:
-                    normalizeProviderReference(
-                        providerReference
-                    ),
-
-                reconciliationRequired:
-                    true,
-
-                walletReleaseRequired:
-                    true,
-
-                walletReleaseError:
-                    String(
-                        error?.message ||
-                        "Wallet release failed."
-                    )
-                        .slice(0, 500)
-
-            }
-        );
-
-
-        throw error;
-
-    }
-
-
-    await updateTransaction(
         transactionId,
-        {
 
-            status:
-                STATUS_FAILED,
+        providerResult
 
-            providerOutcome:
-                PROVIDER_FAILURE,
-
-            providerReference:
-                normalizeProviderReference(
-                    providerReference
-                ),
-
-            failureReason:
-                reason ||
-                "Provider confirmed failure.",
-
-            reconciliationRequired:
-                false,
-
-            walletReleaseRequired:
-                false
-
-        }
-    );
-
-
-    return {
-
-        success:
-            true,
-
-        alreadyFinalized:
-            false,
-
-        transactionId
-
-    };
+    });
 
 }
 
 
 // =====================================================
-// GET PENDING TRANSACTIONS
-// =====================================================
-
-async function getPendingTransactions(
-    limit = 50
-) {
-
-    const normalizedLimit =
-        Number(
-            limit
-        );
-
-
-    if (
-        !Number.isInteger(
-            normalizedLimit
-        ) ||
-        normalizedLimit < 1 ||
-        normalizedLimit > 100
-    ) {
-
-        throw new Error(
-            "Pending transaction limit must be between 1 and 100."
-        );
-
-    }
-
-
-    const snapshot =
-        await db
-            .collection(
-                AIRTIME_TRANSACTIONS_COLLECTION
-            )
-            .where(
-                "status",
-                "==",
-                STATUS_PENDING
-            )
-            .orderBy(
-                "createdAt",
-                "asc"
-            )
-            .limit(
-                normalizedLimit
-            )
-            .get();
-
-
-    return snapshot.docs.map(
-        document => ({
-
-            id:
-                document.id,
-
-            ...document.data()
-
-        })
-    );
-
-}
-
-
-// =====================================================
-// EXPORTS
+// MODULE EXPORTS
 // =====================================================
 
 module.exports = {
 
     purchaseAirtime,
 
-    getAirtimeTransaction,
-
-    getPendingTransactions,
-
-    finalizeSuccessfulTransaction,
-
-    finalizeFailedTransaction,
-
-    calculateGainKobo,
-
-    calculateRewardPoints,
-
-    normalizePhoneNumber,
-
-    normalizeNetwork
+    getAirtimeTransaction
 
 };

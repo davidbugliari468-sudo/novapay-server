@@ -6,58 +6,45 @@ const { db } = require("../firebase-admin");
 
 
 // =====================================================
-// NOVAPAY — WALLET RESERVATION / DEBIT FOUNDATION
+// NOVAPAY — WALLET RESERVATION SERVICE
 // =====================================================
 //
-// Financial invariant:
+// This module manages temporary wallet locks.
 //
-//     0 <= reservedKobo <= balanceKobo
+// Airtime flow:
 //
-// Available balance:
+//   Airtime service
+//        ↓
+//   reserveFunds()
+//        ↓
+//   money becomes RESERVED
+//        ↓
+//   VTU.ng operation
+//        ↓
+//   ┌──────────────┬──────────────┐
+//   ↓              ↓              ↓
+// SUCCESS        FAILURE        UNKNOWN
+//   ↓              ↓              ↓
+// COMMIT         RELEASE        KEEP RESERVED
 //
-//     availableKobo =
-//         balanceKobo - reservedKobo
+// IMPORTANT
 //
-// IMPORTANT:
+// reserveFunds()
+//   → does NOT reduce balanceKobo
 //
-// - Frontend never changes wallet balances.
-// - All monetary values are stored as integer kobo.
-// - Reservations are temporary wallet locks.
-// - Reservation creation is atomic.
-// - Reservation commit is atomic.
-// - Reservation release is atomic.
-// - Idempotency is deterministic.
-// - A committed reservation can never be released.
-// - A released reservation can never be committed.
-// - Provider uncertainty does NOT automatically release funds.
+// commitReservation()
+//   → reduces balanceKobo
+//   → reduces reservedKobo
 //
-// Wallet document:
+// releaseReservation()
+//   → keeps balanceKobo unchanged
+//   → reduces reservedKobo
 //
-// wallets/{uid}
+// availableKobo:
 //
-// {
-//     uid: "...",
-//     currency: "NGN",
-//     balanceKobo: 100000,
-//     reservedKobo: 20000,
-//     updatedAt: ...
-// }
+//   balanceKobo - reservedKobo
 //
-// Reservation document:
-//
-// reservations/{reservationId}
-//
-// {
-//     id: "...",
-//     uid: "...",
-//     reference: "...",
-//     service: "airtime",
-//     amountKobo: 20000,
-//     currency: "NGN",
-//     status: "pending",
-//     ...
-// }
-//
+// All financial changes use Firestore transactions.
 // =====================================================
 
 
@@ -65,208 +52,224 @@ const { db } = require("../firebase-admin");
 // COLLECTIONS
 // =====================================================
 
-const WALLETS_COLLECTION =
-    "wallets";
+const WALLETS_COLLECTION = "wallets";
 
-const RESERVATIONS_COLLECTION =
-    "reservations";
-
-const LEDGER_COLLECTION =
-    "ledger";
+const RESERVATIONS_COLLECTION = "walletReservations";
 
 
 // =====================================================
 // CONSTANTS
 // =====================================================
 
-const DEFAULT_CURRENCY =
-    "NGN";
+const CURRENCY = "NGN";
 
+const STATUS_PENDING = "pending";
 
-const RESERVATION_STATUS =
-    Object.freeze({
+const STATUS_COMMITTED = "committed";
 
-        PENDING:
-            "pending",
-
-        COMMITTED:
-            "committed",
-
-        RELEASED:
-            "released"
-
-    });
+const STATUS_RELEASED = "released";
 
 
 // =====================================================
-// VALIDATION
+// MAX RESERVATION
 // =====================================================
 
-function validateUid(uid) {
+const configuredMaximum =
+    Number(process.env.MAX_WALLET_RESERVATION_KOBO);
 
+const MAX_RESERVATION_KOBO =
+    Number.isSafeInteger(configuredMaximum) &&
+    configuredMaximum > 0
+        ? configuredMaximum
+        : Number.MAX_SAFE_INTEGER;
+
+
+// =====================================================
+// ERROR HELPER
+// =====================================================
+
+function createError(message, statusCode = 500) {
+    const error = new Error(message);
+
+    error.statusCode = statusCode;
+
+    return error;
+}
+
+
+// =====================================================
+// UID VALIDATION
+// =====================================================
+
+function requireUid(uid) {
     if (
         typeof uid !== "string" ||
         !uid.trim()
     ) {
-
-        throw new Error(
-            "Authenticated user ID is required."
+        throw createError(
+            "Authenticated user ID is required.",
+            401
         );
-
     }
 
     return uid.trim();
-
 }
 
 
-// -----------------------------------------------------
-// AMOUNT
-// -----------------------------------------------------
+// =====================================================
+// REFERENCE VALIDATION
+// =====================================================
 
-function validateAmountKobo(
-    amountKobo
-) {
+function requireReference(reference) {
+    const normalized =
+        String(reference || "").trim();
 
-    const amount =
-        Number(
-            amountKobo
+    if (!normalized) {
+        throw createError(
+            "Wallet reservation reference is required.",
+            400
         );
+    }
 
+    if (normalized.length > 200) {
+        throw createError(
+            "Wallet reservation reference is too long.",
+            400
+        );
+    }
+
+    return normalized;
+}
+
+
+// =====================================================
+// AMOUNT VALIDATION
+// =====================================================
+
+function validateAmountKobo(amountKobo) {
+    const amount = Number(amountKobo);
 
     if (
         !Number.isSafeInteger(amount) ||
         amount <= 0
     ) {
-
-        throw new Error(
-            "Amount must be a positive integer in kobo."
+        throw createError(
+            "Wallet reservation amount must be a positive integer in kobo.",
+            400
         );
-
     }
 
+    if (amount > MAX_RESERVATION_KOBO) {
+        throw createError(
+            "Wallet reservation amount exceeds the supported limit.",
+            400
+        );
+    }
 
     return amount;
-
 }
 
 
-// -----------------------------------------------------
+// =====================================================
 // CURRENCY
-// -----------------------------------------------------
+// =====================================================
 
-function normalizeCurrency(
-    currency
-) {
-
+function normalizeCurrency(currency = CURRENCY) {
     const normalized =
-        String(
-            currency ||
-            DEFAULT_CURRENCY
-        )
+        String(currency)
             .trim()
             .toUpperCase();
 
-
-    if (
-        normalized !==
-        DEFAULT_CURRENCY
-    ) {
-
-        throw new Error(
-            "Unsupported wallet currency."
+    if (normalized !== CURRENCY) {
+        throw createError(
+            "Unsupported wallet currency.",
+            400
         );
-
     }
 
-
     return normalized;
-
 }
 
 
-// -----------------------------------------------------
-// REFERENCE
-// -----------------------------------------------------
-
-function normalizeReference(
-    reference
-) {
-
-    const normalized =
-        String(
-            reference ||
-            ""
-        )
-            .trim();
-
-
-    if (!normalized) {
-
-        throw new Error(
-            "Transaction reference is required."
-        );
-
-    }
-
-
-    if (
-        normalized.length >
-        200
-    ) {
-
-        throw new Error(
-            "Transaction reference is too long."
-        );
-
-    }
-
-
-    return normalized;
-
-}
-
-
-// -----------------------------------------------------
+// =====================================================
 // SERVICE
-// -----------------------------------------------------
+// =====================================================
 
-function normalizeService(
-    service
-) {
-
+function normalizeService(service) {
     const normalized =
-        String(
-            service ||
-            ""
-        )
+        String(service || "")
             .trim()
             .toLowerCase();
 
-
     if (!normalized) {
-
-        throw new Error(
-            "Payment service is required."
+        throw createError(
+            "Wallet service is required.",
+            400
         );
-
     }
 
-
-    if (
-        normalized.length >
-        50
-    ) {
-
-        throw new Error(
-            "Payment service is too long."
+    if (normalized.length > 100) {
+        throw createError(
+            "Wallet service is too long.",
+            400
         );
-
     }
-
 
     return normalized;
+}
 
+
+// =====================================================
+// RESERVATION ID
+// =====================================================
+
+function requireReservationId(reservationId) {
+    const normalized =
+        String(reservationId || "").trim();
+
+    if (!normalized) {
+        throw createError(
+            "Wallet reservation ID is required.",
+            400
+        );
+    }
+
+    if (normalized.length > 200) {
+        throw createError(
+            "Wallet reservation ID is too long.",
+            400
+        );
+    }
+
+    return normalized;
+}
+
+
+// =====================================================
+// CREATE RESERVATION ID
+// =====================================================
+
+function createReservationId() {
+    return (
+        "NPRES_" +
+        Date.now() +
+        "_" +
+        crypto.randomBytes(16).toString("hex")
+    );
+}
+
+
+// =====================================================
+// CREATE AUDIT ID
+// =====================================================
+
+function createAuditId() {
+    return (
+        "NPAUD_" +
+        Date.now() +
+        "_" +
+        crypto.randomBytes(12).toString("hex")
+    );
 }
 
 
@@ -275,19 +278,9 @@ function normalizeService(
 // =====================================================
 
 function getWalletRef(uid) {
-
-    const validUid =
-        validateUid(uid);
-
-
     return db
-        .collection(
-            WALLETS_COLLECTION
-        )
-        .doc(
-            validUid
-        );
-
+        .collection(WALLETS_COLLECTION)
+        .doc(requireUid(uid));
 }
 
 
@@ -295,1600 +288,581 @@ function getWalletRef(uid) {
 // RESERVATION REFERENCE
 // =====================================================
 
-function getReservationRef(
-    uid,
-    reservationId
-) {
-
-    validateUid(uid);
-
-
-    if (
-        typeof reservationId !==
-            "string" ||
-        !reservationId.trim()
-    ) {
-
-        throw new Error(
-            "Reservation ID is required."
-        );
-
-    }
-
-
+function getReservationRef(reservationId) {
     return db
-        .collection(
-            RESERVATIONS_COLLECTION
-        )
-        .doc(
-            reservationId.trim()
-        );
-
+        .collection(RESERVATIONS_COLLECTION)
+        .doc(requireReservationId(reservationId));
 }
 
 
 // =====================================================
-// LEDGER REFERENCE
+// READ INTEGER
 // =====================================================
 
-function getLedgerRef(
-    uid,
-    ledgerId
-) {
+function readIntegerField(value, fieldName) {
+    const number = Number(value);
 
-    const validUid =
-        validateUid(uid);
-
-
-    if (
-        typeof ledgerId !==
-            "string" ||
-        !ledgerId.trim()
-    ) {
-
+    if (!Number.isSafeInteger(number)) {
         throw new Error(
-            "Ledger ID is required."
+            `Wallet field ${fieldName} is invalid.`
         );
-
     }
 
-
-    return getWalletRef(
-        validUid
-    )
-        .collection(
-            LEDGER_COLLECTION
-        )
-        .doc(
-            ledgerId.trim()
-        );
-
+    return number;
 }
 
 
 // =====================================================
-// RESERVATION ID
-// =====================================================
-//
-// Deterministic.
-//
-// Same:
-//
-//     uid + reference
-//
-// produces the same reservation ID.
-//
-// This is the foundation for idempotency.
-//
-// IMPORTANT:
-//
-// The caller must therefore use a stable transaction
-// reference when retrying the same financial operation.
+// READ WALLET
 // =====================================================
 
-function createReservationId(
-    uid,
-    reference
-) {
-
-    const validUid =
-        validateUid(uid);
-
-    const validReference =
-        normalizeReference(
-            reference
-        );
-
-
-    return crypto
-        .createHash(
-            "sha256"
-        )
-        .update(
-            `novapay-reservation:v1:${validUid}:${validReference}`
-        )
-        .digest(
-            "hex"
-        );
-
-}
-
-
-// =====================================================
-// LEDGER ID
-// =====================================================
-
-function createLedgerId(
-    uid,
-    reference,
-    service
-) {
-
-    const validUid =
-        validateUid(uid);
-
-    const validReference =
-        normalizeReference(
-            reference
-        );
-
-    const validService =
-        normalizeService(
-            service
-        );
-
-
-    return crypto
-        .createHash(
-            "sha256"
-        )
-        .update(
-            `novapay-ledger:v1:${validUid}:${validService}:${validReference}`
-        )
-        .digest(
-            "hex"
-        );
-
-}
-
-
-// =====================================================
-// VALIDATE WALLET
-// =====================================================
-
-function validateWalletData(
-    wallet
-) {
-
+function readWalletState(walletData) {
     if (
-        !wallet ||
-        typeof wallet !== "object"
+        !walletData ||
+        typeof walletData !== "object"
     ) {
-
         throw new Error(
-            "Wallet data is invalid."
+            "Wallet account is invalid."
         );
-
     }
-
 
     const balanceKobo =
-        Number(
-            wallet.balanceKobo
+        readIntegerField(
+            walletData.balanceKobo,
+            "balanceKobo"
         );
-
 
     const reservedKobo =
-        Number(
-            wallet.reservedKobo ??
-            0
-        );
+        walletData.reservedKobo === undefined ||
+        walletData.reservedKobo === null
+            ? 0
+            : readIntegerField(
+                walletData.reservedKobo,
+                "reservedKobo"
+            );
 
-
-    if (
-        !Number.isSafeInteger(
-            balanceKobo
-        ) ||
-        balanceKobo < 0
-    ) {
-
+    if (balanceKobo < 0) {
         throw new Error(
-            "Wallet contains an invalid balance."
+            "Wallet balance cannot be negative."
         );
-
     }
 
-
-    if (
-        !Number.isSafeInteger(
-            reservedKobo
-        ) ||
-        reservedKobo < 0
-    ) {
-
+    if (reservedKobo < 0) {
         throw new Error(
-            "Wallet contains an invalid reserved balance."
+            "Reserved wallet balance cannot be negative."
         );
-
     }
 
-
-    if (
-        reservedKobo >
-        balanceKobo
-    ) {
-
+    if (reservedKobo > balanceKobo) {
         throw new Error(
-            "Wallet reservation integrity violation."
+            "Wallet reservation state is inconsistent."
         );
-
     }
-
-
-    const currency =
-        normalizeCurrency(
-            wallet.currency
-        );
-
 
     return {
-
         balanceKobo,
-
         reservedKobo,
-
         availableKobo:
-            balanceKobo -
-            reservedKobo,
-
-        currency
-
+            balanceKobo - reservedKobo
     };
-
 }
 
 
 // =====================================================
-// CALCULATE AVAILABLE BALANCE
+// FIND EXISTING RESERVATION
 // =====================================================
 //
-// This function reads the wallet aggregate.
+// Used for idempotency.
 //
-// It intentionally does NOT scan reservation documents.
+// Airtime service uses the NovaPay transaction ID as the
+// reservation reference:
 //
-// The wallet's reservedKobo is the authoritative aggregate.
+//   NPAIR_xxxxx
+//
+// Therefore the same purchase cannot create another
+// reservation for the same reference.
 // =====================================================
 
-async function calculateAvailableBalance(
-    transaction,
-    uid
-) {
+async function findReservationByReference({
+    uid,
+    reference
+}) {
+    const authenticatedUid =
+        requireUid(uid);
 
-    const validUid =
-        validateUid(uid);
+    const normalizedReference =
+        requireReference(reference);
 
+    const snapshot =
+        await db
+            .collection(RESERVATIONS_COLLECTION)
+            .where("uid", "==", authenticatedUid)
+            .where(
+                "reference",
+                "==",
+                normalizedReference
+            )
+            .limit(2)
+            .get();
 
-    const walletRef =
-        getWalletRef(
-            validUid
-        );
-
-
-    const walletSnapshot =
-        await transaction.get(
-            walletRef
-        );
-
-
-    if (
-        !walletSnapshot.exists
-    ) {
-
-        throw new Error(
-            "Wallet not found."
-        );
-
+    if (snapshot.empty) {
+        return null;
     }
 
+    if (snapshot.size > 1) {
+        throw new Error(
+            "Multiple wallet reservations exist for the same reference."
+        );
+    }
 
-    return validateWalletData(
-        walletSnapshot.data()
-    );
+    const document = snapshot.docs[0];
 
+    return {
+        id: document.id,
+        ...document.data()
+    };
+}
+
+
+// =====================================================
+// BUILD RESERVATION
+// =====================================================
+
+function buildReservationData({
+    reservationId,
+    uid,
+    reference,
+    amountKobo,
+    currency,
+    service,
+    metadata,
+    now,
+    reservedBeforeKobo,
+    reservedAfterKobo,
+    availableBeforeKobo,
+    availableAfterKobo
+}) {
+    return {
+        id: reservationId,
+
+        uid,
+
+        reference,
+
+        amountKobo,
+
+        currency,
+
+        service,
+
+        status: STATUS_PENDING,
+
+        reservedBeforeKobo,
+
+        reservedAfterKobo,
+
+        availableBeforeKobo,
+
+        availableAfterKobo,
+
+        metadata:
+            metadata &&
+            typeof metadata === "object"
+                ? metadata
+                : {},
+
+        createdAt: now,
+
+        updatedAt: now,
+
+        committedAt: null,
+
+        releasedAt: null,
+
+        releaseReason: null,
+
+        provider: null
+    };
 }
 
 
 // =====================================================
 // RESERVE FUNDS
 // =====================================================
-//
-// Atomic operation:
-//
-//     wallet.reservedKobo += amount
-//     reservation.status = pending
-//
-// Both changes occur in ONE Firestore transaction.
-//
-// Therefore concurrent reservation attempts against the
-// same wallet serialize correctly.
-// =====================================================
 
 async function reserveFunds({
     uid,
     reference,
     amountKobo,
-    currency = DEFAULT_CURRENCY,
-    service = "airtime",
+    currency = CURRENCY,
+    service,
     metadata = {}
 }) {
+    const authenticatedUid =
+        requireUid(uid);
 
-    const validUid =
-        validateUid(uid);
+    const normalizedReference =
+        requireReference(reference);
 
-    const validReference =
-        normalizeReference(
-            reference
-        );
+    const amount =
+        validateAmountKobo(amountKobo);
 
-    const validAmount =
-        validateAmountKobo(
-            amountKobo
-        );
+    const normalizedCurrency =
+        normalizeCurrency(currency);
 
-    const validCurrency =
-        normalizeCurrency(
-            currency
-        );
+    const normalizedService =
+        normalizeService(service);
 
-    const validService =
-        normalizeService(
-            service
-        );
+    const walletRef =
+        getWalletRef(authenticatedUid);
 
+    /*
+     * First idempotency check.
+     */
+
+    const existing =
+        await findReservationByReference({
+            uid: authenticatedUid,
+            reference: normalizedReference
+        });
+
+    if (existing) {
+        if (
+            Number(existing.amountKobo) !== amount
+        ) {
+            throw createError(
+                "A wallet reservation already exists with a different amount.",
+                409
+            );
+        }
+
+        if (
+            String(existing.currency || "")
+                .toUpperCase() !==
+            normalizedCurrency
+        ) {
+            throw createError(
+                "A wallet reservation already exists with a different currency.",
+                409
+            );
+        }
+
+        if (
+            existing.uid !==
+            authenticatedUid
+        ) {
+            throw createError(
+                "Wallet reservation does not belong to the authenticated user.",
+                403
+            );
+        }
+
+        return {
+            reservationId: existing.id,
+
+            reference: existing.reference,
+
+            amountKobo: existing.amountKobo,
+
+            currency: existing.currency,
+
+            status:
+                existing.status ||
+                STATUS_PENDING,
+
+            alreadyExists: true,
+
+            balanceKobo: null,
+
+            reservedKobo: null,
+
+            availableKobo: null
+        };
+    }
 
     const reservationId =
-        createReservationId(
-            validUid,
-            validReference
-        );
-
+        createReservationId();
 
     const reservationRef =
         getReservationRef(
-            validUid,
             reservationId
         );
 
-
-    const walletRef =
-        getWalletRef(
-            validUid
-        );
-
-
-    const safeMetadata =
-        metadata &&
-        typeof metadata === "object" &&
-        !Array.isArray(metadata)
-            ? metadata
-            : {};
-
+    const now = new Date();
 
     const result =
         await db.runTransaction(
             async transaction => {
 
-                // -----------------------------------------
-                // READ RESERVATION
-                // -----------------------------------------
+                /*
+                 * IMPORTANT:
+                 *
+                 * Wallet MUST already exist.
+                 */
+
+                const walletSnapshot =
+                    await transaction.get(
+                        walletRef
+                    );
+
+                if (!walletSnapshot.exists) {
+                    throw createError(
+                        "Wallet account not found.",
+                        404
+                    );
+                }
+
+                /*
+                 * Check reservation document inside
+                 * the transaction as well.
+                 */
 
                 const reservationSnapshot =
                     await transaction.get(
                         reservationRef
                     );
-
-
-                // -----------------------------------------
-                // IDEMPOTENT RETRY
-                // -----------------------------------------
 
                 if (
                     reservationSnapshot.exists
                 ) {
-
-                    const existing =
+                    const existingReservation =
                         reservationSnapshot.data();
 
-
                     if (
-                        existing.uid !==
-                        validUid
+                        existingReservation.uid !==
+                        authenticatedUid
                     ) {
-
-                        throw new Error(
-                            "Reservation ownership mismatch."
+                        throw createError(
+                            "Wallet reservation ownership mismatch.",
+                            403
                         );
-
                     }
-
-
-                    if (
-                        Number(
-                            existing.amountKobo
-                        ) !==
-                        validAmount
-                    ) {
-
-                        throw new Error(
-                            "Transaction reference is already associated with a different amount."
-                        );
-
-                    }
-
-
-                    if (
-                        String(
-                            existing.currency ||
-                            ""
-                        )
-                            .toUpperCase() !==
-                        validCurrency
-                    ) {
-
-                        throw new Error(
-                            "Transaction reference is already associated with a different currency."
-                        );
-
-                    }
-
-
-                    if (
-                        String(
-                            existing.service ||
-                            ""
-                        )
-                            .trim()
-                            .toLowerCase() !==
-                        validService
-                    ) {
-
-                        throw new Error(
-                            "Transaction reference is already associated with a different service."
-                        );
-
-                    }
-
 
                     return {
+                        alreadyExists: true,
 
                         reservationId,
 
-                        status:
-                            existing.status,
+                        reservation:
+                            existingReservation,
 
-                        amountKobo:
-                            Number(
-                                existing.amountKobo
-                            ),
-
-                        currency:
-                            existing.currency,
-
-                        balanceKobo:
-                            Number(
-                                existing.balanceKobo
-                            ),
-
-                        reservedBeforeKobo:
-                            Number(
-                                existing.reservedBeforeKobo
-                            ),
-
-                        reservedAfterKobo:
-                            Number(
-                                existing.reservedAfterKobo
-                            ),
-
-                        availableKobo:
-                            Number(
-                                existing.availableKobo
-                            ),
-
-                        availableAfterKobo:
-                            Number(
-                                existing.availableAfterKobo
-                            ),
-
-                        duplicate:
-                            true
-
+                        wallet:
+                            readWalletState(
+                                walletSnapshot.data()
+                            )
                     };
-
                 }
-
-
-                // -----------------------------------------
-                // READ WALLET
-                // -----------------------------------------
-
-                const walletSnapshot =
-                    await transaction.get(
-                        walletRef
-                    );
-
-
-                if (
-                    !walletSnapshot.exists
-                ) {
-
-                    throw new Error(
-                        "Wallet not found."
-                    );
-
-                }
-
 
                 const wallet =
-                    validateWalletData(
+                    readWalletState(
                         walletSnapshot.data()
                     );
 
+                /*
+                 * Only AVAILABLE funds may be reserved.
+                 */
 
                 if (
-                    wallet.currency !==
-                    validCurrency
+                    wallet.availableKobo <
+                    amount
                 ) {
-
-                    throw new Error(
-                        "Wallet currency mismatch."
+                    throw createError(
+                        "Insufficient wallet balance.",
+                        400
                     );
-
                 }
-
-
-                // -----------------------------------------
-                // AVAILABLE BALANCE
-                // -----------------------------------------
-
-                const availableKobo =
-                    wallet.availableKobo;
-
-
-                // -----------------------------------------
-                // INSUFFICIENT FUNDS
-                // -----------------------------------------
-
-                if (
-                    availableKobo <
-                    validAmount
-                ) {
-
-                    const error =
-                        new Error(
-                            "Insufficient wallet balance."
-                        );
-
-
-                    error.code =
-                        "INSUFFICIENT_FUNDS";
-
-
-                    throw error;
-
-                }
-
-
-                // -----------------------------------------
-                // NEW RESERVED BALANCE
-                // -----------------------------------------
 
                 const reservedAfterKobo =
                     wallet.reservedKobo +
-                    validAmount;
-
-
-                if (
-                    !Number.isSafeInteger(
-                        reservedAfterKobo
-                    )
-                ) {
-
-                    throw new Error(
-                        "Reserved wallet amount exceeds supported limits."
-                    );
-
-                }
-
-
-                if (
-                    reservedAfterKobo >
-                    wallet.balanceKobo
-                ) {
-
-                    throw new Error(
-                        "Wallet reservation would exceed available funds."
-                    );
-
-                }
-
+                    amount;
 
                 const availableAfterKobo =
                     wallet.balanceKobo -
                     reservedAfterKobo;
 
+                if (
+                    reservedAfterKobo < 0 ||
+                    reservedAfterKobo >
+                        wallet.balanceKobo
+                ) {
+                    throw new Error(
+                        "Wallet reservation would create an invalid reserved balance."
+                    );
+                }
 
-                const now =
-                    new Date();
+                if (
+                    availableAfterKobo < 0
+                ) {
+                    throw new Error(
+                        "Wallet reservation would create a negative available balance."
+                    );
+                }
 
-
-                // -----------------------------------------
-                // UPDATE WALLET
-                // -----------------------------------------
-
-                transaction.update(
-                    walletRef,
-                    {
-
-                        reservedKobo:
-                            reservedAfterKobo,
-
-                        updatedAt:
-                            now
-
-                    }
-                );
-
-
-                // -----------------------------------------
-                // CREATE RESERVATION
-                // -----------------------------------------
-
-                transaction.create(
-                    reservationRef,
-                    {
-
-                        id:
-                            reservationId,
+                const reservation =
+                    buildReservationData({
+                        reservationId,
 
                         uid:
-                            validUid,
+                            authenticatedUid,
 
                         reference:
-                            validReference,
-
-                        service:
-                            validService,
+                            normalizedReference,
 
                         amountKobo:
-                            validAmount,
+                            amount,
 
                         currency:
-                            validCurrency,
+                            normalizedCurrency,
 
-                        status:
-                            RESERVATION_STATUS.PENDING,
+                        service:
+                            normalizedService,
 
-                        balanceKobo:
-                            wallet.balanceKobo,
+                        metadata,
+
+                        now,
 
                         reservedBeforeKobo:
                             wallet.reservedKobo,
 
                         reservedAfterKobo,
 
-                        availableKobo:
-
+                        availableBeforeKobo:
                             wallet.availableKobo,
 
-                        availableAfterKobo,
-
-                        metadata:
-                            safeMetadata,
-
-                        createdAt:
-                            now,
-
-                        updatedAt:
-                            now
-
-                    }
-                );
-
-
-                return {
-
-                    reservationId,
-
-                    status:
-                        RESERVATION_STATUS.PENDING,
-
-                    amountKobo:
-                        validAmount,
-
-                    currency:
-                        validCurrency,
-
-                    balanceKobo:
-                        wallet.balanceKobo,
-
-                    reservedBeforeKobo:
-                        wallet.reservedKobo,
-
-                    reservedAfterKobo,
-
-                    availableKobo:
-                        wallet.availableKobo,
-
-                    availableAfterKobo,
-
-                    duplicate:
-                        false
-
-                };
-
-            }
-        );
-
-
-    return {
-
-        uid:
-            validUid,
-
-        ...result
-
-    };
-
-}
-
-
-// =====================================================
-// COMMIT RESERVATION
-// =====================================================
-//
-// Atomic operation:
-//
-//     wallet.balanceKobo -= amount
-//     wallet.reservedKobo -= amount
-//     reservation.status = committed
-//     ledger entry = successful debit
-//
-// Everything occurs in ONE Firestore transaction.
-// =====================================================
-
-async function commitReservation({
-    uid,
-    reservationId,
-    provider = "vtu.ng",
-    providerReference = null
-}) {
-
-    const validUid =
-        validateUid(uid);
-
-
-    const reservationRef =
-        getReservationRef(
-            validUid,
-            reservationId
-        );
-
-
-    const walletRef =
-        getWalletRef(
-            validUid
-        );
-
-
-    const normalizedProvider =
-        String(
-            provider ||
-            "vtu.ng"
-        )
-            .trim()
-            .toLowerCase();
-
-
-    if (
-        !normalizedProvider
-    ) {
-
-        throw new Error(
-            "Provider is required."
-        );
-
-    }
-
-
-    const normalizedProviderReference =
-        providerReference !==
-            undefined &&
-        providerReference !==
-            null
-            ? String(
-                providerReference
-            )
-                .trim()
-                .slice(
-                    0,
-                    200
-                ) ||
-                null
-            : null;
-
-
-    const result =
-        await db.runTransaction(
-            async transaction => {
-
-                // -----------------------------------------
-                // READ RESERVATION
-                // -----------------------------------------
-
-                const reservationSnapshot =
-                    await transaction.get(
-                        reservationRef
-                    );
-
-
-                if (
-                    !reservationSnapshot.exists
-                ) {
-
-                    throw new Error(
-                        "Reservation not found."
-                    );
-
-                }
-
-
-                const reservation =
-                    reservationSnapshot.data();
-
-
-                if (
-                    reservation.uid !==
-                    validUid
-                ) {
-
-                    throw new Error(
-                        "Reservation ownership mismatch."
-                    );
-
-                }
-
-
-                const amountKobo =
-                    validateAmountKobo(
-                        reservation.amountKobo
-                    );
-
-
-                const service =
-                    normalizeService(
-                        reservation.service
-                    );
-
-
-                // -----------------------------------------
-                // IDEMPOTENT COMMIT
-                // -----------------------------------------
-
-                if (
-                    reservation.status ===
-                    RESERVATION_STATUS.COMMITTED
-                ) {
-
-                    return {
-
-                        committed:
-                            true,
-
-                        duplicate:
-                            true,
-
-                        amountKobo,
-
-                        balanceAfterKobo:
-                            Number(
-                                reservation.balanceAfterKobo
-                            ),
-
-                        ledgerId:
-                            reservation.ledgerId ||
-                            null
-
-                    };
-
-                }
-
-
-                // -----------------------------------------
-                // TERMINAL RELEASE
-                // -----------------------------------------
-
-                if (
-                    reservation.status ===
-                    RESERVATION_STATUS.RELEASED
-                ) {
-
-                    throw new Error(
-                        "A released reservation cannot be committed."
-                    );
-
-                }
-
-
-                if (
-                    reservation.status !==
-                    RESERVATION_STATUS.PENDING
-                ) {
-
-                    throw new Error(
-                        "Reservation is not pending."
-                    );
-
-                }
-
-
-                // -----------------------------------------
-                // READ WALLET
-                // -----------------------------------------
-
-                const walletSnapshot =
-                    await transaction.get(
-                        walletRef
-                    );
-
-
-                if (
-                    !walletSnapshot.exists
-                ) {
-
-                    throw new Error(
-                        "Wallet not found."
-                    );
-
-                }
-
-
-                const wallet =
-                    validateWalletData(
-                        walletSnapshot.data()
-                    );
-
-
-                // -----------------------------------------
-                // VERIFY RESERVED BALANCE
-                // -----------------------------------------
-
-                if (
-                    wallet.reservedKobo <
-                    amountKobo
-                ) {
-
-                    throw new Error(
-                        "Wallet reserved balance is insufficient for this reservation."
-                    );
-
-                }
-
-
-                if (
-                    wallet.balanceKobo <
-                    amountKobo
-                ) {
-
-                    throw new Error(
-                        "Wallet balance is insufficient for the reserved debit."
-                    );
-
-                }
-
-
-                // -----------------------------------------
-                // CALCULATE NEW WALLET STATE
-                // -----------------------------------------
-
-                const balanceAfterKobo =
-                    wallet.balanceKobo -
-                    amountKobo;
-
-
-                const reservedAfterKobo =
-                    wallet.reservedKobo -
-                    amountKobo;
-
-
-                if (
-                    balanceAfterKobo <
-                    0
-                ) {
-
-                    throw new Error(
-                        "Wallet balance cannot become negative."
-                    );
-
-                }
-
-
-                if (
-                    reservedAfterKobo <
-                    0
-                ) {
-
-                    throw new Error(
-                        "Wallet reserved balance cannot become negative."
-                    );
-
-                }
-
-
-                if (
-                    reservedAfterKobo >
-                    balanceAfterKobo
-                ) {
-
-                    throw new Error(
-                        "Wallet reservation integrity violation after commit."
-                    );
-
-                }
-
-
-                const availableAfterKobo =
-                    balanceAfterKobo -
-                    reservedAfterKobo;
-
-
-                const now =
-                    new Date();
-
-
-                // -----------------------------------------
-                // LEDGER ID
-                // -----------------------------------------
-
-                const ledgerId =
-                    createLedgerId(
-                        validUid,
-                        reservation.reference,
-                        service
-                    );
-
-
-                const ledgerRef =
-                    getLedgerRef(
-                        validUid,
-                        ledgerId
-                    );
-
-
-                // -----------------------------------------
-                // READ LEDGER
-                // -----------------------------------------
-
-                const ledgerSnapshot =
-                    await transaction.get(
-                        ledgerRef
-                    );
-
-
-                if (
-                    ledgerSnapshot.exists
-                ) {
-
-                    const existingLedger =
-                        ledgerSnapshot.data();
-
-
-                    if (
-                        existingLedger.reservationId !==
-                        reservationSnapshot.id
-                    ) {
-
-                        throw new Error(
-                            "Ledger reference collision detected."
-                        );
-
-                    }
-
-
-                    throw new Error(
-                        "A ledger entry already exists for this transaction."
-                    );
-
-                }
-
-
-                // -----------------------------------------
-                // UPDATE WALLET
-                // -----------------------------------------
+                        availableAfterKobo
+                    });
+
+                /*
+                 * Only reservedKobo changes.
+                 */
 
                 transaction.update(
                     walletRef,
                     {
-
-                        balanceKobo:
-                            balanceAfterKobo,
-
                         reservedKobo:
                             reservedAfterKobo,
 
                         updatedAt:
                             now
-
                     }
                 );
 
-
-                // -----------------------------------------
-                // UPDATE RESERVATION
-                // -----------------------------------------
-
-                transaction.update(
-                    reservationRef,
-                    {
-
-                        status:
-                            RESERVATION_STATUS.COMMITTED,
-
-                        balanceAfterKobo,
-
-                        reservedAfterKobo,
-
-                        availableAfterKobo,
-
-                        ledgerId,
-
-                        provider:
-                            normalizedProvider,
-
-                        providerReference:
-                            normalizedProviderReference,
-
-                        committedAt:
-                            now,
-
-                        updatedAt:
-                            now
-
-                    }
-                );
-
-
-                // -----------------------------------------
-                // CREATE LEDGER
-                // -----------------------------------------
+                /*
+                 * Create reservation.
+                 */
 
                 transaction.create(
-                    ledgerRef,
-                    {
+                    reservationRef,
+                    reservation
+                );
 
-                        id:
-                            ledgerId,
+                /*
+                 * Create audit record.
+                 */
+
+                const auditRef =
+                    reservationRef
+                        .collection("audit")
+                        .doc(
+                            createAuditId()
+                        );
+
+                transaction.create(
+                    auditRef,
+                    {
+                        id: auditRef.id,
+
+                        reservationId,
 
                         uid:
-                            validUid,
+                            authenticatedUid,
 
-                        type:
-                            service,
+                        action:
+                            "reserved",
 
-                        direction:
-                            "debit",
-
-                        status:
-                            "successful",
-
-                        reference:
-                            reservation.reference,
-
-                        provider:
-                            normalizedProvider,
-
-                        providerReference:
-                            normalizedProviderReference,
-
-                        amountKobo,
-
-                        currency:
-                            reservation.currency,
+                        amountKobo:
+                            amount,
 
                         balanceBeforeKobo:
                             wallet.balanceKobo,
 
-                        balanceAfterKobo,
+                        balanceAfterKobo:
+                            wallet.balanceKobo,
 
                         reservedBeforeKobo:
                             wallet.reservedKobo,
 
                         reservedAfterKobo,
 
+                        availableBeforeKobo:
+                            wallet.availableKobo,
+
                         availableAfterKobo,
 
-                        reservationId:
-                            reservationSnapshot.id,
+                        reference:
+                            normalizedReference,
+
+                        service:
+                            normalizedService,
 
                         createdAt:
                             now
-
                     }
                 );
 
-
                 return {
+                    alreadyExists: false,
 
-                    committed:
-                        true,
+                    reservationId,
 
-                    duplicate:
-                        false,
+                    reservation,
 
-                    amountKobo,
-
-                    balanceAfterKobo,
-
-                    reservedAfterKobo,
-
-                    availableAfterKobo,
-
-                    ledgerId
-
-                };
-
-            }
-        );
-
-
-    return {
-
-        uid:
-            validUid,
-
-        reservationId,
-
-        ...result
-
-    };
-
-}
-
-
-// =====================================================
-// RELEASE RESERVATION
-// =====================================================
-//
-// Atomic operation:
-//
-//     wallet.reservedKobo -= amount
-//     reservation.status = released
-//
-// IMPORTANT:
-//
-// No money is credited.
-//
-// The money was never permanently debited.
-//
-// We simply remove the temporary lock.
-// =====================================================
-
-async function releaseReservation({
-    uid,
-    reservationId,
-    reason = "provider_failed"
-}) {
-
-    const validUid =
-        validateUid(uid);
-
-
-    const reservationRef =
-        getReservationRef(
-            validUid,
-            reservationId
-        );
-
-
-    const walletRef =
-        getWalletRef(
-            validUid
-        );
-
-
-    const normalizedReason =
-        String(
-            reason ||
-            "provider_failed"
-        )
-            .trim()
-            .slice(
-                0,
-                300
-            );
-
-
-    const result =
-        await db.runTransaction(
-            async transaction => {
-
-                // -----------------------------------------
-                // READ RESERVATION
-                // -----------------------------------------
-
-                const reservationSnapshot =
-                    await transaction.get(
-                        reservationRef
-                    );
-
-
-                if (
-                    !reservationSnapshot.exists
-                ) {
-
-                    throw new Error(
-                        "Reservation not found."
-                    );
-
-                }
-
-
-                const reservation =
-                    reservationSnapshot.data();
-
-
-                if (
-                    reservation.uid !==
-                    validUid
-                ) {
-
-                    throw new Error(
-                        "Reservation ownership mismatch."
-                    );
-
-                }
-
-
-                const amountKobo =
-                    validateAmountKobo(
-                        reservation.amountKobo
-                    );
-
-
-                // -----------------------------------------
-                // IDEMPOTENT RELEASE
-                // -----------------------------------------
-
-                if (
-                    reservation.status ===
-                    RESERVATION_STATUS.RELEASED
-                ) {
-
-                    return {
-
-                        released:
-                            true,
-
-                        duplicate:
-                            true,
-
-                        amountKobo,
-
+                    wallet: {
                         balanceKobo:
-                            Number(
-                                reservation.balanceKobo
-                            ),
-
-                        reservedAfterKobo:
-                            Number(
-                                reservation.reservedAfterKobo
-                            ),
-
-                        availableAfterKobo:
-                            Number(
-                                reservation.availableAfterKobo
-                            )
-
-                    };
-
-                }
-
-
-                // -----------------------------------------
-                // CANNOT RELEASE COMMITTED MONEY
-                // -----------------------------------------
-
-                if (
-                    reservation.status ===
-                    RESERVATION_STATUS.COMMITTED
-                ) {
-
-                    throw new Error(
-                        "A committed reservation cannot be released."
-                    );
-
-                }
-
-
-                if (
-                    reservation.status !==
-                    RESERVATION_STATUS.PENDING
-                ) {
-
-                    throw new Error(
-                        "Reservation cannot be released."
-                    );
-
-                }
-
-
-                // -----------------------------------------
-                // READ WALLET
-                // -----------------------------------------
-
-                const walletSnapshot =
-                    await transaction.get(
-                        walletRef
-                    );
-
-
-                if (
-                    !walletSnapshot.exists
-                ) {
-
-                    throw new Error(
-                        "Wallet not found."
-                    );
-
-                }
-
-
-                const wallet =
-                    validateWalletData(
-                        walletSnapshot.data()
-                    );
-
-
-                // -----------------------------------------
-                // VERIFY RESERVED BALANCE
-                // -----------------------------------------
-
-                if (
-                    wallet.reservedKobo <
-                    amountKobo
-                ) {
-
-                    throw new Error(
-                        "Wallet reserved balance is insufficient for this release."
-                    );
-
-                }
-
-
-                // -----------------------------------------
-                // CALCULATE NEW RESERVED BALANCE
-                // -----------------------------------------
-
-                const reservedAfterKobo =
-                    wallet.reservedKobo -
-                    amountKobo;
-
-
-                if (
-                    reservedAfterKobo <
-                    0
-                ) {
-
-                    throw new Error(
-                        "Wallet reserved balance cannot become negative."
-                    );
-
-                }
-
-
-                if (
-                    reservedAfterKobo >
-                    wallet.balanceKobo
-                ) {
-
-                    throw new Error(
-                        "Wallet reservation integrity violation after release."
-                    );
-
-                }
-
-
-                const availableAfterKobo =
-                    wallet.balanceKobo -
-                    reservedAfterKobo;
-
-
-                const now =
-                    new Date();
-
-
-                // -----------------------------------------
-                // UPDATE WALLET
-                // -----------------------------------------
-
-                transaction.update(
-                    walletRef,
-                    {
+                            wallet.balanceKobo,
 
                         reservedKobo:
                             reservedAfterKobo,
 
-                        updatedAt:
-                            now
-
+                        availableKobo:
+                            availableAfterKobo
                     }
-                );
-
-
-                // -----------------------------------------
-                // UPDATE RESERVATION
-                // -----------------------------------------
-
-                transaction.update(
-                    reservationRef,
-                    {
-
-                        status:
-                            RESERVATION_STATUS.RELEASED,
-
-                        reservedAfterKobo,
-
-                        availableAfterKobo,
-
-                        releaseReason:
-                            normalizedReason,
-
-                        releasedAt:
-                            now,
-
-                        updatedAt:
-                            now
-
-                    }
-                );
-
-
-                return {
-
-                    released:
-                        true,
-
-                    duplicate:
-                        false,
-
-                    amountKobo,
-
-                    balanceKobo:
-                        wallet.balanceKobo,
-
-                    reservedBeforeKobo:
-                        wallet.reservedKobo,
-
-                    reservedAfterKobo,
-
-                    availableAfterKobo
-
                 };
-
             }
         );
 
-
     return {
+        reservationId:
+            result.reservationId,
 
-        uid:
-            validUid,
+        reference:
+            normalizedReference,
 
-        reservationId,
+        amountKobo:
+            amount,
 
-        ...result
+        currency:
+            normalizedCurrency,
 
+        status:
+            result.reservation?.status ||
+            STATUS_PENDING,
+
+        alreadyExists:
+            result.alreadyExists,
+
+        balanceKobo:
+            result.wallet?.balanceKobo ??
+            null,
+
+        reservedKobo:
+            result.wallet?.reservedKobo ??
+            null,
+
+        availableKobo:
+            result.wallet?.availableKobo ??
+            null
     };
-
 }
 
 
@@ -1900,209 +874,692 @@ async function getReservation({
     uid,
     reservationId
 }) {
+    const authenticatedUid =
+        requireUid(uid);
 
-    const validUid =
-        validateUid(uid);
-
-
-    const reservationRef =
-        getReservationRef(
-            validUid,
+    const normalizedId =
+        requireReservationId(
             reservationId
         );
 
-
     const snapshot =
-        await reservationRef.get();
+        await getReservationRef(
+            normalizedId
+        ).get();
 
-
-    if (
-        !snapshot.exists
-    ) {
-
+    if (!snapshot.exists) {
         return null;
-
     }
 
-
-    const data =
+    const reservation =
         snapshot.data();
 
-
     if (
-        data.uid !==
-        validUid
+        reservation.uid !==
+        authenticatedUid
     ) {
-
-        return null;
-
+        throw createError(
+            "Wallet reservation not found.",
+            404
+        );
     }
 
+    return {
+        id: snapshot.id,
+        ...reservation
+    };
+}
+
+
+// =====================================================
+// COMMIT RESERVATION
+// =====================================================
+//
+// Called by Airtime service ONLY after explicit provider
+// success.
+//
+// Financial effect:
+//
+// balanceKobo   ↓
+// reservedKobo ↓
+//
+// availableKobo remains mathematically correct.
+// =====================================================
+
+async function commitReservation({
+    uid,
+    reservationId,
+    provider = null
+}) {
+    const authenticatedUid =
+        requireUid(uid);
+
+    const normalizedReservationId =
+        requireReservationId(
+            reservationId
+        );
+
+    const walletRef =
+        getWalletRef(authenticatedUid);
+
+    const reservationRef =
+        getReservationRef(
+            normalizedReservationId
+        );
+
+    const now = new Date();
+
+    const result =
+        await db.runTransaction(
+            async transaction => {
+
+                const walletSnapshot =
+                    await transaction.get(
+                        walletRef
+                    );
+
+                const reservationSnapshot =
+                    await transaction.get(
+                        reservationRef
+                    );
+
+                if (
+                    !reservationSnapshot.exists
+                ) {
+                    throw createError(
+                        "Wallet reservation not found.",
+                        404
+                    );
+                }
+
+                const reservation =
+                    reservationSnapshot.data();
+
+                if (
+                    reservation.uid !==
+                    authenticatedUid
+                ) {
+                    throw createError(
+                        "Wallet reservation does not belong to the authenticated user.",
+                        403
+                    );
+                }
+
+                /*
+                 * Idempotent commit.
+                 */
+
+                if (
+                    reservation.status ===
+                    STATUS_COMMITTED
+                ) {
+                    return {
+                        committed: true,
+
+                        alreadyCommitted: true,
+
+                        reservation
+                    };
+                }
+
+                /*
+                 * Released is terminal.
+                 */
+
+                if (
+                    reservation.status ===
+                    STATUS_RELEASED
+                ) {
+                    throw createError(
+                        "A released wallet reservation cannot be committed.",
+                        409
+                    );
+                }
+
+                if (
+                    reservation.status !==
+                    STATUS_PENDING
+                ) {
+                    throw createError(
+                        "Wallet reservation is in an invalid state.",
+                        409
+                    );
+                }
+
+                if (
+                    !walletSnapshot.exists
+                ) {
+                    throw createError(
+                        "Wallet account not found.",
+                        404
+                    );
+                }
+
+                const wallet =
+                    readWalletState(
+                        walletSnapshot.data()
+                    );
+
+                const amount =
+                    validateAmountKobo(
+                        reservation.amountKobo
+                    );
+
+                /*
+                 * Reserved money must exist.
+                 */
+
+                if (
+                    wallet.reservedKobo <
+                    amount
+                ) {
+                    throw new Error(
+                        "Wallet reserved balance is inconsistent with the reservation."
+                    );
+                }
+
+                if (
+                    wallet.balanceKobo <
+                    amount
+                ) {
+                    throw new Error(
+                        "Wallet balance is inconsistent with the reservation."
+                    );
+                }
+
+                const newBalanceKobo =
+                    wallet.balanceKobo -
+                    amount;
+
+                const newReservedKobo =
+                    wallet.reservedKobo -
+                    amount;
+
+                if (
+                    newBalanceKobo < 0
+                ) {
+                    throw new Error(
+                        "Wallet commit would create a negative balance."
+                    );
+                }
+
+                if (
+                    newReservedKobo < 0
+                ) {
+                    throw new Error(
+                        "Wallet commit would create a negative reserved balance."
+                    );
+                }
+
+                const newAvailableKobo =
+                    newBalanceKobo -
+                    newReservedKobo;
+
+                if (
+                    newAvailableKobo < 0
+                ) {
+                    throw new Error(
+                        "Wallet commit would create a negative available balance."
+                    );
+                }
+
+                const normalizedProvider =
+                    provider === null ||
+                    provider === undefined
+                        ? null
+                        : String(provider)
+                            .trim()
+                            .slice(0, 100);
+
+                const commitUpdate = {
+                    status:
+                        STATUS_COMMITTED,
+
+                    committedAt:
+                        now,
+
+                    updatedAt:
+                        now,
+
+                    provider:
+                        normalizedProvider
+                };
+
+                /*
+                 * Permanently debit the wallet.
+                 */
+
+                transaction.update(
+                    walletRef,
+                    {
+                        balanceKobo:
+                            newBalanceKobo,
+
+                        reservedKobo:
+                            newReservedKobo,
+
+                        updatedAt:
+                            now
+                    }
+                );
+
+                /*
+                 * Mark reservation committed.
+                 */
+
+                transaction.update(
+                    reservationRef,
+                    commitUpdate
+                );
+
+                /*
+                 * Audit.
+                 */
+
+                const auditRef =
+                    reservationRef
+                        .collection("audit")
+                        .doc(
+                            createAuditId()
+                        );
+
+                transaction.create(
+                    auditRef,
+                    {
+                        id: auditRef.id,
+
+                        reservationId:
+                            normalizedReservationId,
+
+                        uid:
+                            authenticatedUid,
+
+                        action:
+                            "committed",
+
+                        amountKobo:
+                            amount,
+
+                        balanceBeforeKobo:
+                            wallet.balanceKobo,
+
+                        balanceAfterKobo:
+                            newBalanceKobo,
+
+                        reservedBeforeKobo:
+                            wallet.reservedKobo,
+
+                        reservedAfterKobo:
+                            newReservedKobo,
+
+                        availableBeforeKobo:
+                            wallet.availableKobo,
+
+                        availableAfterKobo:
+                            newAvailableKobo,
+
+                        provider:
+                            normalizedProvider,
+
+                        createdAt:
+                            now
+                    }
+                );
+
+                return {
+                    committed: true,
+
+                    alreadyCommitted: false,
+
+                    reservation: {
+                        ...reservation,
+                        ...commitUpdate
+                    }
+                };
+            }
+        );
 
     return {
+        committed:
+            result.committed,
 
-        id:
-            snapshot.id,
+        alreadyCommitted:
+            result.alreadyCommitted,
 
-        uid:
-            validUid,
-
-        reference:
-            String(
-                data.reference ||
-                ""
-            ),
-
-        service:
-            String(
-                data.service ||
-                ""
-            ),
-
-        amountKobo:
-            Number(
-                data.amountKobo
-            ),
-
-        currency:
-            String(
-                data.currency ||
-                DEFAULT_CURRENCY
-            ),
+        reservationId:
+            normalizedReservationId,
 
         status:
-            String(
-                data.status ||
-                ""
-            ),
-
-        balanceKobo:
-            Number(
-                data.balanceKobo
-            ),
-
-        reservedBeforeKobo:
-            Number(
-                data.reservedBeforeKobo
-            ),
-
-        reservedAfterKobo:
-            Number(
-                data.reservedAfterKobo
-            ),
-
-        availableKobo:
-            Number(
-                data.availableKobo
-            ),
-
-        availableAfterKobo:
-            Number(
-                data.availableAfterKobo
-            ),
-
-        balanceAfterKobo:
-            data.balanceAfterKobo !==
-                undefined
-                ? Number(
-                    data.balanceAfterKobo
-                )
-                : null,
-
-        ledgerId:
-            data.ledgerId ||
-            null,
-
-        provider:
-            data.provider ||
-            null,
-
-        providerReference:
-            data.providerReference ||
-            null,
-
-        metadata:
-            data.metadata &&
-            typeof data.metadata ===
-                "object"
-                ? data.metadata
-                : {},
-
-        createdAt:
-            data.createdAt ||
-            null,
-
-        updatedAt:
-            data.updatedAt ||
-            null,
-
-        committedAt:
-            data.committedAt ||
-            null,
-
-        releasedAt:
-            data.releasedAt ||
-            null,
-
-        releaseReason:
-            data.releaseReason ||
-            null
-
+            STATUS_COMMITTED
     };
+}
 
+
+// =====================================================
+// RELEASE RESERVATION
+// =====================================================
+//
+// Called by Airtime service ONLY after explicit provider
+// failure.
+//
+// Financial effect:
+//
+// balanceKobo   unchanged
+// reservedKobo ↓
+//
+// Therefore availableKobo increases again.
+// =====================================================
+
+async function releaseReservation({
+    uid,
+    reservationId,
+    reason = "wallet_reservation_released"
+}) {
+    const authenticatedUid =
+        requireUid(uid);
+
+    const normalizedReservationId =
+        requireReservationId(
+            reservationId
+        );
+
+    const normalizedReason =
+        String(
+            reason ||
+            "wallet_reservation_released"
+        )
+            .trim()
+            .slice(0, 300);
+
+    const walletRef =
+        getWalletRef(authenticatedUid);
+
+    const reservationRef =
+        getReservationRef(
+            normalizedReservationId
+        );
+
+    const now = new Date();
+
+    const result =
+        await db.runTransaction(
+            async transaction => {
+
+                const walletSnapshot =
+                    await transaction.get(
+                        walletRef
+                    );
+
+                const reservationSnapshot =
+                    await transaction.get(
+                        reservationRef
+                    );
+
+                if (
+                    !reservationSnapshot.exists
+                ) {
+                    throw createError(
+                        "Wallet reservation not found.",
+                        404
+                    );
+                }
+
+                const reservation =
+                    reservationSnapshot.data();
+
+                if (
+                    reservation.uid !==
+                    authenticatedUid
+                ) {
+                    throw createError(
+                        "Wallet reservation does not belong to the authenticated user.",
+                        403
+                    );
+                }
+
+                /*
+                 * Idempotent release.
+                 */
+
+                if (
+                    reservation.status ===
+                    STATUS_RELEASED
+                ) {
+                    return {
+                        released: true,
+
+                        alreadyReleased: true,
+
+                        reservation
+                    };
+                }
+
+                /*
+                 * Committed reservations are terminal.
+                 */
+
+                if (
+                    reservation.status ===
+                    STATUS_COMMITTED
+                ) {
+                    throw createError(
+                        "A committed wallet reservation cannot be released.",
+                        409
+                    );
+                }
+
+                if (
+                    reservation.status !==
+                    STATUS_PENDING
+                ) {
+                    throw createError(
+                        "Wallet reservation is in an invalid state.",
+                        409
+                    );
+                }
+
+                if (
+                    !walletSnapshot.exists
+                ) {
+                    throw createError(
+                        "Wallet account not found.",
+                        404
+                    );
+                }
+
+                const wallet =
+                    readWalletState(
+                        walletSnapshot.data()
+                    );
+
+                const amount =
+                    validateAmountKobo(
+                        reservation.amountKobo
+                    );
+
+                if (
+                    wallet.reservedKobo <
+                    amount
+                ) {
+                    throw new Error(
+                        "Wallet reserved balance is inconsistent with the reservation."
+                    );
+                }
+
+                const newReservedKobo =
+                    wallet.reservedKobo -
+                    amount;
+
+                if (
+                    newReservedKobo < 0
+                ) {
+                    throw new Error(
+                        "Wallet release would create a negative reserved balance."
+                    );
+                }
+
+                const newAvailableKobo =
+                    wallet.balanceKobo -
+                    newReservedKobo;
+
+                if (
+                    newAvailableKobo < 0
+                ) {
+                    throw new Error(
+                        "Wallet release would create a negative available balance."
+                    );
+                }
+
+                const releaseUpdate = {
+                    status:
+                        STATUS_RELEASED,
+
+                    releasedAt:
+                        now,
+
+                    updatedAt:
+                        now,
+
+                    releaseReason:
+                        normalizedReason
+                };
+
+                /*
+                 * Balance stays unchanged.
+                 */
+
+                transaction.update(
+                    walletRef,
+                    {
+                        reservedKobo:
+                            newReservedKobo,
+
+                        updatedAt:
+                            now
+                    }
+                );
+
+                /*
+                 * Mark reservation released.
+                 */
+
+                transaction.update(
+                    reservationRef,
+                    releaseUpdate
+                );
+
+                /*
+                 * Audit.
+                 */
+
+                const auditRef =
+                    reservationRef
+                        .collection("audit")
+                        .doc(
+                            createAuditId()
+                        );
+
+                transaction.create(
+                    auditRef,
+                    {
+                        id: auditRef.id,
+
+                        reservationId:
+                            normalizedReservationId,
+
+                        uid:
+                            authenticatedUid,
+
+                        action:
+                            "released",
+
+                        amountKobo:
+                            amount,
+
+                        balanceBeforeKobo:
+                            wallet.balanceKobo,
+
+                        balanceAfterKobo:
+                            wallet.balanceKobo,
+
+                        reservedBeforeKobo:
+                            wallet.reservedKobo,
+
+                        reservedAfterKobo:
+                            newReservedKobo,
+
+                        availableBeforeKobo:
+                            wallet.availableKobo,
+
+                        availableAfterKobo:
+                            newAvailableKobo,
+
+                        reason:
+                            normalizedReason,
+
+                        createdAt:
+                            now
+                    }
+                );
+
+                return {
+                    released: true,
+
+                    alreadyReleased: false,
+
+                    reservation: {
+                        ...reservation,
+                        ...releaseUpdate
+                    }
+                };
+            }
+        );
+
+    return {
+        released:
+            result.released,
+
+        alreadyReleased:
+            result.alreadyReleased,
+
+        reservationId:
+            normalizedReservationId,
+
+        status:
+            STATUS_RELEASED
+    };
 }
 
 
 // =====================================================
 // GET WALLET BALANCE
 // =====================================================
-//
-// Useful for backend APIs.
-//
-// Returns the authoritative wallet aggregate.
-// =====================================================
 
-async function getWalletBalance(
-    uid
-) {
-
-    const validUid =
-        validateUid(uid);
-
+async function getWalletBalance(uid) {
+    const authenticatedUid =
+        requireUid(uid);
 
     const walletRef =
         getWalletRef(
-            validUid
+            authenticatedUid
         );
-
 
     const snapshot =
         await walletRef.get();
 
-
-    if (
-        !snapshot.exists
-    ) {
-
-        return null;
-
+    if (!snapshot.exists) {
+        throw createError(
+            "Wallet account not found.",
+            404
+        );
     }
 
-
     const wallet =
-        validateWalletData(
+        readWalletState(
             snapshot.data()
         );
 
-
     return {
-
-        uid:
-            validUid,
-
-        currency:
-            wallet.currency,
-
         balanceKobo:
             wallet.balanceKobo,
 
@@ -2110,10 +1567,11 @@ async function getWalletBalance(
             wallet.reservedKobo,
 
         availableKobo:
-            wallet.availableKobo
+            wallet.availableKobo,
 
+        currency:
+            CURRENCY
     };
-
 }
 
 
@@ -2122,25 +1580,13 @@ async function getWalletBalance(
 // =====================================================
 
 module.exports = {
-
-    RESERVATION_STATUS,
-
-    createReservationId,
-
-    createLedgerId,
-
-    validateAmountKobo,
-
-    calculateAvailableBalance,
-
-    getWalletBalance,
-
     reserveFunds,
 
     commitReservation,
 
     releaseReservation,
 
-    getReservation
+    getReservation,
 
+    getWalletBalance
 };

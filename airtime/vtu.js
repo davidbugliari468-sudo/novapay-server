@@ -1,50 +1,67 @@
-// airtime/vtu.js
+"use strict";
 
 const crypto = require("crypto");
 
 
 // =====================================================
-// NOVAPAY VTU.NG PROVIDER ADAPTER
+// NOVAPAY — VTU.NG AIRTIME PROVIDER ADAPTER
 // =====================================================
 //
-// This file is the ONLY layer that talks directly to
-// VTU.ng for Airtime.
+// RESPONSIBILITY
 //
-// The rest of NovaPay must NOT know:
-// - VTU.ng URLs
-// - VTU authentication details
-// - VTU response structure
-// - VTU status names
+// This module is the ONLY Airtime layer that communicates
+// directly with VTU.ng.
 //
-// It converts VTU.ng responses into NovaPay's internal:
+// It does NOT:
+//
+// - access Firestore wallets
+// - reserve wallet funds
+// - commit wallet funds
+// - release wallet funds
+// - create NovaPay financial transactions
+// - authenticate NovaPay users
+// - trust frontend provider data
+//
+// It ONLY:
+//
+// - authenticates with VTU.ng
+// - sends Airtime orders
+// - requeries Airtime orders
+// - normalizes provider responses
+// - reports provider outcome to the Airtime service
+//
+// PROVIDER OUTCOMES:
 //
 // success
 // failure
 // unknown
 //
-// IMPORTANT FINANCIAL RULE:
+// IMPORTANT:
 //
-// Network errors, timeouts and unexpected provider
-// responses are UNKNOWN.
+// UNKNOWN means:
 //
-// UNKNOWN NEVER automatically releases the user's
-// reserved money.
+// "We do not have enough evidence to conclude that the
+// provider failed."
 //
-// The transaction remains PENDING and can later be
-// reconciled through VTU.ng requery.
+// Therefore the service MUST NOT release a wallet
+// reservation merely because this adapter encountered a
+// timeout, network error, malformed response, or other
+// ambiguous provider condition.
 //
 // =====================================================
 
 
 // =====================================================
-// VTU.NG API CONFIGURATION
+// CONFIGURATION
 // =====================================================
 
 const VTU_BASE_URL =
-    (
+    String(
         process.env.VTU_BASE_URL ||
         "https://vtu.ng/wp-json"
-    ).replace(/\/+$/, "");
+    )
+        .trim()
+        .replace(/\/+$/, "");
 
 
 const VTU_AUTH_URL =
@@ -69,18 +86,18 @@ const VTU_PASSWORD =
     );
 
 
-const REQUEST_TIMEOUT_MS =
-    Number.isSafeInteger(
-        Number(
-            process.env.VTU_REQUEST_TIMEOUT_MS
-        )
-    ) &&
+const configuredTimeout =
     Number(
         process.env.VTU_REQUEST_TIMEOUT_MS
-    ) > 0
-        ? Number(
-            process.env.VTU_REQUEST_TIMEOUT_MS
-        )
+    );
+
+
+const VTU_REQUEST_TIMEOUT_MS =
+    Number.isSafeInteger(
+        configuredTimeout
+    ) &&
+    configuredTimeout > 0
+        ? configuredTimeout
         : 15000;
 
 
@@ -88,24 +105,25 @@ const REQUEST_TIMEOUT_MS =
 // TOKEN CACHE
 // =====================================================
 //
-// VTU.ng JWT tokens expire after approximately 7 days.
+// The token stays server-side.
 //
-// We keep the token in process memory.
+// It is never returned to callers.
 //
-// The token is NEVER returned to the frontend.
-//
-// If authentication fails, we clear the cached token
-// and retry authentication once.
+// A small expiration safety window prevents starting a
+// financial provider request with a nearly expired token.
 //
 // =====================================================
 
-let cachedToken = null;
+let cachedToken =
+    null;
 
-let cachedTokenExpiresAt = 0;
+
+let cachedTokenExpiresAt =
+    0;
 
 
 // =====================================================
-// ERROR CLASS
+// PROVIDER ERROR
 // =====================================================
 
 class VtuProviderError extends Error {
@@ -122,7 +140,9 @@ class VtuProviderError extends Error {
         } = {}
     ) {
 
-        super(message);
+        super(
+            message
+        );
 
         this.name =
             "VtuProviderError";
@@ -185,33 +205,24 @@ function validateConfiguration() {
 
 
 // =====================================================
-// SAFE REQUEST ID
-// =====================================================
-//
-// VTU.ng requires request_id and documents a maximum
-// length of 50 characters.
-//
-// NovaPay transaction IDs are already unique.
-//
-// We additionally hash them into a short deterministic
-// provider-safe identifier.
-//
+// TRANSACTION ID VALIDATION
 // =====================================================
 
-function createProviderRequestId(
+function requireTransactionId(
     transactionId
 ) {
 
     const normalized =
         String(
-            transactionId || ""
+            transactionId ||
+            ""
         ).trim();
 
 
     if (!normalized) {
 
         throw new VtuProviderError(
-            "NovaPay transaction ID is required.",
+            "Transaction ID is required.",
             {
                 kind:
                     "validation"
@@ -221,20 +232,85 @@ function createProviderRequestId(
     }
 
 
+    if (
+        normalized.length >
+        200
+    ) {
+
+        throw new VtuProviderError(
+            "Transaction ID is too long.",
+            {
+                kind:
+                    "validation"
+            }
+        );
+
+    }
+
+
+    return normalized;
+
+}
+
+
+// =====================================================
+// PROVIDER REQUEST ID
+// =====================================================
+//
+// VTU.ng request_id is the idempotency/reconciliation
+// identifier.
+//
+// We derive it deterministically from the NovaPay
+// transaction ID.
+//
+// Same NovaPay transaction:
+//
+//     transactionId
+//          ↓
+//     same request_id
+//
+// This is essential if the first request times out and we
+// later need to requery the provider.
+//
+// Maximum output length:
+// 48 characters.
+//
+// =====================================================
+
+function createProviderRequestId(
+    transactionId
+) {
+
+    const normalized =
+        requireTransactionId(
+            transactionId
+        );
+
+
     return (
         "NP" +
         crypto
-            .createHash("sha256")
-            .update(normalized)
-            .digest("hex")
-            .slice(0, 46)
+            .createHash(
+                "sha256"
+            )
+            .update(
+                normalized,
+                "utf8"
+            )
+            .digest(
+                "hex"
+            )
+            .slice(
+                0,
+                46
+            )
     );
 
 }
 
 
 // =====================================================
-// ABORTABLE FETCH
+// ABORTABLE HTTP REQUEST
 // =====================================================
 
 async function fetchWithTimeout(
@@ -249,9 +325,11 @@ async function fetchWithTimeout(
     const timeout =
         setTimeout(
             () => {
+
                 controller.abort();
+
             },
-            REQUEST_TIMEOUT_MS
+            VTU_REQUEST_TIMEOUT_MS
         );
 
 
@@ -260,9 +338,12 @@ async function fetchWithTimeout(
         return await fetch(
             url,
             {
+
                 ...options,
+
                 signal:
                     controller.signal
+
             }
         );
 
@@ -291,14 +372,16 @@ async function fetchWithTimeout(
             {
                 kind:
                     "network",
+
                 rawMessage:
                     String(
                         error?.message ||
                         ""
-                    ).slice(
-                        0,
-                        300
                     )
+                        .slice(
+                            0,
+                            300
+                        )
             }
         );
 
@@ -316,7 +399,14 @@ async function fetchWithTimeout(
 
 
 // =====================================================
-// SAFE JSON PARSING
+// RESPONSE BODY PARSER
+// =====================================================
+//
+// Provider responses should normally be JSON.
+//
+// An invalid response is UNKNOWN, not automatically
+// FAILURE.
+//
 // =====================================================
 
 async function parseJsonResponse(
@@ -327,9 +417,18 @@ async function parseJsonResponse(
         await response.text();
 
 
-    if (!text) {
+    if (!text.trim()) {
 
-        return null;
+        throw new VtuProviderError(
+            "VTU.ng returned an empty response.",
+            {
+                kind:
+                    "unknown",
+
+                httpStatus:
+                    response.status
+            }
+        );
 
     }
 
@@ -349,8 +448,15 @@ async function parseJsonResponse(
             {
                 kind:
                     "unknown",
+
                 httpStatus:
-                    response.status
+                    response.status,
+
+                rawMessage:
+                    text.slice(
+                        0,
+                        300
+                    )
             }
         );
 
@@ -360,7 +466,7 @@ async function parseJsonResponse(
 
 
 // =====================================================
-// GET ACCESS TOKEN
+// ACCESS TOKEN
 // =====================================================
 
 async function getAccessToken({
@@ -374,18 +480,16 @@ async function getAccessToken({
         Date.now();
 
 
-    /*
-     * Keep a safety margin before the token expires.
-     *
-     * We don't want to start a financial request with a
-     * token that is about to expire.
-     */
-
     if (
         !forceRefresh &&
         cachedToken &&
         cachedTokenExpiresAt >
-            now + 10 * 60 * 1000
+            now +
+            (
+                10 *
+                60 *
+                1000
+            )
     ) {
 
         return cachedToken;
@@ -393,64 +497,79 @@ async function getAccessToken({
     }
 
 
-    let response;
+    const response =
+        await fetchWithTimeout(
+            VTU_AUTH_URL,
+            {
+
+                method:
+                    "POST",
+
+                headers: {
+
+                    "Content-Type":
+                        "application/json",
+
+                    "Accept":
+                        "application/json"
+
+                },
+
+                body:
+                    JSON.stringify({
+
+                        username:
+                            VTU_USERNAME,
+
+                        password:
+                            VTU_PASSWORD
+
+                    })
+
+            }
+        );
+
+
+    let data;
 
 
     try {
 
-        response =
-            await fetchWithTimeout(
-                VTU_AUTH_URL,
-                {
-
-                    method:
-                        "POST",
-
-                    headers: {
-
-                        "Content-Type":
-                            "application/json",
-
-                        "Accept":
-                            "application/json"
-
-                    },
-
-                    body:
-                        JSON.stringify({
-
-                            username:
-                                VTU_USERNAME,
-
-                            password:
-                                VTU_PASSWORD
-
-                        })
-
-                }
+        data =
+            await parseJsonResponse(
+                response
             );
 
     }
 
     catch (error) {
 
-        throw error;
+        if (
+            error instanceof
+            VtuProviderError
+        ) {
+
+            throw error;
+
+        }
+
+
+        throw new VtuProviderError(
+            "VTU.ng authentication response could not be verified.",
+            {
+                kind:
+                    "unknown",
+
+                httpStatus:
+                    response.status
+            }
+        );
 
     }
 
 
-    const data =
-        await parseJsonResponse(
-            response
-        );
-
-
     if (
-        !response.ok ||
-        !data ||
-        typeof data.token !==
-            "string" ||
-        !data.token.trim()
+        !response.ok
     ) {
 
         throw new VtuProviderError(
@@ -471,11 +590,32 @@ async function getAccessToken({
                     String(
                         data?.message ||
                         ""
-                    ).slice(
-                        0,
-                        300
                     )
+                        .slice(
+                            0,
+                            300
+                        )
 
+            }
+        );
+
+    }
+
+
+    if (
+        typeof data?.token !==
+            "string" ||
+        !data.token.trim()
+    ) {
+
+        throw new VtuProviderError(
+            "VTU.ng authentication returned no token.",
+            {
+                kind:
+                    "authentication",
+
+                httpStatus:
+                    response.status
             }
         );
 
@@ -487,15 +627,19 @@ async function getAccessToken({
 
 
     /*
-     * VTU.ng documents a 7-day token lifetime.
+     * VTU.ng token lifetime is approximately seven days.
      *
-     * We cache for slightly less than 7 days.
+     * Cache slightly below that period.
      */
 
     cachedTokenExpiresAt =
         now +
         (
-            6 * 24 * 60 * 60 * 1000
+            6 *
+            24 *
+            60 *
+            60 *
+            1000
         );
 
 
@@ -505,13 +649,14 @@ async function getAccessToken({
 
 
 // =====================================================
-// CLEAR TOKEN
+// CLEAR ACCESS TOKEN
 // =====================================================
 
 function clearAccessToken() {
 
     cachedToken =
         null;
+
 
     cachedTokenExpiresAt =
         0;
@@ -520,7 +665,7 @@ function clearAccessToken() {
 
 
 // =====================================================
-// AUTHENTICATED API REQUEST
+// AUTHENTICATED PROVIDER REQUEST
 // =====================================================
 
 async function authenticatedRequest(
@@ -581,17 +726,20 @@ async function authenticatedRequest(
 
 
     /*
-     * If VTU says the JWT is invalid, obtain a fresh
-     * token and retry the HTTP request once.
+     * A 401/403 can indicate an expired/invalid cached
+     * token.
      *
-     * This is safe because the actual Airtime request
-     * uses the same request_id.
+     * Refresh once and retry the SAME provider operation.
+     *
+     * The request_id does not change.
      */
 
     if (
         (
-            response.status === 401 ||
-            response.status === 403
+            response.status ===
+                401 ||
+            response.status ===
+                403
         ) &&
         retryAuthentication
     ) {
@@ -606,53 +754,86 @@ async function authenticatedRequest(
             });
 
 
-        try {
+        response =
+            await fetchWithTimeout(
+                `${VTU_API_URL}/${path}`,
+                {
 
-            response =
-                await fetchWithTimeout(
-                    `${VTU_API_URL}/${path}`,
-                    {
+                    method,
 
-                        method,
+                    headers: {
 
-                        headers: {
+                        "Authorization":
+                            `Bearer ${token}`,
 
-                            "Authorization":
-                                `Bearer ${token}`,
+                        "Content-Type":
+                            "application/json",
 
-                            "Content-Type":
-                                "application/json",
+                        "Accept":
+                            "application/json"
 
-                            "Accept":
-                                "application/json"
+                    },
 
-                        },
+                    body:
+                        body === null
+                            ? undefined
+                            : JSON.stringify(
+                                body
+                            )
 
-                        body:
-                            body === null
-                                ? undefined
-                                : JSON.stringify(
-                                    body
-                                )
+                }
+            );
 
-                    }
-                );
+    }
 
-        }
 
-        catch (error) {
+    let data;
+
+
+    try {
+
+        data =
+            await parseJsonResponse(
+                response
+            );
+
+    }
+
+    catch (error) {
+
+        if (
+            error instanceof
+            VtuProviderError
+        ) {
+
+            /*
+             * Preserve the HTTP status so the service can
+             * log/handle it internally without exposing it
+             * to the frontend.
+             */
+
+            error.httpStatus =
+                response.status;
 
             throw error;
 
         }
 
-    }
 
+        throw new VtuProviderError(
+            "VTU.ng response could not be verified.",
+            {
 
-    const data =
-        await parseJsonResponse(
-            response
+                kind:
+                    "unknown",
+
+                httpStatus:
+                    response.status
+
+            }
         );
+
+    }
 
 
     return {
@@ -670,24 +851,27 @@ async function authenticatedRequest(
 // PROVIDER STATUS NORMALIZATION
 // =====================================================
 //
-// VTU.ng documents:
+// Only these states are authoritative:
 //
-// completed-api
-// processing-api
-// queued-api
-// initiated-api
-// cancelled
+// completed-api → success
+//
 // failed
 // refunded
-// pending
-// on-hold
+// cancelled → failure
 //
-// Only completed-api is a confirmed success.
+// Everything else → unknown
 //
-// Failed/refunded/cancelled are confirmed provider
-// failure states.
+// This is intentional.
 //
-// Everything else remains UNKNOWN/PENDING.
+// Processing is NOT failure.
+//
+// Queued is NOT failure.
+//
+// Initiated is NOT failure.
+//
+// Pending is NOT failure.
+//
+// On-hold is NOT failure.
 //
 // =====================================================
 
@@ -697,7 +881,8 @@ function normalizeProviderStatus(
 
     const normalized =
         String(
-            status || ""
+            status ||
+            ""
         )
             .trim()
             .toLowerCase();
@@ -705,7 +890,7 @@ function normalizeProviderStatus(
 
     if (
         normalized ===
-            "completed-api"
+        "completed-api"
     ) {
 
         return "success";
@@ -733,19 +918,19 @@ function normalizeProviderStatus(
 
 
 // =====================================================
-// MONEY TO KOBO
+// MONEY CONVERSION
 // =====================================================
 //
-// VTU returns monetary values as numbers/strings in NGN.
+// Provider monetary values are represented in NGN.
 //
-// We convert them into integer kobo.
+// We convert safely to integer kobo.
 //
-// Example:
+// Examples:
 //
+// 100
+// "100"
+// "100.00"
 // "97.50"
-// → 9750
-//
-// Avoid floating point financial calculations.
 //
 // =====================================================
 
@@ -755,11 +940,16 @@ function nairaToKobo(
 
     const text =
         String(
-            value ?? ""
+            value ??
+            ""
         ).trim();
 
 
-    if (!/^\d+(\.\d{1,2})?$/.test(text)) {
+    if (
+        !/^\d+(?:\.\d{1,2})?$/.test(
+            text
+        )
+    ) {
 
         return null;
 
@@ -776,19 +966,21 @@ function nairaToKobo(
         );
 
 
-    const koboText =
+    const koboPart =
         (
             parts[1] ||
             ""
-        ).padEnd(
-            2,
-            "0"
-        );
+        )
+            .padEnd(
+                2,
+                "0"
+            );
 
 
     const kobo =
         Number(
-            koboText || "0"
+            koboPart ||
+            "0"
         );
 
 
@@ -808,7 +1000,8 @@ function nairaToKobo(
 
     const total =
         (
-            naira * 100
+            naira *
+            100
         ) +
         kobo;
 
@@ -830,58 +1023,86 @@ function nairaToKobo(
 
 
 // =====================================================
-// EXTRACT PROVIDER REFERENCE
+// PROVIDER REFERENCE EXTRACTION
 // =====================================================
 
 function extractProviderReference(
     data
 ) {
 
-    const reference =
-        data?.order_id ??
-        data?.data?.order_id ??
-        null;
+    const payload =
+        data?.data &&
+        typeof data.data ===
+            "object"
+            ? data.data
+            : data;
 
 
-    if (
-        reference === null ||
-        reference === undefined
+    const candidates = [
+
+        payload?.order_id,
+
+        payload?.reference,
+
+        payload?.transaction_id
+
+    ];
+
+
+    for (
+        const candidate
+        of candidates
     ) {
 
-        return null;
+        if (
+            candidate ===
+                null ||
+            candidate ===
+                undefined
+        ) {
+
+            continue;
+
+        }
+
+
+        const normalized =
+            String(
+                candidate
+            ).trim();
+
+
+        if (
+            normalized
+        ) {
+
+            return normalized;
+
+        }
 
     }
 
 
-    const normalized =
-        String(
-            reference
-        ).trim();
-
-
-    return normalized ||
-        null;
+    return null;
 
 }
 
 
 // =====================================================
-// EXTRACT PROVIDER COST
+// PROVIDER COST EXTRACTION
 // =====================================================
 //
-// VTU.ng's Airtime response includes amount_charged.
+// VTU.ng may return amount_charged.
+//
+// This is provider cost, NOT the customer's wallet
+// amount.
 //
 // Example:
 //
-// amount       = 100.00
-// discount     = 2.50
-// amount_charged = 97.50
+// customer amount = ₦100
+// provider cost   = ₦97.50
 //
-// Therefore provider cost is amount_charged.
-//
-// This allows NovaPay to calculate:
-//
-// gross gain = customer amount - provider cost
+// NovaPay can later calculate its gain.
 //
 // =====================================================
 
@@ -889,16 +1110,23 @@ function extractProviderCostKobo(
     data
 ) {
 
+    const payload =
+        data?.data &&
+        typeof data.data ===
+            "object"
+            ? data.data
+            : data;
+
+
     const amountCharged =
-        data?.amount_charged ??
-        data?.data?.amount_charged;
+        payload?.amount_charged;
 
 
     if (
         amountCharged ===
-            undefined ||
+            null ||
         amountCharged ===
-            null
+            undefined
     ) {
 
         return null;
@@ -914,24 +1142,26 @@ function extractProviderCostKobo(
 
 
 // =====================================================
-// NORMALIZE AIRTIME RESPONSE
+// NORMALIZE PROVIDER RESPONSE
 // =====================================================
 
-function normalizeAirtimeResponse(
+function normalizeProviderResponse(
     data,
     httpStatus
 ) {
 
     const payload =
         data?.data &&
-        typeof data.data === "object"
+        typeof data.data ===
+            "object"
             ? data.data
             : data || {};
 
 
     const providerStatus =
         String(
-            payload.status ||
+            payload?.status ||
+            data?.status ||
             ""
         )
             .trim()
@@ -956,30 +1186,39 @@ function normalizeAirtimeResponse(
         );
 
 
+    const providerCode =
+        data?.code ??
+        payload?.code ??
+        null;
+
+
     const message =
         String(
-            data?.message ||
+            data?.message ??
+            payload?.message ??
             ""
         )
-            .trim() ||
-            null;
+            .trim()
+            .slice(
+                0,
+                500
+            ) ||
+        null;
 
 
     return {
 
         outcome,
 
-        providerReference,
-
-        providerCostKobo,
-
         providerStatus:
             providerStatus ||
             null,
 
-        providerCode:
-            data?.code ||
-            null,
+        providerReference,
+
+        providerCostKobo,
+
+        providerCode,
 
         message,
 
@@ -991,10 +1230,10 @@ function normalizeAirtimeResponse(
 
 
 // =====================================================
-// PURCHASE AIRTIME
+// VALIDATE AIRTIME PROVIDER INPUT
 // =====================================================
 
-async function purchaseAirtime({
+function validatePurchaseInput({
     transactionId,
     network,
     phoneNumber,
@@ -1002,42 +1241,18 @@ async function purchaseAirtime({
 }) {
 
     const normalizedTransactionId =
-        String(
-            transactionId || ""
-        ).trim();
+        requireTransactionId(
+            transactionId
+        );
 
 
     const normalizedNetwork =
         String(
-            network || ""
+            network ||
+            ""
         )
             .trim()
             .toLowerCase();
-
-
-    const normalizedPhone =
-        String(
-            phoneNumber || ""
-        ).trim();
-
-
-    const amount =
-        Number(
-            amountKobo
-        );
-
-
-    if (!normalizedTransactionId) {
-
-        throw new VtuProviderError(
-            "Transaction ID is required.",
-            {
-                kind:
-                    "validation"
-            }
-        );
-
-    }
 
 
     if (!normalizedNetwork) {
@@ -1053,6 +1268,13 @@ async function purchaseAirtime({
     }
 
 
+    const normalizedPhone =
+        String(
+            phoneNumber ||
+            ""
+        ).trim();
+
+
     if (!normalizedPhone) {
 
         throw new VtuProviderError(
@@ -1066,10 +1288,20 @@ async function purchaseAirtime({
     }
 
 
+    const amount =
+        Number(
+            amountKobo
+        );
+
+
     if (
-        !Number.isSafeInteger(amount) ||
+        !Number.isSafeInteger(
+            amount
+        ) ||
         amount <= 0 ||
-        amount % 100 !== 0
+        amount %
+            100 !==
+            0
     ) {
 
         throw new VtuProviderError(
@@ -1083,14 +1315,66 @@ async function purchaseAirtime({
     }
 
 
-    const amountNaira =
-        amount / 100;
+    return {
+
+        transactionId:
+            normalizedTransactionId,
+
+        network:
+            normalizedNetwork,
+
+        phoneNumber:
+            normalizedPhone,
+
+        amountKobo:
+            amount
+
+    };
+
+}
 
 
-    const requestId =
+// =====================================================
+// PURCHASE AIRTIME
+// =====================================================
+//
+// This function does NOT reserve or debit NovaPay money.
+//
+// The service must have already created the transaction
+// and reserved the user's funds before calling it.
+//
+// =====================================================
+
+async function purchaseAirtime({
+    transactionId,
+    network,
+    phoneNumber,
+    amountKobo
+}) {
+
+    const input =
+        validatePurchaseInput({
+
+            transactionId,
+
+            network,
+
+            phoneNumber,
+
+            amountKobo
+
+        });
+
+
+    const providerRequestId =
         createProviderRequestId(
-            normalizedTransactionId
+            input.transactionId
         );
+
+
+    const amountNaira =
+        input.amountKobo /
+        100;
 
 
     let result;
@@ -1109,13 +1393,13 @@ async function purchaseAirtime({
                     body: {
 
                         request_id:
-                            requestId,
+                            providerRequestId,
 
                         phone:
-                            normalizedPhone,
+                            input.phoneNumber,
 
                         service_id:
-                            normalizedNetwork,
+                            input.network,
 
                         amount:
                             amountNaira
@@ -1130,15 +1414,11 @@ async function purchaseAirtime({
     catch (error) {
 
         /*
-         * CRITICAL:
+         * NEVER turn an uncertain provider operation into
+         * a confirmed failure.
          *
-         * A timeout/network error does NOT mean VTU.ng
-         * failed to process the Airtime.
-         *
-         * Therefore throw an UNKNOWN provider error.
-         *
-         * The Airtime service will keep the transaction
-         * pending and reconciliation will use request_id.
+         * The service must keep the reservation pending
+         * and reconcile later.
          */
 
         if (
@@ -1152,7 +1432,7 @@ async function purchaseAirtime({
 
 
         throw new VtuProviderError(
-            "VTU.ng request could not be verified.",
+            "VTU.ng Airtime request could not be verified.",
             {
                 kind:
                     "unknown"
@@ -1163,16 +1443,11 @@ async function purchaseAirtime({
 
 
     const normalized =
-        normalizeAirtimeResponse(
+        normalizeProviderResponse(
             result.data,
             result.response.status
         );
 
-
-    /*
-     * A completed-api response is the ONLY confirmed
-     * successful provider result.
-     */
 
     if (
         normalized.outcome ===
@@ -1183,6 +1458,8 @@ async function purchaseAirtime({
 
             outcome:
                 "success",
+
+            providerRequestId,
 
             providerReference:
                 normalized.providerReference,
@@ -1197,20 +1474,12 @@ async function purchaseAirtime({
                 normalized.providerCode,
 
             message:
-                normalized.message,
-
-            providerRequestId:
-                requestId
+                normalized.message
 
         };
 
     }
 
-
-    /*
-     * Explicit failed/refunded/cancelled states are
-     * confirmed provider failures.
-     */
 
     if (
         normalized.outcome ===
@@ -1221,6 +1490,8 @@ async function purchaseAirtime({
 
             outcome:
                 "failure",
+
+            providerRequestId,
 
             providerReference:
                 normalized.providerReference,
@@ -1236,28 +1507,19 @@ async function purchaseAirtime({
 
             message:
                 normalized.message ||
-                "VTU.ng confirmed that the Airtime order failed.",
-
-            providerRequestId:
-                requestId
+                "VTU.ng confirmed that the Airtime order failed."
 
         };
 
     }
 
 
-    /*
-     * Processing, queued, initiated, pending and on-hold
-     * are NOT failures.
-     *
-     * They remain unknown/pending until requery/webhook
-     * confirms the final state.
-     */
-
     return {
 
         outcome:
             "unknown",
+
+        providerRequestId,
 
         providerReference:
             normalized.providerReference,
@@ -1273,10 +1535,7 @@ async function purchaseAirtime({
 
         message:
             normalized.message ||
-            "VTU.ng is still processing the Airtime order.",
-
-        providerRequestId:
-            requestId
+            "VTU.ng is still processing the Airtime order."
 
     };
 
@@ -1284,30 +1543,14 @@ async function purchaseAirtime({
 
 
 // =====================================================
-// REQUERY AIRTIME ORDER
+// REQUERY AIRTIME
 // =====================================================
 //
-// This is extremely important for NovaPay.
+// Requery uses the EXACT SAME deterministic request ID
+// generated from the original NovaPay transaction ID.
 //
-// If the original Airtime request times out:
-//
-// NovaPay
-//    ↓
-// VTU request sent
-//    ↓
-// network timeout
-//
-// We DON'T refund immediately.
-//
-// Later:
-//
-// NovaPay
-//    ↓
-// POST /api/v2/requery
-//    ↓
-// request_id
-//    ↓
-// final provider status
+// This is what allows an uncertain transaction to be
+// reconciled without creating a second provider order.
 //
 // =====================================================
 
@@ -1316,25 +1559,12 @@ async function requeryAirtime(
 ) {
 
     const normalizedTransactionId =
-        String(
-            transactionId || ""
-        ).trim();
-
-
-    if (!normalizedTransactionId) {
-
-        throw new VtuProviderError(
-            "Transaction ID is required for requery.",
-            {
-                kind:
-                    "validation"
-            }
+        requireTransactionId(
+            transactionId
         );
 
-    }
 
-
-    const requestId =
+    const providerRequestId =
         createProviderRequestId(
             normalizedTransactionId
         );
@@ -1356,7 +1586,7 @@ async function requeryAirtime(
                     body: {
 
                         request_id:
-                            requestId
+                            providerRequestId
 
                     }
 
@@ -1366,13 +1596,6 @@ async function requeryAirtime(
     }
 
     catch (error) {
-
-        /*
-         * Requery itself can fail.
-         *
-         * That still does NOT prove the original Airtime
-         * failed.
-         */
 
         if (
             error instanceof
@@ -1396,7 +1619,7 @@ async function requeryAirtime(
 
 
     const normalized =
-        normalizeAirtimeResponse(
+        normalizeProviderResponse(
             result.data,
             result.response.status
         );
@@ -1406,6 +1629,8 @@ async function requeryAirtime(
 
         outcome:
             normalized.outcome,
+
+        providerRequestId,
 
         providerReference:
             normalized.providerReference,
@@ -1420,10 +1645,7 @@ async function requeryAirtime(
             normalized.providerCode,
 
         message:
-            normalized.message,
-
-        providerRequestId:
-            requestId
+            normalized.message
 
     };
 
@@ -1431,53 +1653,43 @@ async function requeryAirtime(
 
 
 // =====================================================
-// CHECK VTU WALLET BALANCE
+// PROVIDER WALLET BALANCE
 // =====================================================
 //
-// This is an operational/admin function.
+// This is the VTU.ng reseller/provider wallet.
 //
-// It is NOT the user's NovaPay wallet.
+// It is NOT the NovaPay user's wallet.
 //
-// It checks the VTU.ng reseller wallet that NovaPay
-// uses to fulfill Airtime.
+// It must never be used to determine whether the user
+// can purchase Airtime.
 //
 // =====================================================
 
 async function getProviderBalance() {
 
-    let result;
+    const result =
+        await authenticatedRequest(
+            "balance",
+            {
 
+                method:
+                    "GET"
 
-    try {
-
-        result =
-            await authenticatedRequest(
-                "balance",
-                {
-
-                    method:
-                        "GET"
-
-                }
-            );
-
-    }
-
-    catch (error) {
-
-        throw error;
-
-    }
+            }
+        );
 
 
     const payload =
-        result.data?.data ||
-        {};
+        result.data?.data &&
+        typeof result.data.data ===
+            "object"
+            ? result.data.data
+            : result.data;
 
 
     const balance =
         Number(
-            payload.balance
+            payload?.balance
         );
 
 
@@ -1492,7 +1704,10 @@ async function getProviderBalance() {
             "VTU.ng returned an invalid wallet balance.",
             {
                 kind:
-                    "unknown"
+                    "unknown",
+
+                httpStatus:
+                    result.response.status
             }
         );
 
@@ -1506,12 +1721,13 @@ async function getProviderBalance() {
 
         balanceKobo:
             Math.round(
-                balance * 100
+                balance *
+                100
             ),
 
         currency:
             String(
-                payload.currency ||
+                payload?.currency ||
                 "NGN"
             )
                 .trim()
@@ -1539,6 +1755,12 @@ module.exports = {
     clearAccessToken,
 
     createProviderRequestId,
+
+    normalizeProviderStatus,
+
+    normalizeProviderResponse,
+
+    nairaToKobo,
 
     VtuProviderError
 
