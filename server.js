@@ -16,6 +16,7 @@ const {
 } = require("./wallet.js/wallet");
 const airtimeRoutes = require("./airtime/routes");
 const addMoneyRoutes = require("./add-money/routes");
+const dataRoutes = require("./data/routes");
 const {
   handlePaystackWebhook
 } = require("./add-money/paystack/webhook");
@@ -231,6 +232,10 @@ app.use(
 app.use(
   "/api/airtime",
   airtimeRoutes
+);
+app.use(
+  "/api/data",
+  dataRoutes
 );
 // =====================================================
 // PROTECTED AUTH TEST ROUTE

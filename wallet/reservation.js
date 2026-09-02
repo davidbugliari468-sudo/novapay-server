@@ -1228,9 +1228,9 @@ async function commitReservation({
 
                         createdAt:
                             now,
-
-                        type:
-                            "airtime",
+type:
+    reservation.service,
+                        
 
                         service:
                             reservation.service ||
