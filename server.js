@@ -1,6 +1,8 @@
 // NovaPay backend deployment update
 require("dotenv").config();
-
+const {
+  startReconciliationWorker
+} = require("./data/reconciliation");
 const notificationRoutes =
     require("./notifications/routes");
 const transactionRoutes =
@@ -411,4 +413,6 @@ app.use((err, req, res, next) => {
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`NovaPay backend running on port ${PORT}`);
+
+  startReconciliationWorker();
 });

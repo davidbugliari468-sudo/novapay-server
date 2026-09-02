@@ -112,20 +112,13 @@ function requireTransactionId(transactionId) {
 
 function requireReference(reference) {
     if (
-        reference === null ||
-        reference === undefined ||
-        reference === ""
-    ) {
-        return null;
-    }
-
-    if (
-        typeof reference !== "string"
+        typeof reference !== "string" ||
+        !reference.trim()
     ) {
         throw createServiceError(
-            "Invalid transaction reference.",
+            "A purchase reference is required.",
             {
-                code: "INVALID_REFERENCE",
+                code: "REFERENCE_REQUIRED",
                 statusCode: 400
             }
         );
@@ -242,45 +235,63 @@ function toPlainPlan(plan) {
     return Object.freeze({
         planId:
             String(plan.planId),
+
         provider:
             String(plan.provider),
+
         variationId:
             String(plan.variationId),
+
         network:
             String(plan.network),
+
         serviceName:
             String(
                 plan.serviceName ||
                 ""
             ),
+
         dataPlan:
             String(plan.dataPlan),
+
         dataAmount:
             String(plan.dataAmount),
+
         dataAmountValue:
             plan.dataAmountValue ?? null,
+
         dataAmountUnit:
             plan.dataAmountUnit ?? null,
+
         validityDays:
             plan.validityDays ?? null,
+
         validityLabel:
             String(plan.validityLabel),
+
         category:
             String(plan.category),
+
         isHot:
             Boolean(plan.isHot),
+
         priceNaira:
             Number(plan.priceNaira),
+
         priceKobo:
             plan.priceKobo,
+
         customerPriceNaira:
             Number(
                 plan.customerPriceNaira
             ),
+
         customerPriceKobo:
             plan.customerPriceKobo,
+
         availability:
             plan.availability !== false,
+
         source:
             String(
                 plan.source ||
@@ -289,23 +300,36 @@ function toPlainPlan(plan) {
     });
 }
 
-function createTransactionId(uid) {
-    const timestamp =
-        Date.now().toString(36);
-
-    const random =
-        crypto
-            .randomBytes(12)
-            .toString("hex");
-
-    const uidHash =
+/*
+ * The purchase reference is now the idempotency key.
+ *
+ * The transaction ID is deterministic for the
+ * authenticated user + purchase reference.
+ *
+ * This means:
+ *
+ * Same user + same reference
+ *        ↓
+ * Same transaction ID
+ *        ↓
+ * Same provider request ID
+ *        ↓
+ * Retry cannot create a second purchase.
+ */
+function createTransactionId(
+    uid,
+    reference
+) {
+    const digest =
         crypto
             .createHash("sha256")
-            .update(uid, "utf8")
-            .digest("hex")
-            .slice(0, 10);
+            .update(
+                `${uid}:${reference}`,
+                "utf8"
+            )
+            .digest("hex");
 
-    return `DATA_${timestamp}_${uidHash}_${random}`;
+    return `DATA_${digest}`;
 }
 
 function createTransactionReference(
@@ -334,18 +358,30 @@ function buildTransactionSnapshot({
     providerResult = null
 }) {
     return {
-        id: transactionId,
+        id:
+            transactionId,
+
         uid,
+
         transactionId,
+
         reference,
+
         reservationId,
 
-        service: "data",
-        type: "data",
+        service:
+            "data",
+
+        type:
+            "data",
+
         status,
 
-        direction: "debit",
-        currency: CURRENCY,
+        direction:
+            "debit",
+
+        currency:
+            CURRENCY,
 
         network:
             plan.network,
@@ -418,32 +454,46 @@ function buildTransactionSnapshot({
         productSnapshot: {
             planId:
                 plan.planId,
+
             variationId:
                 plan.variationId,
+
             provider:
                 plan.provider,
+
             network:
                 plan.network,
+
             dataPlan:
                 plan.dataPlan,
+
             dataAmount:
                 plan.dataAmount,
+
             dataAmountValue:
                 plan.dataAmountValue,
+
             dataAmountUnit:
                 plan.dataAmountUnit,
+
             validityDays:
                 plan.validityDays,
+
             validityLabel:
                 plan.validityLabel,
+
             category:
                 plan.category,
+
             isHot:
                 plan.isHot,
+
             customerPriceKobo:
                 plan.customerPriceKobo,
+
             customerPriceNaira:
                 plan.customerPriceNaira,
+
             providerPriceKobo:
                 plan.priceKobo
         },
@@ -466,32 +516,11 @@ async function saveTransaction(
             )
             .doc(transaction.id);
 
-    await transactionRef.set(
-        transaction,
-        {
-            merge: false
-        }
+    await transactionRef.create(
+        transaction
     );
 
     return transaction;
-}
-
-async function updateTransaction(
-    transactionId,
-    updates
-) {
-    const transactionRef =
-        db
-            .collection(
-                TRANSACTIONS_COLLECTION
-            )
-            .doc(transactionId);
-
-    await transactionRef.update({
-        ...updates,
-        updatedAt:
-            new Date()
-    });
 }
 
 async function getTransaction(
@@ -532,7 +561,8 @@ async function getTransaction(
         throw createServiceError(
             "Transaction not found.",
             {
-                code: "TRANSACTION_NOT_FOUND",
+                code:
+                    "TRANSACTION_NOT_FOUND",
                 statusCode: 404
             }
         );
@@ -543,6 +573,240 @@ async function getTransaction(
             snapshot.id,
         ...transaction
     };
+}
+
+function assertInputMatchesExistingTransaction(
+    input,
+    transaction
+) {
+    if (
+        transaction.service !==
+        "data"
+    ) {
+        throw createServiceError(
+            "This purchase reference is already being used.",
+            {
+                code:
+                    "REFERENCE_ALREADY_USED",
+                statusCode: 409
+            }
+        );
+    }
+
+    if (
+        transaction.network !==
+        input.network
+    ) {
+        throw createServiceError(
+            "This purchase reference is already linked to another data purchase.",
+            {
+                code:
+                    "REFERENCE_ALREADY_USED",
+                statusCode: 409
+            }
+        );
+    }
+
+    if (
+        transaction.planId !==
+        input.planId
+    ) {
+        throw createServiceError(
+            "This purchase reference is already linked to another data plan.",
+            {
+                code:
+                    "REFERENCE_ALREADY_USED",
+                statusCode: 409
+            }
+        );
+    }
+
+    if (
+        transaction.phoneNumber !==
+        input.phoneNumber
+    ) {
+        throw createServiceError(
+            "This purchase reference is already linked to another phone number.",
+            {
+                code:
+                    "REFERENCE_ALREADY_USED",
+                statusCode: 409
+            }
+        );
+    }
+}
+
+function buildExistingPurchaseResponse(
+    transaction
+) {
+    if (
+        transaction.status ===
+        "successful"
+    ) {
+        return {
+            success:
+                true,
+
+            status:
+                "successful",
+
+            transactionId:
+                transaction.transactionId ||
+                transaction.id,
+
+            reference:
+                transaction.reference,
+
+            plan: {
+                planId:
+                    transaction.planId,
+
+                network:
+                    transaction.network,
+
+                dataPlan:
+                    transaction.dataPlan,
+
+                dataAmount:
+                    transaction.dataAmount,
+
+                validityLabel:
+                    transaction.validityLabel,
+
+                category:
+                    transaction.category,
+
+                customerPriceKobo:
+                    transaction.amountKobo,
+
+                customerPriceNaira:
+                    transaction.amountNaira
+            },
+
+            message:
+                "Data purchase successful."
+        };
+    }
+
+    if (
+        transaction.status ===
+        "failed"
+    ) {
+        throw createServiceError(
+            "Data purchase could not be completed.",
+            {
+                code:
+                    transaction.failureCode ||
+                    "DATA_PROVIDER_REJECTED",
+                statusCode:
+                    400
+            }
+        );
+    }
+
+    return {
+        success:
+            false,
+
+        status:
+            "pending",
+
+        transactionId:
+            transaction.transactionId ||
+            transaction.id,
+
+        reference:
+            transaction.reference,
+
+        message:
+            "Your data purchase is being confirmed. Please check your transaction history shortly."
+    };
+}
+
+async function claimPurchaseTransaction({
+    transactionId,
+    transaction
+}) {
+    const transactionRef =
+        db
+            .collection(
+                TRANSACTIONS_COLLECTION
+            )
+            .doc(transactionId);
+
+    try {
+        await transactionRef.create(
+            transaction
+        );
+
+        return {
+            created:
+                true,
+
+            transaction
+        };
+    } catch (error) {
+        /*
+         * Firestore ALREADY_EXISTS means another
+         * request already claimed this idempotency key.
+         *
+         * We intentionally do not start another
+         * reservation or provider purchase.
+         */
+        if (
+            error.code !==
+            6
+        ) {
+            throw error;
+        }
+
+        const existingSnapshot =
+            await transactionRef.get();
+
+        if (
+            !existingSnapshot.exists
+        ) {
+            throw createServiceError(
+                "The Data purchase could not be established safely. Please try again.",
+                {
+                    code:
+                        "DATA_IDEMPOTENCY_CONFLICT",
+                    statusCode:
+                        503
+                }
+            );
+        }
+
+        return {
+            created:
+                false,
+
+            transaction: {
+                id:
+                    existingSnapshot.id,
+                ...existingSnapshot.data()
+            }
+        };
+    }
+}
+
+async function updateTransaction(
+    transactionId,
+    updates
+) {
+    const transactionRef =
+        db
+            .collection(
+                TRANSACTIONS_COLLECTION
+            )
+            .doc(transactionId);
+
+    await transactionRef.update({
+        ...updates,
+
+        updatedAt:
+            new Date()
+    });
 }
 
 function assertInputMatchesPlan(
@@ -556,8 +820,10 @@ function assertInputMatchesPlan(
         throw createServiceError(
             "The selected data plan does not match the selected network.",
             {
-                code: "DATA_PLAN_NETWORK_MISMATCH",
-                statusCode: 400
+                code:
+                    "DATA_PLAN_NETWORK_MISMATCH",
+                statusCode:
+                    400
             }
         );
     }
@@ -569,8 +835,10 @@ function assertInputMatchesPlan(
         throw createServiceError(
             "The selected data provider is not supported.",
             {
-                code: "UNSUPPORTED_DATA_PROVIDER",
-                statusCode: 500
+                code:
+                    "UNSUPPORTED_DATA_PROVIDER",
+                statusCode:
+                    500
             }
         );
     }
@@ -581,8 +849,10 @@ function assertInputMatchesPlan(
         throw createServiceError(
             "This data plan is currently unavailable.",
             {
-                code: "DATA_PLAN_UNAVAILABLE",
-                statusCode: 409
+                code:
+                    "DATA_PLAN_UNAVAILABLE",
+                statusCode:
+                    409
             }
         );
     }
@@ -594,8 +864,10 @@ function assertInputMatchesPlan(
         throw createServiceError(
             "The data plan identity is inconsistent.",
             {
-                code: "DATA_PLAN_IDENTITY_MISMATCH",
-                statusCode: 500
+                code:
+                    "DATA_PLAN_IDENTITY_MISMATCH",
+                statusCode:
+                    500
             }
         );
     }
@@ -609,7 +881,8 @@ async function verifyFreshPlan(
         await findDataPlan(
             planId,
             {
-                forceRefresh: true
+                forceRefresh:
+                    true
             }
         );
 
@@ -617,8 +890,10 @@ async function verifyFreshPlan(
         throw createServiceError(
             "This data plan is no longer available.",
             {
-                code: "DATA_PLAN_NOT_FOUND",
-                statusCode: 409
+                code:
+                    "DATA_PLAN_NOT_FOUND",
+                statusCode:
+                    409
             }
         );
     }
@@ -635,8 +910,10 @@ async function verifyFreshPlan(
         throw createServiceError(
             "The data plan network has changed. Please refresh and try again.",
             {
-                code: "DATA_PLAN_CHANGED",
-                statusCode: 409
+                code:
+                    "DATA_PLAN_CHANGED",
+                statusCode:
+                    409
             }
         );
     }
@@ -648,8 +925,10 @@ async function verifyFreshPlan(
         throw createServiceError(
             "The data plan has changed. Please refresh and try again.",
             {
-                code: "DATA_PLAN_CHANGED",
-                statusCode: 409
+                code:
+                    "DATA_PLAN_CHANGED",
+                statusCode:
+                    409
             }
         );
     }
@@ -661,8 +940,10 @@ async function verifyFreshPlan(
         throw createServiceError(
             "The price of this data plan has changed. Please refresh and try again.",
             {
-                code: "DATA_PLAN_PRICE_CHANGED",
-                statusCode: 409
+                code:
+                    "DATA_PLAN_PRICE_CHANGED",
+                statusCode:
+                    409
             }
         );
     }
@@ -674,8 +955,10 @@ async function verifyFreshPlan(
         throw createServiceError(
             "The data plan details have changed. Please refresh and try again.",
             {
-                code: "DATA_PLAN_CHANGED",
-                statusCode: 409
+                code:
+                    "DATA_PLAN_CHANGED",
+                statusCode:
+                    409
             }
         );
     }
@@ -687,8 +970,10 @@ async function verifyFreshPlan(
         throw createServiceError(
             "The data plan details have changed. Please refresh and try again.",
             {
-                code: "DATA_PLAN_CHANGED",
-                statusCode: 409
+                code:
+                    "DATA_PLAN_CHANGED",
+                statusCode:
+                    409
             }
         );
     }
@@ -700,8 +985,10 @@ async function verifyFreshPlan(
         throw createServiceError(
             "The data plan validity has changed. Please refresh and try again.",
             {
-                code: "DATA_PLAN_CHANGED",
-                statusCode: 409
+                code:
+                    "DATA_PLAN_CHANGED",
+                statusCode:
+                    409
             }
         );
     }
@@ -773,20 +1060,25 @@ async function markProviderSuccess({
         throw createServiceError(
             "The wallet reservation could not be found.",
             {
-                code: "RESERVATION_NOT_FOUND",
-                statusCode: 500
+                code:
+                    "RESERVATION_NOT_FOUND",
+                statusCode:
+                    500
             }
         );
     }
 
     if (
-        reservation.uid !== uid
+        reservation.uid !==
+        uid
     ) {
         throw createServiceError(
             "Wallet reservation ownership mismatch.",
             {
-                code: "RESERVATION_OWNERSHIP_MISMATCH",
-                statusCode: 500
+                code:
+                    "RESERVATION_OWNERSHIP_MISMATCH",
+                statusCode:
+                    500
             }
         );
     }
@@ -798,8 +1090,10 @@ async function markProviderSuccess({
         throw createServiceError(
             "Wallet reservation transaction mismatch.",
             {
-                code: "RESERVATION_TRANSACTION_MISMATCH",
-                statusCode: 500
+                code:
+                    "RESERVATION_TRANSACTION_MISMATCH",
+                statusCode:
+                    500
             }
         );
     }
@@ -811,8 +1105,10 @@ async function markProviderSuccess({
         throw createServiceError(
             "The wallet reservation was already released.",
             {
-                code: "RESERVATION_ALREADY_RELEASED",
-                statusCode: 500
+                code:
+                    "RESERVATION_ALREADY_RELEASED",
+                statusCode:
+                    500
             }
         );
     }
@@ -830,18 +1126,24 @@ async function markProviderSuccess({
     await updateTransaction(
         transactionId,
         {
-            status: "successful",
+            status:
+                "successful",
+
             providerStatus:
                 providerResult.providerStatus ||
                 "completed",
+
             providerOutcome:
                 "success",
+
             providerReference:
                 providerResult.providerReference ||
                 null,
+
             providerRequestId:
                 providerResult.requestId ||
                 null,
+
             providerCostKobo:
                 Number.isSafeInteger(
                     providerResult.providerCostKobo
@@ -869,20 +1171,25 @@ async function markProviderFailure({
         throw createServiceError(
             "The wallet reservation could not be found.",
             {
-                code: "RESERVATION_NOT_FOUND",
-                statusCode: 500
+                code:
+                    "RESERVATION_NOT_FOUND",
+                statusCode:
+                    500
             }
         );
     }
 
     if (
-        reservation.uid !== uid
+        reservation.uid !==
+        uid
     ) {
         throw createServiceError(
             "Wallet reservation ownership mismatch.",
             {
-                code: "RESERVATION_OWNERSHIP_MISMATCH",
-                statusCode: 500
+                code:
+                    "RESERVATION_OWNERSHIP_MISMATCH",
+                statusCode:
+                    500
             }
         );
     }
@@ -894,8 +1201,10 @@ async function markProviderFailure({
         throw createServiceError(
             "Wallet reservation transaction mismatch.",
             {
-                code: "RESERVATION_TRANSACTION_MISMATCH",
-                statusCode: 500
+                code:
+                    "RESERVATION_TRANSACTION_MISMATCH",
+                statusCode:
+                    500
             }
         );
     }
@@ -907,18 +1216,24 @@ async function markProviderFailure({
         await updateTransaction(
             transactionId,
             {
-                status: "successful",
+                status:
+                    "successful",
+
                 providerOutcome:
                     "success",
+
                 providerStatus:
                     providerResult.providerStatus ||
                     null,
+
                 providerReference:
                     providerResult.providerReference ||
                     null,
+
                 providerRequestId:
                     providerResult.requestId ||
                     null,
+
                 providerCostKobo:
                     Number.isSafeInteger(
                         providerResult.providerCostKobo
@@ -938,18 +1253,24 @@ async function markProviderFailure({
         await updateTransaction(
             transactionId,
             {
-                status: "failed",
+                status:
+                    "failed",
+
                 providerOutcome:
                     "failure",
+
                 providerStatus:
                     providerResult.providerStatus ||
                     null,
+
                 providerReference:
                     providerResult.providerReference ||
                     null,
+
                 providerRequestId:
                     providerResult.requestId ||
                     null,
+
                 providerCostKobo:
                     Number.isSafeInteger(
                         providerResult.providerCostKobo
@@ -973,18 +1294,24 @@ async function markProviderFailure({
     await updateTransaction(
         transactionId,
         {
-            status: "failed",
+            status:
+                "failed",
+
             providerOutcome:
                 "failure",
+
             providerStatus:
                 providerResult.providerStatus ||
                 null,
+
             providerReference:
                 providerResult.providerReference ||
                 null,
+
             providerRequestId:
                 providerResult.requestId ||
                 null,
+
             providerCostKobo:
                 Number.isSafeInteger(
                     providerResult.providerCostKobo
@@ -1002,39 +1329,37 @@ async function purchaseDataForCustomer({
     network,
     phoneNumber,
     planId,
-    reference = null
+    reference
 }) {
     const authenticatedUid =
         requireUid(uid);
+
+    const purchaseReference =
+        requireReference(
+            reference
+        );
 
     const input =
         validatePurchaseInput({
             network,
             phoneNumber,
             planId,
-            currency: CURRENCY,
-            reference
+            currency:
+                CURRENCY,
+            reference:
+                purchaseReference
         });
 
     const transactionId =
         createTransactionId(
-            authenticatedUid
-        );
-
-    const transactionReference =
-        input.reference ||
-        createTransactionReference(
-            transactionId
+            authenticatedUid,
+            purchaseReference
         );
 
     /*
      * Step 1:
      * Resolve the customer-selected plan from
      * the authoritative server-side catalog.
-     *
-     * The customer never supplies the price,
-     * provider, variation ID, data amount, or
-     * validity as authoritative values.
      */
     const catalogPlan =
         await findDataPlan(
@@ -1045,8 +1370,10 @@ async function purchaseDataForCustomer({
         throw createServiceError(
             "This data plan is no longer available.",
             {
-                code: "DATA_PLAN_NOT_FOUND",
-                statusCode: 409
+                code:
+                    "DATA_PLAN_NOT_FOUND",
+                statusCode:
+                    409
             }
         );
     }
@@ -1058,8 +1385,7 @@ async function purchaseDataForCustomer({
 
     /*
      * Step 2:
-     * Verify that the requested network and
-     * selected server product agree.
+     * Verify selected network and server product.
      */
     assertInputMatchesPlan(
         input,
@@ -1068,11 +1394,8 @@ async function purchaseDataForCustomer({
 
     /*
      * Step 3:
-     * Refresh the provider-backed catalog immediately
-     * before taking the customer's money.
-     *
-     * We refuse to silently charge a changed price or
-     * silently substitute a changed product.
+     * Refresh provider-backed catalog before
+     * establishing the purchase.
      */
     plan =
         await verifyFreshPlan(
@@ -1087,27 +1410,64 @@ async function purchaseDataForCustomer({
 
     /*
      * Step 4:
-     * Create the customer's Data transaction record
-     * before the provider call.
+     * Establish the idempotent transaction.
      *
-     * The complete product snapshot is stored so that
-     * later catalog changes cannot rewrite history.
+     * The document ID is deterministic.
+     *
+     * If another request already created this
+     * transaction, this request MUST NOT continue
+     * into reservation or provider purchase.
      */
     const initialTransaction =
         buildTransactionSnapshot({
             transactionId,
-            uid: authenticatedUid,
+            uid:
+                authenticatedUid,
             reference:
-                transactionReference,
+                purchaseReference,
             input,
             plan,
-            reservationId: null,
-            status: "pending"
+            reservationId:
+                null,
+            status:
+                "pending"
         });
 
-    await saveTransaction(
-        initialTransaction
-    );
+    const claimResult =
+        await claimPurchaseTransaction({
+            transactionId,
+            transaction:
+                initialTransaction
+        });
+
+    if (!claimResult.created) {
+        const existingTransaction =
+            claimResult.transaction;
+
+        if (
+            existingTransaction.uid !==
+            authenticatedUid
+        ) {
+            throw createServiceError(
+                "Unable to establish this purchase safely.",
+                {
+                    code:
+                        "DATA_IDEMPOTENCY_CONFLICT",
+                    statusCode:
+                        503
+                }
+            );
+        }
+
+        assertInputMatchesExistingTransaction(
+            input,
+            existingTransaction
+        );
+
+        return buildExistingPurchaseResponse(
+            existingTransaction
+        );
+    }
 
     let reservation;
 
@@ -1116,19 +1476,21 @@ async function purchaseDataForCustomer({
          * Step 5:
          * Reserve exactly the server-authoritative
          * customer price.
-         *
-         * No amount from the browser is used.
          */
         reservation =
             await reserveFunds({
                 uid:
                     authenticatedUid,
+
                 amountKobo:
                     plan.customerPriceKobo,
+
                 currency:
                     CURRENCY,
+
                 service:
                     "data",
+
                 reference:
                     transactionId
             });
@@ -1140,8 +1502,10 @@ async function purchaseDataForCustomer({
             throw createServiceError(
                 "The wallet reservation could not be created.",
                 {
-                    code: "RESERVATION_FAILED",
-                    statusCode: 500
+                    code:
+                        "RESERVATION_FAILED",
+                    statusCode:
+                        500
                 }
             );
         }
@@ -1151,8 +1515,10 @@ async function purchaseDataForCustomer({
             {
                 reservationId:
                     reservation.id,
+
                 reservationStatus:
                     reservation.status,
+
                 reservedAmountKobo:
                     plan.customerPriceKobo
             }
@@ -1161,7 +1527,9 @@ async function purchaseDataForCustomer({
         await updateTransaction(
             transactionId,
             {
-                status: "failed",
+                status:
+                    "failed",
+
                 failureCode:
                     error.code ||
                     "RESERVATION_FAILED"
@@ -1175,9 +1543,6 @@ async function purchaseDataForCustomer({
      * Step 6:
      * Call VTU using ONLY the server-selected
      * variation and network.
-     *
-     * Customer price is intentionally not sent
-     * to VTU.
      */
     let providerResult;
 
@@ -1200,12 +1565,7 @@ async function purchaseDataForCustomer({
                 : null;
 
         /*
-         * A timeout, network failure, authentication
-         * uncertainty, or unknown provider response
-         * MUST NOT release the customer's reservation.
-         *
-         * VTU may have accepted the transaction even
-         * though NovaPay did not receive confirmation.
+         * Unknown provider outcomes remain reserved.
          */
         if (
             providerError &&
@@ -1221,64 +1581,82 @@ async function purchaseDataForCustomer({
             await updateTransaction(
                 transactionId,
                 {
-                    status: "pending",
+                    status:
+                        "pending",
+
                     providerOutcome:
                         "unknown",
+
                     providerStatus:
                         providerError.providerStatus ||
                         null,
+
                     providerCode:
                         providerError.providerCode ||
                         null,
+
                     providerRequestId:
                         createSafeProviderRequestId(
                             transactionId
                         ),
+
                     reconciliationRequired:
                         true,
+
                     retryAfterSeconds:
                         UNKNOWN_RETRY_AFTER_SECONDS
                 }
             );
 
             return {
-                success: false,
-                status: "pending",
+                success:
+                    false,
+
+                status:
+                    "pending",
+
                 transactionId,
+
                 reference:
-                    transactionReference,
+                    purchaseReference,
+
                 message:
                     "Your data purchase is being confirmed. Please check your transaction history shortly."
             };
         }
 
         /*
-         * A definite provider rejection/failure means
-         * the provider did not successfully complete
-         * the purchase, so the customer reservation
-         * can safely be released.
+         * Definite provider rejection/failure can
+         * safely release the reservation.
          */
         try {
             const failedResult = {
                 outcome:
                     "failure",
+
                 providerStatus:
                     providerError?.providerStatus ||
                     null,
+
                 providerReference:
                     providerError?.providerReference ||
                     null,
+
                 providerCostKobo:
                     null,
+
                 providerCode:
                     providerError?.providerCode ||
                     null,
+
                 requestId:
                     createSafeProviderRequestId(
                         transactionId
                     ),
+
                 requestedVariationId:
                     plan.variationId,
+
                 returnedVariationId:
                     null
             };
@@ -1286,9 +1664,12 @@ async function purchaseDataForCustomer({
             await markProviderFailure({
                 uid:
                     authenticatedUid,
+
                 transactionId,
+
                 reservationId:
                     reservation.id,
+
                 providerResult:
                     failedResult
             });
@@ -1296,11 +1677,15 @@ async function purchaseDataForCustomer({
             await updateTransaction(
                 transactionId,
                 {
-                    status: "pending",
+                    status:
+                        "pending",
+
                     providerOutcome:
                         "failure",
+
                     reconciliationRequired:
                         true,
+
                     reconciliationError:
                         releaseError.message
                 }
@@ -1311,7 +1696,10 @@ async function purchaseDataForCustomer({
                 {
                     code:
                         "DATA_RECONCILIATION_REQUIRED",
-                    statusCode: 503,
+
+                    statusCode:
+                        503,
+
                     cause:
                         releaseError
                 }
@@ -1323,7 +1711,9 @@ async function purchaseDataForCustomer({
             {
                 code:
                     "DATA_PROVIDER_REJECTED",
-                statusCode: 400
+
+                statusCode:
+                    400
             }
         );
     }
@@ -1335,9 +1725,8 @@ async function purchaseDataForCustomer({
 
     /*
      * Step 7:
-     * Reject provider success if it identifies
-     * a different variation from the exact product
-     * selected by NovaPay.
+     * Reject a provider response that identifies
+     * a different variation.
      */
     if (
         providerResult.returnedVariationId &&
@@ -1347,37 +1736,51 @@ async function purchaseDataForCustomer({
         await updateTransaction(
             transactionId,
             {
-                status: "pending",
+                status:
+                    "pending",
+
                 providerOutcome:
                     "unknown",
+
                 providerStatus:
                     providerResult.providerStatus ||
                     null,
+
                 providerReference:
                     providerResult.providerReference ||
                     null,
+
                 providerRequestId:
                     providerResult.requestId ||
                     null,
+
                 providerCostKobo:
                     Number.isSafeInteger(
                         providerResult.providerCostKobo
                     )
                         ? providerResult.providerCostKobo
                         : null,
+
                 reconciliationRequired:
                     true,
+
                 productMismatch:
                     true
             }
         );
 
         return {
-            success: false,
-            status: "pending",
+            success:
+                false,
+
+            status:
+                "pending",
+
             transactionId,
+
             reference:
-                transactionReference,
+                purchaseReference,
+
             message:
                 "Your data purchase is being confirmed. Please check your transaction history shortly."
         };
@@ -1385,11 +1788,7 @@ async function purchaseDataForCustomer({
 
     /*
      * Step 8:
-     * Confirmed provider success = commit the wallet.
-     *
-     * commitReservation() performs the wallet debit
-     * and ledger write atomically with reservation
-     * state.
+     * Confirmed provider success = commit wallet.
      */
     if (
         providerResult.outcome ===
@@ -1402,14 +1801,18 @@ async function purchaseDataForCustomer({
                     providerStatus:
                         providerResult.providerStatus ||
                         null,
+
                     providerOutcome:
                         "success",
+
                     providerReference:
                         providerResult.providerReference ||
                         null,
+
                     providerRequestId:
                         providerResult.requestId ||
                         null,
+
                     providerCostKobo:
                         Number.isSafeInteger(
                             providerResult.providerCostKobo
@@ -1422,58 +1825,75 @@ async function purchaseDataForCustomer({
             await markProviderSuccess({
                 uid:
                     authenticatedUid,
+
                 transactionId,
+
                 reservationId:
                     reservation.id,
+
                 providerResult:
                     safeProviderResult
             });
 
             return {
-                success: true,
-                status: "successful",
+                success:
+                    true,
+
+                status:
+                    "successful",
+
                 transactionId,
+
                 reference:
-                    transactionReference,
+                    purchaseReference,
+
                 plan: {
                     planId:
                         plan.planId,
+
                     network:
                         plan.network,
+
                     dataPlan:
                         plan.dataPlan,
+
                     dataAmount:
                         plan.dataAmount,
+
                     validityLabel:
                         plan.validityLabel,
+
                     category:
                         plan.category,
+
                     customerPriceKobo:
                         plan.customerPriceKobo,
+
                     customerPriceNaira:
                         plan.customerPriceNaira
                 },
+
                 message:
                     "Data purchase successful."
             };
         } catch (commitError) {
             /*
-             * Provider success is already known.
+             * Provider success is known.
              *
-             * We therefore NEVER release the reservation
-             * merely because NovaPay's commit operation
-             * encountered an error.
-             *
-             * Reconciliation must repair this state.
+             * Never release the reservation here.
              */
             await updateTransaction(
                 transactionId,
                 {
-                    status: "pending",
+                    status:
+                        "pending",
+
                     providerOutcome:
                         "success",
+
                     reconciliationRequired:
                         true,
+
                     reconciliationError:
                         commitError.message
                 }
@@ -1484,7 +1904,10 @@ async function purchaseDataForCustomer({
                 {
                     code:
                         "DATA_COMMIT_RECONCILIATION_REQUIRED",
-                    statusCode: 503,
+
+                    statusCode:
+                        503,
+
                     cause:
                         commitError
                 }
@@ -1504,9 +1927,12 @@ async function purchaseDataForCustomer({
             await markProviderFailure({
                 uid:
                     authenticatedUid,
+
                 transactionId,
+
                 reservationId:
                     reservation.id,
+
                 providerResult:
                     safeProviderResult
             });
@@ -1514,11 +1940,15 @@ async function purchaseDataForCustomer({
             await updateTransaction(
                 transactionId,
                 {
-                    status: "pending",
+                    status:
+                        "pending",
+
                     providerOutcome:
                         "failure",
+
                     reconciliationRequired:
                         true,
+
                     reconciliationError:
                         releaseError.message
                 }
@@ -1529,7 +1959,10 @@ async function purchaseDataForCustomer({
                 {
                     code:
                         "DATA_RECONCILIATION_REQUIRED",
-                    statusCode: 503,
+
+                    statusCode:
+                        503,
+
                     cause:
                         releaseError
                 }
@@ -1541,51 +1974,65 @@ async function purchaseDataForCustomer({
             {
                 code:
                     "DATA_PROVIDER_REJECTED",
-                statusCode: 400
+
+                statusCode:
+                    400
             }
         );
     }
 
     /*
      * Step 10:
-     * Anything else is uncertain.
-     *
-     * Never release funds here.
+     * Anything else remains uncertain.
      */
     await updateTransaction(
         transactionId,
         {
-            status: "pending",
+            status:
+                "pending",
+
             providerOutcome:
                 "unknown",
+
             providerStatus:
                 providerResult.providerStatus ||
                 null,
+
             providerReference:
                 providerResult.providerReference ||
                 null,
+
             providerRequestId:
                 providerResult.requestId ||
                 null,
+
             providerCostKobo:
                 Number.isSafeInteger(
                     providerResult.providerCostKobo
                 )
                     ? providerResult.providerCostKobo
                     : null,
+
             reconciliationRequired:
                 true,
+
             retryAfterSeconds:
                 UNKNOWN_RETRY_AFTER_SECONDS
         }
     );
 
     return {
-        success: false,
-        status: "pending",
+        success:
+            false,
+
+        status:
+            "pending",
+
         transactionId,
+
         reference:
-            transactionReference,
+            purchaseReference,
+
         message:
             "Your data purchase is being confirmed. Please check your transaction history shortly."
     };
@@ -1628,8 +2075,10 @@ async function reconcileDataTransaction({
         throw createServiceError(
             "Transaction not found.",
             {
-                code: "TRANSACTION_NOT_FOUND",
-                statusCode: 404
+                code:
+                    "TRANSACTION_NOT_FOUND",
+                statusCode:
+                    404
             }
         );
     }
@@ -1643,7 +2092,8 @@ async function reconcileDataTransaction({
             {
                 code:
                     "INVALID_DATA_TRANSACTION",
-                statusCode: 400
+                statusCode:
+                    400
             }
         );
     }
@@ -1653,8 +2103,12 @@ async function reconcileDataTransaction({
         "successful"
     ) {
         return {
-            success: true,
-            status: "successful",
+            success:
+                true,
+
+            status:
+                "successful",
+
             transactionId:
                 normalizedTransactionId
         };
@@ -1673,7 +2127,8 @@ async function reconcileDataTransaction({
             {
                 code:
                     "DATA_RESERVATION_MISSING",
-                statusCode: 500
+                statusCode:
+                    500
             }
         );
     }
@@ -1689,25 +2144,27 @@ async function reconcileDataTransaction({
             {
                 code:
                     "DATA_RESERVATION_NOT_FOUND",
-                statusCode: 500
+                statusCode:
+                    500
             }
         );
     }
 
     if (
         reservation.uid !==
-        authenticatedUid ||
+            authenticatedUid ||
         reservation.reference !==
-        normalizedTransactionId ||
+            normalizedTransactionId ||
         reservation.service !==
-        "data"
+            "data"
     ) {
         throw createServiceError(
             "Data transaction reservation does not match.",
             {
                 code:
                     "DATA_RESERVATION_MISMATCH",
-                statusCode: 500
+                statusCode:
+                    500
             }
         );
     }
@@ -1719,17 +2176,24 @@ async function reconcileDataTransaction({
         await updateTransaction(
             normalizedTransactionId,
             {
-                status: "successful",
+                status:
+                    "successful",
+
                 providerOutcome:
                     "success",
+
                 reconciliationRequired:
                     false
             }
         );
 
         return {
-            success: true,
-            status: "successful",
+            success:
+                true,
+
+            status:
+                "successful",
+
             transactionId:
                 normalizedTransactionId
         };
@@ -1742,17 +2206,24 @@ async function reconcileDataTransaction({
         await updateTransaction(
             normalizedTransactionId,
             {
-                status: "failed",
+                status:
+                    "failed",
+
                 providerOutcome:
                     "failure",
+
                 reconciliationRequired:
                     false
             }
         );
 
         return {
-            success: false,
-            status: "failed",
+            success:
+                false,
+
+            status:
+                "failed",
+
             transactionId:
                 normalizedTransactionId
         };
@@ -1770,19 +2241,27 @@ async function reconcileDataTransaction({
         await updateTransaction(
             normalizedTransactionId,
             {
-                status: "pending",
+                status:
+                    "pending",
+
                 providerOutcome:
                     "unknown",
+
                 reconciliationRequired:
                     true,
+
                 reconciliationError:
                     error.message
             }
         ).catch(() => {});
 
         return {
-            success: false,
-            status: "pending",
+            success:
+                false,
+
+            status:
+                "pending",
+
             transactionId:
                 normalizedTransactionId
         };
@@ -1793,6 +2272,63 @@ async function reconcileDataTransaction({
             providerResult
         );
 
+    /*
+     * A requery response must still identify the
+     * exact variation requested by NovaPay.
+     */
+    if (
+        providerResult.returnedVariationId &&
+        providerResult.returnedVariationId !==
+            transaction.variationId
+    ) {
+        await updateTransaction(
+            normalizedTransactionId,
+            {
+                status:
+                    "pending",
+
+                providerOutcome:
+                    "unknown",
+
+                providerStatus:
+                    providerResult.providerStatus ||
+                    null,
+
+                providerReference:
+                    providerResult.providerReference ||
+                    null,
+
+                providerRequestId:
+                    providerResult.requestId ||
+                    null,
+
+                providerCostKobo:
+                    Number.isSafeInteger(
+                        providerResult.providerCostKobo
+                    )
+                        ? providerResult.providerCostKobo
+                        : null,
+
+                reconciliationRequired:
+                    true,
+
+                productMismatch:
+                    true
+            }
+        );
+
+        return {
+            success:
+                false,
+
+            status:
+                "pending",
+
+            transactionId:
+                normalizedTransactionId
+        };
+    }
+
     if (
         providerResult.outcome ===
         "success"
@@ -1801,16 +2337,23 @@ async function reconcileDataTransaction({
             await markProviderSuccess({
                 uid:
                     authenticatedUid,
+
                 transactionId:
                     normalizedTransactionId,
+
                 reservationId,
+
                 providerResult:
                     safeProviderResult
             });
 
             return {
-                success: true,
-                status: "successful",
+                success:
+                    true,
+
+                status:
+                    "successful",
+
                 transactionId:
                     normalizedTransactionId
             };
@@ -1818,19 +2361,27 @@ async function reconcileDataTransaction({
             await updateTransaction(
                 normalizedTransactionId,
                 {
-                    status: "pending",
+                    status:
+                        "pending",
+
                     providerOutcome:
                         "success",
+
                     reconciliationRequired:
                         true,
+
                     reconciliationError:
                         error.message
                 }
             ).catch(() => {});
 
             return {
-                success: false,
-                status: "pending",
+                success:
+                    false,
+
+                status:
+                    "pending",
+
                 transactionId:
                     normalizedTransactionId
             };
@@ -1845,16 +2396,23 @@ async function reconcileDataTransaction({
             await markProviderFailure({
                 uid:
                     authenticatedUid,
+
                 transactionId:
                     normalizedTransactionId,
+
                 reservationId,
+
                 providerResult:
                     safeProviderResult
             });
 
             return {
-                success: false,
-                status: "failed",
+                success:
+                    false,
+
+                status:
+                    "failed",
+
                 transactionId:
                     normalizedTransactionId
             };
@@ -1862,19 +2420,27 @@ async function reconcileDataTransaction({
             await updateTransaction(
                 normalizedTransactionId,
                 {
-                    status: "pending",
+                    status:
+                        "pending",
+
                     providerOutcome:
                         "failure",
+
                     reconciliationRequired:
                         true,
+
                     reconciliationError:
                         error.message
                 }
             ).catch(() => {});
 
             return {
-                success: false,
-                status: "pending",
+                success:
+                    false,
+
+                status:
+                    "pending",
+
                 transactionId:
                     normalizedTransactionId
             };
@@ -1884,32 +2450,43 @@ async function reconcileDataTransaction({
     await updateTransaction(
         normalizedTransactionId,
         {
-            status: "pending",
+            status:
+                "pending",
+
             providerOutcome:
                 "unknown",
+
             providerStatus:
                 providerResult.providerStatus ||
                 null,
+
             providerReference:
                 providerResult.providerReference ||
                 null,
+
             providerRequestId:
                 providerResult.requestId ||
                 null,
+
             providerCostKobo:
                 Number.isSafeInteger(
                     providerResult.providerCostKobo
                 )
                     ? providerResult.providerCostKobo
                     : null,
+
             reconciliationRequired:
                 true
         }
     );
 
     return {
-        success: false,
-        status: "pending",
+        success:
+            false,
+
+        status:
+            "pending",
+
         transactionId:
             normalizedTransactionId
     };
