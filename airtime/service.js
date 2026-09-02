@@ -329,8 +329,6 @@ function createTransactionId() {
 // The transaction ID itself is used as the wallet
 // reservation reference.
 //
-// This gives us deterministic idempotency.
-//
 // =====================================================
 
 function getReservationReference(
@@ -367,14 +365,6 @@ function getTransactionRef(
 
 // =====================================================
 // FIND EXISTING TRANSACTION
-// =====================================================
-//
-// This is the first idempotency barrier.
-//
-// A repeated purchase request must not create another
-// financial transaction when the same transaction ID is
-// already being processed.
-//
 // =====================================================
 
 async function getAirtimeTransaction(
@@ -414,19 +404,6 @@ async function getAirtimeTransaction(
 
 // =====================================================
 // CREATE INITIAL TRANSACTION
-// =====================================================
-//
-// This transaction record is created BEFORE wallet
-// reservation.
-//
-// Why?
-//
-// Because the Airtime operation needs a durable business
-// transaction ID before the provider call occurs.
-//
-// If reservation fails, the transaction is marked failed
-// without touching the wallet.
-//
 // =====================================================
 
 async function createInitialTransaction({
@@ -548,93 +525,73 @@ async function createInitialTransaction({
     };
 
 
-    try {
+    await db.runTransaction(
+        async firestoreTransaction => {
 
-        await db.runTransaction(
-            async firestoreTransaction => {
+            const snapshot =
+                await firestoreTransaction.get(
+                    ref
+                );
 
-                const snapshot =
-                    await firestoreTransaction.get(
-                        ref
-                    );
+
+            if (
+                snapshot.exists
+            ) {
+
+                const existing =
+                    snapshot.data();
 
 
                 if (
-                    snapshot.exists
+                    existing.uid !==
+                    authenticatedUid
                 ) {
 
-                    const existing =
-                        snapshot.data();
-
-
-                    /*
-                     * Never allow one transaction ID to be
-                     * reused for a different user.
-                     */
-
-                    if (
-                        existing.uid !==
-                        authenticatedUid
-                    ) {
-
-                        throw createError(
-                            "Airtime transaction ownership mismatch.",
-                            403
-                        );
-
-                    }
-
-
-                    /*
-                     * Never allow the same transaction ID to
-                     * represent different financial details.
-                     */
-
-                    if (
-                        Number(
-                            existing.amountKobo
-                        ) !==
-                        amount ||
-                        String(
-                            existing.network ||
-                            ""
-                        ).toLowerCase() !==
-                        normalizedNetwork ||
-                        String(
-                            existing.phoneNumber ||
-                            ""
-                        ) !==
-                        normalizedPhone
-                    ) {
-
-                        throw createError(
-                            "Airtime transaction details do not match the existing transaction.",
-                            409
-                        );
-
-                    }
-
-
-                    return;
+                    throw createError(
+                        "Airtime transaction ownership mismatch.",
+                        403
+                    );
 
                 }
 
 
-                firestoreTransaction.create(
-                    ref,
-                    transactionData
-                );
+                if (
+                    Number(
+                        existing.amountKobo
+                    ) !==
+                    amount ||
+                    String(
+                        existing.network ||
+                        ""
+                    ).toLowerCase() !==
+                    normalizedNetwork ||
+                    String(
+                        existing.phoneNumber ||
+                        ""
+                    ) !==
+                    normalizedPhone
+                ) {
+
+                    throw createError(
+                        "Airtime transaction details do not match the existing transaction.",
+                        409
+                    );
+
+                }
+
+
+                return;
 
             }
-        );
 
-    }
 
-    catch (error) {
+            firestoreTransaction.create(
+                ref,
+                transactionData
+            );
 
-        throw error;
-
-    }
+        }
+    );
 
 
     const created =
@@ -660,13 +617,6 @@ async function createInitialTransaction({
 // =====================================================
 // UPDATE TRANSACTION
 // =====================================================
-//
-// All financial state transitions are performed through
-// wallet/reservation.js.
-//
-// This function only updates the Airtime business record.
-//
-// =====================================================
 
 async function updateTransaction(
     transactionId,
@@ -679,12 +629,14 @@ async function updateTransaction(
         );
 
 
-    const safeUpdates =
-        {
-            ...updates,
-            updatedAt:
-                new Date()
-        };
+    const safeUpdates = {
+
+        ...updates,
+
+        updatedAt:
+            new Date()
+
+    };
 
 
     await ref.update(
@@ -701,25 +653,6 @@ async function updateTransaction(
 
 // =====================================================
 // CALCULATE GAIN
-// =====================================================
-//
-// Customer amount:
-//
-// amountKobo
-//
-// Provider cost:
-//
-// providerCostKobo
-//
-// Gross gain:
-//
-// amountKobo - providerCostKobo
-//
-// The result can never be negative.
-//
-// If VTU does not provide a valid provider cost,
-// gain remains null.
-//
 // =====================================================
 
 function calculateGainKobo(
@@ -768,13 +701,6 @@ function calculateGainKobo(
         amount
     ) {
 
-        /*
-         * Do not manufacture a negative "gain".
-         *
-         * A provider cost greater than the customer charge
-         * is an accounting anomaly that should be investigated.
-         */
-
         return null;
 
     }
@@ -790,17 +716,6 @@ function calculateGainKobo(
 
 // =====================================================
 // NORMALIZE PROVIDER RESULT
-// =====================================================
-//
-// vtu.js is responsible for translating VTU's response
-// into:
-//
-// success
-// failure
-// unknown
-//
-// The service trusts only those internal outcomes.
-//
 // =====================================================
 
 function normalizeProviderOutcome(
@@ -843,13 +758,6 @@ function normalizeProviderOutcome(
 
 // =====================================================
 // HANDLE PROVIDER SUCCESS
-// =====================================================
-//
-// IMPORTANT:
-//
-// We commit the reservation ONLY after VTU explicitly
-// confirms success.
-//
 // =====================================================
 
 async function handleProviderSuccess({
@@ -898,11 +806,6 @@ async function handleProviderSuccess({
     }
 
 
-    /*
-     * If the transaction was already successfully
-     * completed, do not commit the wallet again.
-     */
-
     if (
         transaction.status ===
         STATUS_SUCCESSFUL
@@ -938,11 +841,6 @@ async function handleProviderSuccess({
     }
 
 
-    /*
-     * A confirmed provider success must not overwrite
-     * a terminal failed state.
-     */
-
     if (
         transaction.status ===
         STATUS_FAILED
@@ -962,24 +860,12 @@ async function handleProviderSuccess({
 
     if (!reservationId) {
 
-        /*
-         * This is a critical accounting condition.
-         *
-         * Never mark the Airtime successful without knowing
-         * which reservation must be committed.
-         */
-
         throw new Error(
             "Airtime transaction has no wallet reservation."
         );
 
     }
 
-
-    /*
-     * Commit is the ONLY operation that permanently
-     * decreases the user's wallet balance.
-     */
 
     await commitReservation({
 
@@ -1079,13 +965,6 @@ async function handleProviderSuccess({
 // =====================================================
 // HANDLE PROVIDER FAILURE
 // =====================================================
-//
-// IMPORTANT:
-//
-// Funds are released ONLY when VTU explicitly confirms
-// failure.
-//
-// =====================================================
 
 async function handleProviderFailure({
     uid,
@@ -1132,10 +1011,6 @@ async function handleProviderFailure({
 
     }
 
-
-    /*
-     * Idempotent terminal failure.
-     */
 
     if (
         transaction.status ===
@@ -1196,10 +1071,6 @@ async function handleProviderFailure({
 
     }
 
-
-    /*
-     * Release ONLY confirmed provider failure.
-     */
 
     await releaseReservation({
 
@@ -1306,21 +1177,6 @@ async function handleProviderFailure({
 // =====================================================
 // HANDLE UNKNOWN PROVIDER RESULT
 // =====================================================
-//
-// UNKNOWN means:
-//
-// - timeout
-// - network failure
-// - processing
-// - queued
-// - initiated
-// - pending
-// - on-hold
-// - unexpected provider response
-//
-// UNKNOWN MUST KEEP THE RESERVATION.
-//
-// =====================================================
 
 async function handleUnknownProviderResult({
     uid,
@@ -1367,11 +1223,6 @@ async function handleUnknownProviderResult({
 
     }
 
-
-    /*
-     * If something already finalized the transaction,
-     * do not move it backwards to pending.
-     */
 
     if (
         transaction.status ===
@@ -1424,27 +1275,27 @@ async function handleUnknownProviderResult({
 
 
     /*
-     * Confirm that the reservation still belongs to
-     * this user and is still pending.
+     * IMPORTANT:
      *
-     * We intentionally DO NOT release it.
+     * getReservation() accepts the reservation ID directly.
+     *
+     * The previous version incorrectly passed an object here.
      */
 
     const reservation =
-        await getReservation({
-
-            uid:
-                authenticatedUid,
-
+        await getReservation(
             reservationId
+        );
 
-        });
 
+    if (
+        reservation.uid !==
+        authenticatedUid
+    ) {
 
-    if (!reservation) {
-
-        throw new Error(
-            "Airtime wallet reservation could not be found."
+        throw createError(
+            "Airtime reservation ownership mismatch.",
+            403
         );
 
     }
@@ -1454,11 +1305,6 @@ async function handleUnknownProviderResult({
         reservation.status !==
         "pending"
     ) {
-
-        /*
-         * The reservation has already reached a terminal
-         * state. Do not overwrite that financial state.
-         */
 
         if (
             reservation.status ===
@@ -1579,10 +1425,6 @@ async function handleUnknownProviderResult({
 // =====================================================
 // PURCHASE AIRTIME
 // =====================================================
-//
-// This is the main service entry point.
-//
-// =====================================================
 
 async function purchaseAirtime({
     uid,
@@ -1615,13 +1457,6 @@ async function purchaseAirtime({
             amountKobo
         );
 
-
-    /*
-     * Provider client must be injected by the route.
-//
-//     This keeps this service independent from the actual
-     * VTU.ng implementation and makes the boundary explicit.
-     */
 
     if (
         !providerClient ||
@@ -1676,22 +1511,6 @@ async function purchaseAirtime({
      * -----------------------------------------------------
      * RESERVE USER MONEY
      * -----------------------------------------------------
-     *
-     * reservation.js changes:
-     *
-     * reservedKobo ↑
-     *
-     * balanceKobo remains unchanged.
-     *
-     * Therefore:
-     *
-     * availableKobo =
-     * balanceKobo - reservedKobo
-     *
-     * This is intentional.
-     *
-     * The actual permanent debit happens ONLY at commit.
-     * -----------------------------------------------------
      */
 
     let reservation;
@@ -1737,14 +1556,6 @@ async function purchaseAirtime({
 
     catch (error) {
 
-        /*
-         * The wallet reservation did not happen.
-         *
-         * Therefore no money was locked.
-         *
-         * Mark the business transaction failed.
-         */
-
         const message =
             String(
                 error?.message ||
@@ -1787,20 +1598,36 @@ async function purchaseAirtime({
      * LINK RESERVATION TO TRANSACTION
      * -----------------------------------------------------
      *
-     * This is critical.
+     * wallet/reservation.js returns:
      *
-     * The Airtime transaction must permanently know which
-     * wallet reservation belongs to it.
+     *     reservation.id
+     *
+     * not:
+     *
+     *     reservation.reservationId
+     *
      * -----------------------------------------------------
      */
+
+    const reservationId =
+        reservation.id;
+
+
+    if (!reservationId) {
+
+        throw new Error(
+            "Wallet reservation was created without a reservation ID."
+        );
+
+    }
+
 
     transaction =
         await updateTransaction(
             transactionId,
             {
 
-                reservationId:
-                    reservation.reservationId,
+                reservationId,
 
                 status:
                     STATUS_PENDING
@@ -1812,11 +1639,6 @@ async function purchaseAirtime({
     /*
      * -----------------------------------------------------
      * PROVIDER CALL
-     * -----------------------------------------------------
-     *
-     * The provider adapter receives the NovaPay transaction
-     * ID and generates its own deterministic provider
-     * request ID.
      * -----------------------------------------------------
      */
 
@@ -1846,15 +1668,9 @@ async function purchaseAirtime({
     catch (error) {
 
         /*
-         * IMPORTANT:
+         * UNKNOWN PROVIDER OUTCOME:
          *
-         * We DO NOT release the reservation here.
-         *
-         * The provider adapter treats network errors,
-         * timeouts and unknown responses as uncertain.
-         *
-         * Therefore the customer's money remains reserved
-         * until reconciliation can determine the outcome.
+         * Do NOT release the reservation.
          */
 
         const providerStatus =
@@ -1902,11 +1718,6 @@ async function purchaseAirtime({
             }
         );
 
-
-        /*
-         * Return a pending result rather than exposing the
-         * provider's internal error to the frontend.
-         */
 
         return {
 
@@ -1997,11 +1808,6 @@ async function purchaseAirtime({
     /*
      * -----------------------------------------------------
      * UNKNOWN / PROCESSING
-     * -----------------------------------------------------
-     *
-     * Reservation remains active.
-     * Transaction remains pending.
-     * Reconciliation is required.
      * -----------------------------------------------------
      */
 

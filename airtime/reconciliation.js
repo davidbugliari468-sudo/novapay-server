@@ -1,5 +1,7 @@
 // airtime/reconciliation.js
 
+"use strict";
+
 const {
     db
 } = require("../firebase-admin");
@@ -76,6 +78,15 @@ const STATUS_SUCCESSFUL =
 
 const STATUS_FAILED =
     "failed";
+
+const RESERVATION_PENDING =
+    "pending";
+
+const RESERVATION_COMMITTED =
+    "committed";
+
+const RESERVATION_RELEASED =
+    "released";
 
 
 // =====================================================
@@ -399,6 +410,180 @@ function verifyOwnership(
 
 
 // =====================================================
+// VERIFY RESERVATION BINDING
+// =====================================================
+//
+// A reservation used by Airtime reconciliation must belong
+// to the same:
+//
+//     user
+//     service
+//     transaction reference
+//     amount
+//
+// This prevents reconciliation from operating on a different
+// reservation accidentally or through corrupted data.
+//
+// =====================================================
+
+function verifyReservationBinding(
+    reservation,
+    transaction,
+    uid
+) {
+
+    const authenticatedUid =
+        requireUid(
+            uid
+        );
+
+
+    if (
+        !reservation
+    ) {
+
+        throw createError(
+            "Airtime wallet reservation not found.",
+            500
+        );
+
+    }
+
+
+    if (
+        reservation.uid !==
+        authenticatedUid
+    ) {
+
+        throw createError(
+            "Airtime reservation ownership mismatch.",
+            403
+        );
+
+    }
+
+
+    if (
+        String(
+            reservation.service ||
+            ""
+        )
+            .trim()
+            .toLowerCase() !==
+        SERVICE
+    ) {
+
+        throw createError(
+            "Airtime reservation service does not match the transaction.",
+            409
+        );
+
+    }
+
+
+    if (
+        String(
+            reservation.reference ||
+            ""
+        ).trim() !==
+        String(
+            transaction.id ||
+            ""
+        ).trim()
+    ) {
+
+        throw createError(
+            "Airtime reservation reference does not match the transaction.",
+            409
+        );
+
+    }
+
+
+    if (
+        Number(
+            reservation.amountKobo
+        ) !==
+        Number(
+            transaction.amountKobo
+        )
+    ) {
+
+        throw createError(
+            "Airtime reservation amount does not match the transaction.",
+            409
+        );
+
+    }
+
+
+    return true;
+
+}
+
+
+// =====================================================
+// GET AND VERIFY RESERVATION
+// =====================================================
+//
+// getReservation() accepts the reservation ID directly.
+//
+// =====================================================
+
+async function getVerifiedReservation({
+    uid,
+    transaction
+}) {
+
+    const authenticatedUid =
+        verifyOwnership(
+            transaction,
+            uid
+        );
+
+
+    const reservationId =
+        String(
+            transaction.reservationId ||
+            ""
+        ).trim();
+
+
+    if (!reservationId) {
+
+        throw createError(
+            "Airtime transaction has no wallet reservation.",
+            500
+        );
+
+    }
+
+
+    const reservation =
+        await getReservation(
+            reservationId
+        );
+
+
+    verifyReservationBinding(
+        reservation,
+        transaction,
+        authenticatedUid
+    );
+
+
+    return {
+
+        reservationId,
+
+        reservation
+
+    };
+
+}
+
+
+// =====================================================
 // FINAL SUCCESS RESPONSE
 // =====================================================
 
@@ -550,44 +735,18 @@ async function handleConfirmedSuccess({
     }
 
 
-    const reservationId =
-        transaction.reservationId;
-
-
-    if (!reservationId) {
-
-        throw createError(
-            "Airtime transaction has no wallet reservation.",
-            500
-        );
-
-    }
-
-
-    /*
-     * Verify ownership and state of the reservation before
-     * committing it.
-     */
-
-    const reservation =
-        await getReservation({
+    const {
+        reservationId,
+        reservation
+    } =
+        await getVerifiedReservation({
 
             uid:
                 authenticatedUid,
 
-            reservationId
+            transaction
 
         });
-
-
-    if (!reservation) {
-
-        throw createError(
-            "Airtime wallet reservation not found.",
-            500
-        );
-
-    }
 
 
     /*
@@ -597,7 +756,7 @@ async function handleConfirmedSuccess({
 
     if (
         reservation.status ===
-        "released"
+        RESERVATION_RELEASED
     ) {
 
         throw createError(
@@ -616,9 +775,9 @@ async function handleConfirmedSuccess({
 
     if (
         reservation.status !==
-        "pending" &&
+        RESERVATION_PENDING &&
         reservation.status !==
-        "committed"
+        RESERVATION_COMMITTED
     ) {
 
         throw createError(
@@ -631,7 +790,7 @@ async function handleConfirmedSuccess({
 
     if (
         reservation.status ===
-        "pending"
+        RESERVATION_PENDING
     ) {
 
         await commitReservation({
@@ -736,8 +895,8 @@ async function handleConfirmedFailure({
 
     /*
      * Already failed.
-//
-//     No second release should occur.
+     *
+     * No second release should occur.
      */
 
     if (
@@ -782,39 +941,18 @@ async function handleConfirmedFailure({
     }
 
 
-    const reservationId =
-        transaction.reservationId;
-
-
-    if (!reservationId) {
-
-        throw createError(
-            "Airtime transaction has no wallet reservation.",
-            500
-        );
-
-    }
-
-
-    const reservation =
-        await getReservation({
+    const {
+        reservationId,
+        reservation
+    } =
+        await getVerifiedReservation({
 
             uid:
                 authenticatedUid,
 
-            reservationId
+            transaction
 
         });
-
-
-    if (!reservation) {
-
-        throw createError(
-            "Airtime wallet reservation not found.",
-            500
-        );
-
-    }
 
 
     /*
@@ -826,7 +964,7 @@ async function handleConfirmedFailure({
 
     if (
         reservation.status ===
-        "committed"
+        RESERVATION_COMMITTED
     ) {
 
         throw createError(
@@ -838,8 +976,20 @@ async function handleConfirmedFailure({
 
 
     if (
+        reservation.status ===
+        RESERVATION_RELEASED
+    ) {
+
+        return buildFailedResponse(
+            transaction
+        );
+
+    }
+
+
+    if (
         reservation.status !==
-        "pending"
+        RESERVATION_PENDING
     ) {
 
         throw createError(
@@ -949,10 +1099,11 @@ async function handleUnknownResult({
     providerResult
 }) {
 
-    verifyOwnership(
-        transaction,
-        uid
-    );
+    const authenticatedUid =
+        verifyOwnership(
+            transaction,
+            uid
+        );
 
 
     /*
@@ -983,37 +1134,30 @@ async function handleUnknownResult({
     }
 
 
-    const reservationId =
-        transaction.reservationId;
-
-
-    if (!reservationId) {
+    if (
+        transaction.status !==
+        STATUS_PENDING
+    ) {
 
         throw createError(
-            "Airtime transaction has no wallet reservation.",
-            500
+            "Airtime transaction is in an invalid state.",
+            409
         );
 
     }
 
 
-    const reservation =
-        await getReservation({
+    const {
+        reservation
+    } =
+        await getVerifiedReservation({
 
-            uid,
-            reservationId
+            uid:
+                authenticatedUid,
+
+            transaction
 
         });
-
-
-    if (!reservation) {
-
-        throw createError(
-            "Airtime wallet reservation not found.",
-            500
-        );
-
-    }
 
 
     /*
@@ -1024,7 +1168,7 @@ async function handleUnknownResult({
 
     if (
         reservation.status ===
-        "committed"
+        RESERVATION_COMMITTED
     ) {
 
         const updated =
@@ -1059,11 +1203,24 @@ async function handleUnknownResult({
 
     if (
         reservation.status ===
-        "released"
+        RESERVATION_RELEASED
     ) {
 
         throw createError(
             "Airtime reservation was released while transaction remained pending.",
+            409
+        );
+
+    }
+
+
+    if (
+        reservation.status !==
+        RESERVATION_PENDING
+    ) {
+
+        throw createError(
+            "Airtime reservation is in an invalid state.",
             409
         );
 
@@ -1104,6 +1261,11 @@ async function handleUnknownResult({
                         providerResult?.providerCode
                     ) ||
                     transaction.providerCode ||
+                    null,
+
+                providerCostKobo:
+                    providerResult?.providerCostKobo ??
+                    transaction.providerCostKobo ??
                     null,
 
                 providerOutcome:
@@ -1270,13 +1432,6 @@ async function reconcileAirtimeTransaction({
         true
     ) {
 
-        /*
-         * A pending transaction can still be reconciled,
-         * but this protects against accidentally treating a
-         * transaction that was never sent to the provider as
-         * an unknown provider transaction.
-         */
-
         throw createError(
             "Airtime transaction does not require provider reconciliation.",
             409
@@ -1285,44 +1440,23 @@ async function reconcileAirtimeTransaction({
     }
 
 
-    const reservationId =
-        transaction.reservationId;
-
-
-    if (!reservationId) {
-
-        throw createError(
-            "Airtime transaction has no wallet reservation.",
-            500
-        );
-
-    }
-
-
     /*
      * Confirm that the reservation still belongs to the
-     * authenticated user before contacting the provider.
+     * authenticated user and this exact Airtime transaction.
      */
 
-    const reservation =
-        await getReservation({
+    const {
+        reservationId,
+        reservation
+    } =
+        await getVerifiedReservation({
 
             uid:
                 authenticatedUid,
 
-            reservationId
+            transaction
 
         });
-
-
-    if (!reservation) {
-
-        throw createError(
-            "Airtime wallet reservation not found.",
-            500
-        );
-
-    }
 
 
     /*
@@ -1331,7 +1465,7 @@ async function reconcileAirtimeTransaction({
 
     if (
         reservation.status ===
-        "committed"
+        RESERVATION_COMMITTED
     ) {
 
         const updated =
@@ -1366,7 +1500,7 @@ async function reconcileAirtimeTransaction({
 
     if (
         reservation.status ===
-        "released"
+        RESERVATION_RELEASED
     ) {
 
         throw createError(
@@ -1379,7 +1513,7 @@ async function reconcileAirtimeTransaction({
 
     if (
         reservation.status !==
-        "pending"
+        RESERVATION_PENDING
     ) {
 
         throw createError(
@@ -1393,14 +1527,6 @@ async function reconcileAirtimeTransaction({
     /*
      * -----------------------------------------------------
      * PROVIDER STATUS CHECK
-     * -----------------------------------------------------
-     *
-     * IMPORTANT:
-     *
-     * The provider adapter receives only the information
-     * necessary to identify the Airtime operation.
-     *
-     * It does not receive wallet credentials.
      * -----------------------------------------------------
      */
 
