@@ -315,17 +315,23 @@ function normalizePhoneNumber(
      *
      * The selected network remains a separate request
      * field.
+     *
+     * IMPORTANT:
+     *
+     * The prefix is exactly 3 digits. The previous version
+     * extracted 4 digits and therefore caused valid numbers
+     * such as 08012345678 to fail the prefix validation.
      */
 
     const prefix =
         normalized.slice(
             0,
-            4
+            3
         );
 
 
     const validMobilePrefix =
-        /^(070|071|080|081|090|091|080|081|082|083|084|085|086|087|088|089|092|093|094|095|096|097|098|099)$/
+        /^(070|071|080|081|090|091|082|083|084|085|086|087|088|089|092|093|094|095|096|097|098|099)$/
             .test(
                 prefix
             );
