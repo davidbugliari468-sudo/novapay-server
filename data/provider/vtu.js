@@ -2,121 +2,32 @@
 
 const crypto = require("crypto");
 
-
-// =====================================================
-// NOVAPAY — VTU.NG DATA PROVIDER ADAPTER
-// =====================================================
-//
-// RESPONSIBILITY
-//
-// This module is the ONLY Data layer that communicates
-// directly with VTU.ng.
-//
-// It does NOT:
-//
-// - access Firestore wallets
-// - reserve wallet funds
-// - commit wallet funds
-// - release wallet funds
-// - create NovaPay financial transactions
-// - authenticate NovaPay users
-// - trust frontend provider data
-//
-// It ONLY:
-//
-// - authenticates with VTU.ng
-// - sends Data orders
-// - requeried Data orders
-// - normalizes provider responses
-// - reports provider outcomes to the Data service
-//
-// PROVIDER OUTCOMES:
-//
-// success
-// failure
-// unknown
-//
-// UNKNOWN means:
-//
-// "We do not have enough evidence to conclude that the
-// provider failed."
-//
-// Therefore the Data service MUST NOT release a wallet
-// reservation merely because this adapter encountered a
-// timeout, network error, malformed response, or other
-// ambiguous provider condition.
-//
-// =====================================================
-
-
-// =====================================================
-// CONFIGURATION
-// =====================================================
-
 const VTU_BASE_URL =
-    String(
-        process.env.VTU_BASE_URL ||
-        "https://vtu.ng/wp-json"
-    )
-        .trim()
-        .replace(/\/+$/, "");
-
+    process.env.VTU_BASE_URL || "https://vtu.ng/wp-json";
 
 const VTU_AUTH_URL =
+    process.env.VTU_AUTH_URL ||
     `${VTU_BASE_URL}/jwt-auth/v1/token`;
 
-
-const VTU_API_URL =
+const VTU_API_BASE_URL =
+    process.env.VTU_API_BASE_URL ||
     `${VTU_BASE_URL}/api/v2`;
 
+const VTU_USERNAME = process.env.VTU_USERNAME || "";
+const VTU_PASSWORD = process.env.VTU_PASSWORD || "";
 
-const VTU_USERNAME =
-    String(
-        process.env.VTU_USERNAME ||
-        ""
-    ).trim();
+const REQUEST_TIMEOUT_MS = Number.parseInt(
+    process.env.VTU_REQUEST_TIMEOUT_MS || "15000",
+    10
+);
 
+const MAX_TRANSACTION_ID_LENGTH = 200;
+const MAX_PROVIDER_REQUEST_ID_LENGTH = 50;
 
-const VTU_PASSWORD =
-    String(
-        process.env.VTU_PASSWORD ||
-        ""
-    );
-
-
-const configuredTimeout =
-    Number(
-        process.env.VTU_REQUEST_TIMEOUT_MS
-    );
-
-
-const VTU_REQUEST_TIMEOUT_MS =
-    Number.isSafeInteger(
-        configuredTimeout
-    ) &&
-    configuredTimeout > 0
-        ? configuredTimeout
-        : 15000;
-
-
-// =====================================================
-// TOKEN CACHE
-// =====================================================
-
-let cachedToken =
-    null;
-
-
-let cachedTokenExpiresAt =
-    0;
-
-
-// =====================================================
-// PROVIDER ERROR
-// =====================================================
+let cachedAccessToken = null;
+let cachedAccessTokenExpiresAt = 0;
 
 class VtuProviderError extends Error {
-
     constructor(
         message,
         {
@@ -128,1107 +39,721 @@ class VtuProviderError extends Error {
             rawMessage = null
         } = {}
     ) {
+        super(message);
 
-        super(
-            message
-        );
+        this.name = "VtuProviderError";
+        this.kind = kind;
+        this.httpStatus = httpStatus;
+        this.providerCode = providerCode;
+        this.providerStatus = providerStatus;
+        this.providerReference = providerReference;
+        this.rawMessage = rawMessage;
 
-        this.name =
-            "VtuProviderError";
-
-        this.kind =
-            kind;
-
-        this.httpStatus =
-            httpStatus;
-
-        this.providerCode =
-            providerCode;
-
-        this.providerStatus =
-            providerStatus;
-
-        this.providerReference =
-            providerReference;
-
-        this.rawMessage =
-            rawMessage;
-
+        Error.captureStackTrace?.(this, VtuProviderError);
     }
-
 }
 
-
-// =====================================================
-// CONFIGURATION VALIDATION
-// =====================================================
-
-function validateConfiguration() {
-
-    if (!VTU_USERNAME) {
-
-        throw new VtuProviderError(
-            "VTU.ng username is not configured.",
-            {
-                kind:
-                    "configuration"
-            }
-        );
-
-    }
-
-
-    if (!VTU_PASSWORD) {
-
-        throw new VtuProviderError(
-            "VTU.ng password is not configured.",
-            {
-                kind:
-                    "configuration"
-            }
-        );
-
-    }
-
+function createProviderError(message, options = {}) {
+    return new VtuProviderError(message, options);
 }
 
+function requireNonEmptyString(value, fieldName, maxLength) {
+    if (typeof value !== "string") {
+        throw createProviderError(
+            `Invalid ${fieldName}.`,
+            {
+                kind: "validation"
+            }
+        );
+    }
 
-// =====================================================
-// TRANSACTION ID VALIDATION
-// =====================================================
-
-function requireTransactionId(
-    transactionId
-) {
-
-    const normalized =
-        String(
-            transactionId ||
-            ""
-        ).trim();
-
+    const normalized = value.trim();
 
     if (!normalized) {
-
-        throw new VtuProviderError(
-            "Transaction ID is required.",
+        throw createProviderError(
+            `Invalid ${fieldName}.`,
             {
-                kind:
-                    "validation"
+                kind: "validation"
             }
         );
-
     }
 
-
-    if (
-        normalized.length >
-        200
-    ) {
-
-        throw new VtuProviderError(
-            "Transaction ID is too long.",
+    if (normalized.length > maxLength) {
+        throw createProviderError(
+            `Invalid ${fieldName}.`,
             {
-                kind:
-                    "validation"
+                kind: "validation"
             }
         );
-
     }
-
 
     return normalized;
-
 }
 
+function requireTransactionId(transactionId) {
+    return requireNonEmptyString(
+        transactionId,
+        "transaction ID",
+        MAX_TRANSACTION_ID_LENGTH
+    );
+}
 
-// =====================================================
-// PROVIDER REQUEST ID
-// =====================================================
-//
-// VTU.ng request_id has a maximum length.
-//
-// We derive it deterministically from the NovaPay
-// transaction ID.
-//
-// Same NovaPay transaction:
-//
-//     transactionId
-//          ↓
-//     same request_id
-//
-// This is important when the original provider request
-// times out and the order must later be requeried.
-//
-// Maximum output length:
-//
-//     48 characters
-//
-// =====================================================
+function normalizePhoneNumber(phoneNumber) {
+    if (typeof phoneNumber !== "string") {
+        throw createProviderError(
+            "Invalid phone number.",
+            {
+                kind: "validation"
+            }
+        );
+    }
 
-function createProviderRequestId(
-    transactionId
-) {
+    const digits = phoneNumber.replace(/\D/g, "");
 
-    const normalized =
-        requireTransactionId(
-            transactionId
+    if (digits.length === 11 && digits.startsWith("0")) {
+        return digits;
+    }
+
+    if (digits.length === 10 && digits.startsWith("8")) {
+        return `0${digits}`;
+    }
+
+    if (digits.length === 13 && digits.startsWith("234")) {
+        return `0${digits.slice(3)}`;
+    }
+
+    if (digits.length === 12 && digits.startsWith("234")) {
+        return `0${digits.slice(3)}`;
+    }
+
+    throw createProviderError(
+        "Invalid phone number.",
+        {
+            kind: "validation"
+        }
+    );
+}
+
+function normalizeNetwork(network) {
+    if (typeof network !== "string") {
+        throw createProviderError(
+            "Invalid network.",
+            {
+                kind: "validation"
+            }
+        );
+    }
+
+    const normalized = network.trim().toLowerCase();
+
+    const supportedNetworks = new Set([
+        "mtn",
+        "airtel",
+        "glo",
+        "9mobile"
+    ]);
+
+    if (!supportedNetworks.has(normalized)) {
+        throw createProviderError(
+            "Unsupported network.",
+            {
+                kind: "validation"
+            }
+        );
+    }
+
+    return normalized;
+}
+
+function normalizeVariationId(variationId) {
+    return requireNonEmptyString(
+        variationId,
+        "variation ID",
+        150
+    );
+}
+
+function createProviderRequestId(transactionId) {
+    const normalizedTransactionId =
+        requireTransactionId(transactionId);
+
+    const digest = crypto
+        .createHash("sha256")
+        .update(normalizedTransactionId, "utf8")
+        .digest("hex");
+
+    const requestId = `ND${digest.slice(0, 46)}`;
+
+    if (requestId.length > MAX_PROVIDER_REQUEST_ID_LENGTH) {
+        throw createProviderError(
+            "Unable to create provider request ID.",
+            {
+                kind: "validation"
+            }
+        );
+    }
+
+    return requestId;
+}
+
+function clearAccessToken() {
+    cachedAccessToken = null;
+    cachedAccessTokenExpiresAt = 0;
+}
+
+function getCachedAccessToken() {
+    if (!cachedAccessToken) {
+        return null;
+    }
+
+    if (
+        Date.now() >=
+        cachedAccessTokenExpiresAt
+    ) {
+        clearAccessToken();
+        return null;
+    }
+
+    return cachedAccessToken;
+}
+
+function cacheAccessToken(token, expiresInSeconds = 3600) {
+    const normalizedToken =
+        requireNonEmptyString(
+            token,
+            "provider access token",
+            10000
         );
 
+    const numericExpiresIn =
+        Number(expiresInSeconds);
 
-    return (
-        "ND" +
-        crypto
-            .createHash(
-                "sha256"
-            )
-            .update(
-                normalized,
-                "utf8"
-            )
-            .digest(
-                "hex"
-            )
-            .slice(
-                0,
-                46
-            )
-    );
+    const safeExpiresIn =
+        Number.isFinite(numericExpiresIn) &&
+        numericExpiresIn > 0
+            ? numericExpiresIn
+            : 3600;
 
+    const safetyWindowMs =
+        Math.min(
+            10 * 60 * 1000,
+            Math.max(
+                30 * 1000,
+                safeExpiresIn * 1000 * 0.1
+            )
+        );
+
+    cachedAccessToken = normalizedToken;
+
+    cachedAccessTokenExpiresAt =
+        Date.now() +
+        Math.max(
+            30 * 1000,
+            safeExpiresIn * 1000 - safetyWindowMs
+        );
+
+    return cachedAccessToken;
 }
-
-
-// =====================================================
-// ABORTABLE HTTP REQUEST
-// =====================================================
 
 async function fetchWithTimeout(
     url,
-    options = {}
+    options = {},
+    timeoutMs = REQUEST_TIMEOUT_MS
 ) {
-
     const controller =
         new AbortController();
 
-
-    const timeout =
-        setTimeout(
-            () => {
-
-                controller.abort();
-
-            },
-            VTU_REQUEST_TIMEOUT_MS
-        );
-
+    const timeout = setTimeout(
+        () => controller.abort(),
+        timeoutMs
+    );
 
     try {
-
         return await fetch(
             url,
             {
-
                 ...options,
-
-                signal:
-                    controller.signal
-
+                signal: controller.signal
             }
         );
-
-    }
-
-    catch (error) {
-
-        if (
-            error?.name ===
-            "AbortError"
-        ) {
-
-            throw new VtuProviderError(
-                "VTU.ng request timed out.",
+    } catch (error) {
+        if (error?.name === "AbortError") {
+            throw createProviderError(
+                "VTU request timed out.",
                 {
-                    kind:
-                        "timeout"
+                    kind: "timeout"
                 }
             );
-
         }
 
-
-        throw new VtuProviderError(
-            "Unable to reach VTU.ng.",
+        throw createProviderError(
+            "Unable to reach VTU.",
             {
-                kind:
-                    "network",
-
-                rawMessage:
-                    String(
-                        error?.message ||
-                        ""
-                    )
-                        .slice(
-                            0,
-                            300
-                        )
+                kind: "network",
+                rawMessage: error?.message || null
             }
         );
-
+    } finally {
+        clearTimeout(timeout);
     }
-
-    finally {
-
-        clearTimeout(
-            timeout
-        );
-
-    }
-
 }
 
+async function readJsonResponse(response) {
+    const text = await response.text();
 
-// =====================================================
-// RESPONSE BODY PARSER
-// =====================================================
-
-async function parseJsonResponse(
-    response
-) {
-
-    const text =
-        await response.text();
-
-
-    if (!text.trim()) {
-
-        throw new VtuProviderError(
-            "VTU.ng returned an empty response.",
+    if (!text) {
+        throw createProviderError(
+            "VTU returned an empty response.",
             {
-                kind:
-                    "unknown",
-
-                httpStatus:
-                    response.status
+                kind: "unknown",
+                httpStatus: response.status
             }
         );
-
     }
-
 
     try {
-
-        return JSON.parse(
-            text
-        );
-
-    }
-
-    catch {
-
-        throw new VtuProviderError(
-            "VTU.ng returned an invalid response.",
+        return JSON.parse(text);
+    } catch {
+        throw createProviderError(
+            "VTU returned an invalid response.",
             {
-                kind:
-                    "unknown",
-
-                httpStatus:
-                    response.status,
-
-                rawMessage:
-                    text.slice(
-                        0,
-                        300
-                    )
+                kind: "unknown",
+                httpStatus: response.status,
+                rawMessage: text.slice(0, 500)
             }
         );
-
     }
-
 }
 
-
-// =====================================================
-// ACCESS TOKEN
-// =====================================================
-
-async function getAccessToken({
-    forceRefresh = false
-} = {}) {
-
-    validateConfiguration();
-
-
-    const now =
-        Date.now();
-
-
-    if (
-        !forceRefresh &&
-        cachedToken &&
-        cachedTokenExpiresAt >
-            now +
-            (
-                10 *
-                60 *
-                1000
-            )
-    ) {
-
-        return cachedToken;
-
+function getProviderMessage(payload) {
+    if (!payload || typeof payload !== "object") {
+        return null;
     }
 
+    const candidates = [
+        payload.message,
+        payload.msg,
+        payload.error,
+        payload.detail
+    ];
+
+    for (const value of candidates) {
+        if (
+            typeof value === "string" &&
+            value.trim()
+        ) {
+            return value.trim();
+        }
+    }
+
+    return null;
+}
+
+function getProviderCode(payload) {
+    if (!payload || typeof payload !== "object") {
+        return null;
+    }
+
+    const candidates = [
+        payload.code,
+        payload.error_code,
+        payload.status_code
+    ];
+
+    for (const value of candidates) {
+        if (
+            typeof value === "string" ||
+            typeof value === "number"
+        ) {
+            return String(value);
+        }
+    }
+
+    return null;
+}
+
+function getProviderStatus(payload) {
+    if (!payload || typeof payload !== "object") {
+        return null;
+    }
+
+    const candidates = [
+        payload.status,
+        payload.order_status,
+        payload.transaction_status,
+        payload.data?.status
+    ];
+
+    for (const value of candidates) {
+        if (
+            typeof value === "string" &&
+            value.trim()
+        ) {
+            return value.trim().toLowerCase();
+        }
+    }
+
+    return null;
+}
+
+function normalizeProviderStatus(status) {
+    if (
+        typeof status !== "string" ||
+        !status.trim()
+    ) {
+        return "unknown";
+    }
+
+    const normalized =
+        status
+            .trim()
+            .toLowerCase()
+            .replace(/[_\s]+/g, "-");
+
+    const successStatuses = new Set([
+        "completed",
+        "completed-api",
+        "successful",
+        "success",
+        "processing-completed"
+    ]);
+
+    const failureStatuses = new Set([
+        "failed",
+        "failure",
+        "refunded",
+        "cancelled",
+        "canceled",
+        "reversed"
+    ]);
+
+    if (successStatuses.has(normalized)) {
+        return "success";
+    }
+
+    if (failureStatuses.has(normalized)) {
+        return "failure";
+    }
+
+    return "unknown";
+}
+
+function extractProviderReference(payload) {
+    if (!payload || typeof payload !== "object") {
+        return null;
+    }
+
+    const candidates = [
+        payload.order_id,
+        payload.reference,
+        payload.transaction_id,
+        payload.transaction_reference,
+        payload.data?.order_id,
+        payload.data?.reference,
+        payload.data?.transaction_id
+    ];
+
+    for (const value of candidates) {
+        if (
+            typeof value === "string" ||
+            typeof value === "number"
+        ) {
+            const normalized = String(value).trim();
+
+            if (normalized) {
+                return normalized.slice(0, 200);
+            }
+        }
+    }
+
+    return null;
+}
+
+function extractProviderCostKobo(payload) {
+    if (!payload || typeof payload !== "object") {
+        return null;
+    }
+
+    const candidates = [
+        payload.amount_charged,
+        payload.data?.amount_charged
+    ];
+
+    for (const value of candidates) {
+        const parsed = nairaToKobo(value);
+
+        if (parsed !== null) {
+            return parsed;
+        }
+    }
+
+    return null;
+}
+
+function extractReturnedVariationId(payload) {
+    if (!payload || typeof payload !== "object") {
+        return null;
+    }
+
+    const candidates = [
+        payload.variation_id,
+        payload.variation,
+        payload.data?.variation_id,
+        payload.data?.variation
+    ];
+
+    for (const value of candidates) {
+        if (
+            typeof value === "string" ||
+            typeof value === "number"
+        ) {
+            const normalized = String(value).trim();
+
+            if (normalized) {
+                return normalized;
+            }
+        }
+    }
+
+    return null;
+}
+
+function nairaToKobo(value) {
+    if (
+        value === null ||
+        value === undefined ||
+        value === ""
+    ) {
+        return null;
+    }
+
+    let numeric;
+
+    if (typeof value === "number") {
+        numeric = value;
+    } else if (typeof value === "string") {
+        const cleaned = value
+            .replace(/₦/g, "")
+            .replace(/,/g, "")
+            .trim();
+
+        numeric = Number(cleaned);
+    } else {
+        return null;
+    }
+
+    if (
+        !Number.isFinite(numeric) ||
+        numeric < 0
+    ) {
+        return null;
+    }
+
+    const kobo = Math.round(
+        numeric * 100
+    );
+
+    if (!Number.isSafeInteger(kobo)) {
+        return null;
+    }
+
+    return kobo;
+}
+
+function normalizeProviderResponse(
+    payload,
+    {
+        requestedVariationId = null,
+        httpStatus = null,
+        requestId = null
+    } = {}
+) {
+    const rawStatus =
+        getProviderStatus(payload);
+
+    const outcome =
+        normalizeProviderStatus(
+            rawStatus
+        );
+
+    const providerReference =
+        extractProviderReference(payload);
+
+    const providerCostKobo =
+        extractProviderCostKobo(payload);
+
+    const returnedVariationId =
+        extractReturnedVariationId(payload);
+
+    return {
+        outcome,
+        providerStatus: rawStatus,
+        providerReference,
+        providerCostKobo,
+        providerCode: getProviderCode(payload),
+        message: getProviderMessage(payload),
+        requestedVariationId,
+        returnedVariationId,
+        requestId,
+        httpStatus,
+        raw: payload
+    };
+}
+
+async function getAccessToken() {
+    const cached =
+        getCachedAccessToken();
+
+    if (cached) {
+        return cached;
+    }
+
+    if (
+        !VTU_USERNAME ||
+        !VTU_PASSWORD
+    ) {
+        throw createProviderError(
+            "VTU credentials are not configured.",
+            {
+                kind: "configuration"
+            }
+        );
+    }
 
     const response =
         await fetchWithTimeout(
             VTU_AUTH_URL,
             {
-
-                method:
-                    "POST",
-
+                method: "POST",
                 headers: {
-
                     "Content-Type":
                         "application/json",
-
-                    "Accept":
+                    Accept:
                         "application/json"
-
                 },
-
-                body:
-                    JSON.stringify({
-
-                        username:
-                            VTU_USERNAME,
-
-                        password:
-                            VTU_PASSWORD
-
-                    })
-
+                body: JSON.stringify({
+                    username: VTU_USERNAME,
+                    password: VTU_PASSWORD
+                })
             }
         );
 
-
-    let data;
-
-
-    try {
-
-        data =
-            await parseJsonResponse(
-                response
-            );
-
-    }
-
-    catch (error) {
-
-        if (
-            error instanceof
-            VtuProviderError
-        ) {
-
-            throw error;
-
-        }
-
-
-        throw new VtuProviderError(
-            "VTU.ng authentication response could not be verified.",
-            {
-                kind:
-                    "unknown",
-
-                httpStatus:
-                    response.status
-            }
+    const payload =
+        await readJsonResponse(
+            response
         );
 
-    }
-
-
-    if (
-        !response.ok
-    ) {
-
-        throw new VtuProviderError(
-            "VTU.ng authentication failed.",
+    if (!response.ok) {
+        throw createProviderError(
+            "VTU authentication failed.",
             {
-
                 kind:
-                    "authentication",
-
-                httpStatus:
-                    response.status,
-
+                    response.status >= 500
+                        ? "provider"
+                        : "authentication",
+                httpStatus: response.status,
                 providerCode:
-                    data?.code ||
-                    null,
-
+                    getProviderCode(payload),
+                providerStatus:
+                    getProviderStatus(payload),
                 rawMessage:
-                    String(
-                        data?.message ||
-                        ""
-                    )
-                        .slice(
-                            0,
-                            300
-                        )
-
+                    getProviderMessage(payload)
             }
         );
-
     }
 
+    const token =
+        payload?.token ||
+        payload?.access_token;
 
     if (
-        typeof data?.token !==
-            "string" ||
-        !data.token.trim()
+        typeof token !== "string" ||
+        !token.trim()
     ) {
-
-        throw new VtuProviderError(
-            "VTU.ng authentication returned no token.",
+        throw createProviderError(
+            "VTU authentication returned no access token.",
             {
-                kind:
-                    "authentication",
-
-                httpStatus:
-                    response.status
+                kind: "authentication",
+                httpStatus: response.status
             }
         );
-
     }
 
+    const expiresIn =
+        payload?.expires_in ||
+        payload?.expires ||
+        3600;
 
-    cachedToken =
-        data.token.trim();
-
-
-    /*
-     * VTU.ng token lifetime is approximately seven days.
-     *
-     * Cache below that period so an almost-expired token
-     * is not used for a provider operation.
-     */
-
-    cachedTokenExpiresAt =
-        now +
-        (
-            6 *
-            24 *
-            60 *
-            60 *
-            1000
-        );
-
-
-    return cachedToken;
-
+    return cacheAccessToken(
+        token,
+        expiresIn
+    );
 }
-
-
-// =====================================================
-// CLEAR ACCESS TOKEN
-// =====================================================
-
-function clearAccessToken() {
-
-    cachedToken =
-        null;
-
-
-    cachedTokenExpiresAt =
-        0;
-
-}
-
-
-// =====================================================
-// AUTHENTICATED PROVIDER REQUEST
-// =====================================================
 
 async function authenticatedRequest(
     path,
     {
-        method = "GET",
+        method = "POST",
         body = null,
         retryAuthentication = true
     } = {}
 ) {
-
-    let token =
+    let accessToken =
         await getAccessToken();
 
+    const url =
+        `${VTU_API_BASE_URL}${path}`;
 
-    let response;
+    const makeRequest =
+        async token => {
+            const headers = {
+                Accept:
+                    "application/json",
+                Authorization:
+                    `Bearer ${token}`
+            };
 
+            if (body !== null) {
+                headers["Content-Type"] =
+                    "application/json";
+            }
 
-    try {
-
-        response =
-            await fetchWithTimeout(
-                `${VTU_API_URL}/${path}`,
+            return fetchWithTimeout(
+                url,
                 {
-
                     method,
-
-                    headers: {
-
-                        "Authorization":
-                            `Bearer ${token}`,
-
-                        "Content-Type":
-                            "application/json",
-
-                        "Accept":
-                            "application/json"
-
-                    },
-
+                    headers,
                     body:
                         body === null
                             ? undefined
-                            : JSON.stringify(
-                                body
-                            )
-
+                            : JSON.stringify(body)
                 }
             );
+        };
 
-    }
-
-    catch (error) {
-
-        throw error;
-
-    }
-
-
-    /*
-     * A 401/403 may mean the cached token has expired.
-     *
-     * Refresh once and retry the same provider operation.
-     *
-     * The request_id does not change.
-     */
+    let response =
+        await makeRequest(
+            accessToken
+        );
 
     if (
-        (
-            response.status ===
-                401 ||
-            response.status ===
-                403
-        ) &&
+        (response.status === 401 ||
+            response.status === 403) &&
         retryAuthentication
     ) {
-
         clearAccessToken();
 
-
-        token =
-            await getAccessToken({
-                forceRefresh:
-                    true
-            });
-
+        accessToken =
+            await getAccessToken();
 
         response =
-            await fetchWithTimeout(
-                `${VTU_API_URL}/${path}`,
-                {
-
-                    method,
-
-                    headers: {
-
-                        "Authorization":
-                            `Bearer ${token}`,
-
-                        "Content-Type":
-                            "application/json",
-
-                        "Accept":
-                            "application/json"
-
-                    },
-
-                    body:
-                        body === null
-                            ? undefined
-                            : JSON.stringify(
-                                body
-                            )
-
-                }
+            await makeRequest(
+                accessToken
             );
-
     }
 
-
-    let data;
-
-
-    try {
-
-        data =
-            await parseJsonResponse(
-                response
-            );
-
-    }
-
-    catch (error) {
-
-        if (
-            error instanceof
-            VtuProviderError
-        ) {
-
-            error.httpStatus =
-                response.status;
-
-            throw error;
-
-        }
-
-
-        throw new VtuProviderError(
-            "VTU.ng response could not be verified.",
-            {
-
-                kind:
-                    "unknown",
-
-                httpStatus:
-                    response.status
-
-            }
-        );
-
-    }
-
-
-    return {
-
-        response,
-
-        data
-
-    };
-
+    return response;
 }
-
-
-// =====================================================
-// PROVIDER STATUS NORMALIZATION
-// =====================================================
-//
-// Confirmed success:
-//
-// completed-api
-//
-// Confirmed failure:
-//
-// failed
-// refunded
-// cancelled
-//
-// Everything else:
-//
-// unknown
-//
-// Processing/pending states are NEVER treated as failure.
-// =====================================================
-
-function normalizeProviderStatus(
-    status
-) {
-
-    const normalized =
-        String(
-            status ||
-            ""
-        )
-            .trim()
-            .toLowerCase();
-
-
-    if (
-        normalized ===
-        "completed-api"
-    ) {
-
-        return "success";
-
-    }
-
-
-    if (
-        normalized ===
-            "failed" ||
-        normalized ===
-            "refunded" ||
-        normalized ===
-            "cancelled"
-    ) {
-
-        return "failure";
-
-    }
-
-
-    return "unknown";
-
-}
-
-
-// =====================================================
-// MONEY CONVERSION
-// =====================================================
-//
-// Provider monetary values are represented in NGN.
-//
-// Convert safely to integer kobo.
-//
-// Examples:
-//
-// 100
-// "100"
-// "100.00"
-// "97.50"
-// =====================================================
-
-function nairaToKobo(
-    value
-) {
-
-    const text =
-        String(
-            value ??
-            ""
-        ).trim();
-
-
-    if (
-        !/^\d+(?:\.\d{1,2})?$/.test(
-            text
-        )
-    ) {
-
-        return null;
-
-    }
-
-
-    const parts =
-        text.split(".");
-
-
-    const naira =
-        Number(
-            parts[0]
-        );
-
-
-    const koboPart =
-        (
-            parts[1] ||
-            ""
-        )
-            .padEnd(
-                2,
-                "0"
-            );
-
-
-    const kobo =
-        Number(
-            koboPart ||
-            "0"
-        );
-
-
-    if (
-        !Number.isSafeInteger(
-            naira
-        ) ||
-        !Number.isSafeInteger(
-            kobo
-        )
-    ) {
-
-        return null;
-
-    }
-
-
-    const total =
-        (
-            naira *
-            100
-        ) +
-        kobo;
-
-
-    if (
-        !Number.isSafeInteger(
-            total
-        )
-    ) {
-
-        return null;
-
-    }
-
-
-    return total;
-
-}
-
-
-// =====================================================
-// PROVIDER REFERENCE EXTRACTION
-// =====================================================
-
-function extractProviderReference(
-    data
-) {
-
-    const payload =
-        data?.data &&
-        typeof data.data ===
-            "object"
-            ? data.data
-            : data;
-
-
-    const candidates = [
-
-        payload?.order_id,
-
-        payload?.reference,
-
-        payload?.transaction_id
-
-    ];
-
-
-    for (
-        const candidate
-        of candidates
-    ) {
-
-        if (
-            candidate ===
-                null ||
-            candidate ===
-                undefined
-        ) {
-
-            continue;
-
-        }
-
-
-        const normalized =
-            String(
-                candidate
-            ).trim();
-
-
-        if (
-            normalized
-        ) {
-
-            return normalized;
-
-        }
-
-    }
-
-
-    return null;
-
-}
-
-
-// =====================================================
-// PROVIDER COST EXTRACTION
-// =====================================================
-//
-// VTU.ng can return amount_charged.
-//
-// This represents the amount charged by the provider.
-//
-// Example:
-//
-// customer charge:
-//     ₦799
-//
-// provider charge:
-//     ₦779
-//
-// providerCostKobo:
-//     77900
-//
-// The Data service uses this value to calculate the
-// provider-side gross margin.
-// =====================================================
-
-function extractProviderCostKobo(
-    data
-) {
-
-    const payload =
-        data?.data &&
-        typeof data.data ===
-            "object"
-            ? data.data
-            : data;
-
-
-    const amountCharged =
-        payload?.amount_charged;
-
-
-    if (
-        amountCharged ===
-            null ||
-        amountCharged ===
-            undefined
-    ) {
-
-        return null;
-
-    }
-
-
-    return nairaToKobo(
-        amountCharged
-    );
-
-}
-
-
-// =====================================================
-// PROVIDER RESPONSE NORMALIZATION
-// =====================================================
-
-function normalizeProviderResponse(
-    data,
-    httpStatus
-) {
-
-    const payload =
-        data?.data &&
-        typeof data.data ===
-            "object"
-            ? data.data
-            : data || {};
-
-
-    const providerStatus =
-        String(
-            payload?.status ||
-            data?.status ||
-            ""
-        )
-            .trim()
-            .toLowerCase();
-
-
-    const outcome =
-        normalizeProviderStatus(
-            providerStatus
-        );
-
-
-    const providerReference =
-        extractProviderReference(
-            data
-        );
-
-
-    const providerCostKobo =
-        extractProviderCostKobo(
-            data
-        );
-
-
-    const providerCode =
-        data?.code ??
-        payload?.code ??
-        null;
-
-
-    const message =
-        String(
-            data?.message ??
-            payload?.message ??
-            ""
-        )
-            .trim()
-            .slice(
-                0,
-                500
-            ) ||
-        null;
-
-
-    const variationId =
-        payload?.variation_id ??
-        null;
-
-
-    const providerRequestId =
-        payload?.request_id ??
-        null;
-
-
-    return {
-
-        outcome,
-
-        providerStatus:
-            providerStatus ||
-            null,
-
-        providerReference,
-
-        providerCostKobo,
-
-        providerCode,
-
-        message,
-
-        variationId:
-            variationId === null
-                ? null
-                : String(
-                    variationId
-                ),
-
-        providerRequestId:
-            providerRequestId === null
-                ? null
-                : String(
-                    providerRequestId
-                ),
-
-        httpStatus
-
-    };
-
-}
-
-
-// =====================================================
-// PURCHASE INPUT VALIDATION
-// =====================================================
 
 function validatePurchaseInput({
     transactionId,
@@ -1236,162 +761,71 @@ function validatePurchaseInput({
     phoneNumber,
     variationId
 }) {
-
     const normalizedTransactionId =
         requireTransactionId(
             transactionId
         );
 
-
     const normalizedNetwork =
-        String(
-            network ||
-            ""
-        )
-            .trim()
-            .toLowerCase();
-
-
-    if (!normalizedNetwork) {
-
-        throw new VtuProviderError(
-            "Data network is required.",
-            {
-                kind:
-                    "validation"
-            }
+        normalizeNetwork(
+            network
         );
 
-    }
-
-
-    const supportedNetworks = [
-
-        "mtn",
-
-        "airtel",
-
-        "glo",
-
-        "9mobile"
-
-    ];
-
-
-    if (
-        !supportedNetworks.includes(
-            normalizedNetwork
-        )
-    ) {
-
-        throw new VtuProviderError(
-            "Unsupported Data network.",
-            {
-                kind:
-                    "validation"
-            }
+    const normalizedPhoneNumber =
+        normalizePhoneNumber(
+            phoneNumber
         );
-
-    }
-
-
-    const normalizedPhone =
-        String(
-            phoneNumber ||
-            ""
-        ).trim();
-
-
-    if (!normalizedPhone) {
-
-        throw new VtuProviderError(
-            "Data phone number is required.",
-            {
-                kind:
-                    "validation"
-            }
-        );
-
-    }
-
 
     const normalizedVariationId =
-        String(
-            variationId ??
-            ""
-        ).trim();
-
-
-    if (!normalizedVariationId) {
-
-        throw new VtuProviderError(
-            "Data variation ID is required.",
-            {
-                kind:
-                    "validation"
-            }
+        normalizeVariationId(
+            variationId
         );
-
-    }
-
-
-    if (
-        normalizedVariationId.length >
-        100
-    ) {
-
-        throw new VtuProviderError(
-            "Data variation ID is too long.",
-            {
-                kind:
-                    "validation"
-            }
-        );
-
-    }
-
 
     return {
-
         transactionId:
             normalizedTransactionId,
-
         network:
             normalizedNetwork,
-
         phoneNumber:
-            normalizedPhone,
-
+            normalizedPhoneNumber,
         variationId:
             normalizedVariationId
-
     };
-
 }
 
+function assertVariationIdentity(
+    response,
+    requestedVariationId
+) {
+    if (
+        !response ||
+        !response.returnedVariationId
+    ) {
+        return;
+    }
 
-// =====================================================
-// PURCHASE DATA
-// =====================================================
-//
-// This function does NOT reserve or debit NovaPay money.
-//
-// The Data service must already have:
-//
-// 1. validated the customer request
-// 2. verified the selected variation
-// 3. determined the authoritative customer amount
-// 4. created the NovaPay Data transaction
-// 5. reserved the customer's wallet funds
-//
-// This adapter only sends the provider order.
-//
-// IMPORTANT:
-//
-// The customer amount is deliberately NOT sent to VTU.ng.
-//
-// VTU.ng determines the provider price from variation_id.
-// =====================================================
+    if (
+        response.returnedVariationId !==
+        requestedVariationId
+    ) {
+        throw createProviderError(
+            "VTU returned a different data variation.",
+            {
+                kind: "provider",
+                httpStatus:
+                    response.httpStatus,
+                providerCode:
+                    response.providerCode,
+                providerStatus:
+                    response.providerStatus,
+                providerReference:
+                    response.providerReference,
+                rawMessage:
+                    "Provider variation mismatch."
+            }
+        );
+    }
+}
 
 async function purchaseData({
     transactionId,
@@ -1399,423 +833,296 @@ async function purchaseData({
     phoneNumber,
     variationId
 }) {
-
     const input =
         validatePurchaseInput({
-
             transactionId,
-
             network,
-
             phoneNumber,
-
             variationId
-
         });
 
-
-    const providerRequestId =
+    const requestId =
         createProviderRequestId(
             input.transactionId
         );
 
-
-    let result;
-
-
-    try {
-
-        result =
-            await authenticatedRequest(
-                "data",
-                {
-
-                    method:
-                        "POST",
-
-                    body: {
-
-                        request_id:
-                            providerRequestId,
-
-                        phone:
-                            input.phoneNumber,
-
-                        service_id:
-                            input.network,
-
-                        variation_id:
-                            input.variationId
-
-                    }
-
-                }
-            );
-
-    }
-
-    catch (error) {
-
-        /*
-         * NEVER convert an uncertain provider operation
-         * into a confirmed failure.
-         *
-         * The Data service must keep the reservation
-         * protected and reconcile later.
-         */
-
-        if (
-            error instanceof
-            VtuProviderError
-        ) {
-
-            throw error;
-
-        }
-
-
-        throw new VtuProviderError(
-            "VTU.ng Data request could not be verified.",
+    const response =
+        await authenticatedRequest(
+            "/data",
             {
-                kind:
-                    "unknown"
+                method: "POST",
+                body: {
+                    request_id:
+                        requestId,
+                    phone:
+                        input.phoneNumber,
+                    service_id:
+                        input.network,
+                    variation_id:
+                        input.variationId
+                }
             }
         );
 
+    const payload =
+        await readJsonResponse(
+            response
+        );
+
+    if (
+        response.status === 401 ||
+        response.status === 403
+    ) {
+        throw createProviderError(
+            "VTU authentication was rejected.",
+            {
+                kind: "authentication",
+                httpStatus:
+                    response.status,
+                providerCode:
+                    getProviderCode(payload),
+                providerStatus:
+                    getProviderStatus(payload),
+                rawMessage:
+                    getProviderMessage(payload)
+            }
+        );
     }
 
+    if (!response.ok) {
+        const providerStatus =
+            getProviderStatus(payload);
+
+        const normalizedStatus =
+            normalizeProviderStatus(
+                providerStatus
+            );
+
+        if (
+            normalizedStatus ===
+            "failure"
+        ) {
+            return normalizeProviderResponse(
+                payload,
+                {
+                    requestedVariationId:
+                        input.variationId,
+                    httpStatus:
+                        response.status,
+                    requestId
+                }
+            );
+        }
+
+        throw createProviderError(
+            "VTU rejected the data request.",
+            {
+                kind:
+                    response.status >= 500
+                        ? "provider"
+                        : "rejected",
+                httpStatus:
+                    response.status,
+                providerCode:
+                    getProviderCode(payload),
+                providerStatus,
+                rawMessage:
+                    getProviderMessage(payload)
+            }
+        );
+    }
 
     const normalized =
         normalizeProviderResponse(
-            result.data,
-            result.response.status
+            payload,
+            {
+                requestedVariationId:
+                    input.variationId,
+                httpStatus:
+                    response.status,
+                requestId
+            }
         );
 
+    assertVariationIdentity(
+        normalized,
+        input.variationId
+    );
 
-    if (
-        normalized.outcome ===
-        "success"
-    ) {
-
-        return {
-
-            outcome:
-                "success",
-
-            providerRequestId,
-
-            providerReference:
-                normalized.providerReference,
-
-            providerCostKobo:
-                normalized.providerCostKobo,
-
-            providerStatus:
-                normalized.providerStatus,
-
-            providerCode:
-                normalized.providerCode,
-
-            providerVariationId:
-                normalized.variationId,
-
-            message:
-                normalized.message
-
-        };
-
-    }
-
-
-    if (
-        normalized.outcome ===
-        "failure"
-    ) {
-
-        return {
-
-            outcome:
-                "failure",
-
-            providerRequestId,
-
-            providerReference:
-                normalized.providerReference,
-
-            providerCostKobo:
-                normalized.providerCostKobo,
-
-            providerStatus:
-                normalized.providerStatus,
-
-            providerCode:
-                normalized.providerCode,
-
-            providerVariationId:
-                normalized.variationId,
-
-            message:
-                normalized.message ||
-                "VTU.ng confirmed that the Data order failed."
-
-        };
-
-    }
-
-
-    return {
-
-        outcome:
-            "unknown",
-
-        providerRequestId,
-
-        providerReference:
-            normalized.providerReference,
-
-        providerCostKobo:
-            normalized.providerCostKobo,
-
-        providerStatus:
-            normalized.providerStatus,
-
-        providerCode:
-            normalized.providerCode,
-
-        providerVariationId:
-            normalized.variationId,
-
-        message:
-            normalized.message ||
-            "VTU.ng is still processing the Data order."
-
-    };
-
+    return normalized;
 }
 
-
-// =====================================================
-// REQUERY DATA
-// =====================================================
-//
-// Uses the EXACT SAME deterministic request ID generated
-// from the original NovaPay transaction ID.
-//
-// This allows an uncertain Data order to be checked
-// without creating a second provider order.
-// =====================================================
-
-async function requeryData(
+async function requeryData({
     transactionId
-) {
-
+}) {
     const normalizedTransactionId =
         requireTransactionId(
             transactionId
         );
 
-
-    const providerRequestId =
+    const requestId =
         createProviderRequestId(
             normalizedTransactionId
         );
 
-
-    let result;
-
-
-    try {
-
-        result =
-            await authenticatedRequest(
-                "requery",
-                {
-
-                    method:
-                        "POST",
-
-                    body: {
-
-                        request_id:
-                            providerRequestId
-
-                    }
-
-                }
-            );
-
-    }
-
-    catch (error) {
-
-        if (
-            error instanceof
-            VtuProviderError
-        ) {
-
-            throw error;
-
-        }
-
-
-        throw new VtuProviderError(
-            "Unable to verify the VTU.ng Data order.",
-            {
-                kind:
-                    "unknown"
-            }
-        );
-
-    }
-
-
-    const normalized =
-        normalizeProviderResponse(
-            result.data,
-            result.response.status
-        );
-
-
-    return {
-
-        outcome:
-            normalized.outcome,
-
-        providerRequestId,
-
-        providerReference:
-            normalized.providerReference,
-
-        providerCostKobo:
-            normalized.providerCostKobo,
-
-        providerStatus:
-            normalized.providerStatus,
-
-        providerCode:
-            normalized.providerCode,
-
-        providerVariationId:
-            normalized.variationId,
-
-        message:
-            normalized.message
-
-    };
-
-}
-
-
-// =====================================================
-// PROVIDER WALLET BALANCE
-// =====================================================
-//
-// This is the VTU.ng reseller/provider wallet.
-//
-// It is NOT the NovaPay user's wallet.
-//
-// It must NEVER be used to determine whether the
-// customer has enough money in NovaPay.
-//
-// =====================================================
-
-async function getProviderBalance() {
-
-    const result =
+    const response =
         await authenticatedRequest(
-            "balance",
+            "/requery",
             {
-
-                method:
-                    "GET"
-
+                method: "POST",
+                body: {
+                    request_id:
+                        requestId
+                }
             }
         );
-
 
     const payload =
-        result.data?.data &&
-        typeof result.data.data ===
-            "object"
-            ? result.data.data
-            : result.data;
-
-
-    const balance =
-        Number(
-            payload?.balance
+        await readJsonResponse(
+            response
         );
 
-
     if (
-        !Number.isFinite(
-            balance
-        ) ||
-        balance < 0
+        response.status === 401 ||
+        response.status === 403
     ) {
+        throw createProviderError(
+            "VTU authentication was rejected.",
+            {
+                kind: "authentication",
+                httpStatus:
+                    response.status,
+                providerCode:
+                    getProviderCode(payload),
+                providerStatus:
+                    getProviderStatus(payload),
+                rawMessage:
+                    getProviderMessage(payload)
+            }
+        );
+    }
 
-        throw new VtuProviderError(
-            "VTU.ng returned an invalid wallet balance.",
+    if (!response.ok) {
+        const normalizedStatus =
+            normalizeProviderStatus(
+                getProviderStatus(payload)
+            );
+
+        if (
+            normalizedStatus ===
+            "failure"
+        ) {
+            return normalizeProviderResponse(
+                payload,
+                {
+                    httpStatus:
+                        response.status,
+                    requestId
+                }
+            );
+        }
+
+        throw createProviderError(
+            "VTU requery failed.",
             {
                 kind:
-                    "unknown",
-
+                    response.status >= 500
+                        ? "provider"
+                        : "rejected",
                 httpStatus:
-                    result.response.status
+                    response.status,
+                providerCode:
+                    getProviderCode(payload),
+                providerStatus:
+                    getProviderStatus(payload),
+                rawMessage:
+                    getProviderMessage(payload)
+            }
+        );
+    }
+
+    return normalizeProviderResponse(
+        payload,
+        {
+            httpStatus:
+                response.status,
+            requestId
+        }
+    );
+}
+
+async function getProviderBalance() {
+    const response =
+        await authenticatedRequest(
+            "/balance",
+            {
+                method: "GET"
             }
         );
 
+    const payload =
+        await readJsonResponse(
+            response
+        );
+
+    if (!response.ok) {
+        throw createProviderError(
+            "Unable to retrieve VTU balance.",
+            {
+                kind:
+                    response.status >= 500
+                        ? "provider"
+                        : "rejected",
+                httpStatus:
+                    response.status,
+                providerCode:
+                    getProviderCode(payload),
+                providerStatus:
+                    getProviderStatus(payload),
+                rawMessage:
+                    getProviderMessage(payload)
+            }
+        );
     }
 
+    const rawBalance =
+        payload?.balance ??
+        payload?.data?.balance ??
+        payload?.wallet_balance ??
+        payload?.data?.wallet_balance;
+
+    const balanceKobo =
+        nairaToKobo(
+            rawBalance
+        );
+
+    if (balanceKobo === null) {
+        throw createProviderError(
+            "VTU returned an invalid balance.",
+            {
+                kind: "unknown",
+                httpStatus:
+                    response.status
+            }
+        );
+    }
 
     return {
-
+        balanceKobo,
         balanceNaira:
-            balance,
-
-        balanceKobo:
-            Math.round(
-                balance *
-                100
-            ),
-
-        currency:
-            String(
-                payload?.currency ||
-                "NGN"
-            )
-                .trim()
-                .toUpperCase()
-
+            balanceKobo / 100
     };
-
 }
 
-
-// =====================================================
-// EXPORTS
-// =====================================================
-
 module.exports = {
-
+    VtuProviderError,
     purchaseData,
-
     requeryData,
-
     getProviderBalance,
-
     getAccessToken,
-
     clearAccessToken,
-
     createProviderRequestId,
-
     normalizeProviderStatus,
-
     normalizeProviderResponse,
-
-    nairaToKobo,
-
-    VtuProviderError
-
+    nairaToKobo
 };

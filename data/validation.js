@@ -4,245 +4,620 @@
  * NovaPay Data Validation
  *
  * Responsibility:
- * - Validate and normalize incoming Data purchase input.
- * - Reject malformed or unsafe values before they reach the service/provider.
+ * - Validate and normalize customer-supplied Data purchase input.
+ * - Validate identifiers and basic request structure.
+ * - Normalize Nigerian phone numbers.
+ * - Validate currency.
  *
- * This file MUST NOT:
- * - modify wallets
- * - create transactions
- * - call providers
- * - calculate or modify profit
- * - trust client-supplied financial state
+ * IMPORTANT:
+ * - This module does NOT determine Data plan price.
+ * - This module does NOT determine provider cost.
+ * - This module does NOT determine Data amount.
+ * - This module does NOT determine validity.
+ * - This module does NOT determine availability.
+ * - This module does NOT determine the provider variation.
+ *
+ * Those values belong to the authoritative backend catalog
+ * and provider layers.
+ *
+ * Purchase authority:
+ *
+ *     client input
+ *          ↓
+ *     validation
+ *          ↓
+ *     authoritative catalog
+ *          ↓
+ *     exact NovaPay product
+ *          ↓
+ *     exact VTU variation
  */
+
+
+// =====================================================
+// CONSTANTS
+// =====================================================
 
 const SUPPORTED_NETWORKS = Object.freeze([
     "mtn",
-    "glo",
     "airtel",
+    "glo",
     "9mobile"
 ]);
 
-const MIN_AMOUNT_KOBO = 100; // ₦1.00
-const MAX_AMOUNT_KOBO = 5_000_000; // ₦50,000.00
+const SUPPORTED_CURRENCY =
+    "NGN";
 
-const MAX_PHONE_DIGITS = 11;
+const MAX_PHONE_DIGITS =
+    11;
 
-function createValidationError(message, field = null) {
-    const error = new Error(message);
-    error.code = "VALIDATION_ERROR";
-    error.statusCode = 400;
+const MAX_PLAN_ID_LENGTH =
+    150;
 
-    if (field) {
-        error.field = field;
-    }
+const MAX_REFERENCE_LENGTH =
+    150;
+
+
+// =====================================================
+// ERROR HELPER
+// =====================================================
+
+function createValidationError(
+    message,
+    code = "INVALID_DATA_REQUEST"
+) {
+
+    const error =
+        new Error(
+            message
+        );
+
+    error.statusCode =
+        400;
+
+    error.code =
+        code;
 
     return error;
+
 }
 
-function normalizeString(value) {
-    if (typeof value !== "string") {
+
+// =====================================================
+// STRING NORMALIZATION
+// =====================================================
+
+function normalizeString(
+    value
+) {
+
+    if (
+        typeof value !==
+        "string"
+    ) {
         return "";
     }
 
     return value.trim();
+
 }
 
-function normalizeNetwork(value) {
-    const network = normalizeString(value).toLowerCase();
 
-    if (!SUPPORTED_NETWORKS.includes(network)) {
-        throw createValidationError(
-            "Unsupported network.",
-            "network"
-        );
-    }
+// =====================================================
+// NETWORK
+// =====================================================
+//
+// Network is accepted only as request context.
+//
+// The authoritative plan lookup must still verify that
+// the selected plan actually belongs to the requested
+// network.
+//
+// =====================================================
 
-    return network;
-}
+function normalizeNetwork(
+    value
+) {
 
-function normalizePhoneNumber(value) {
-    const raw = normalizeString(value);
+    const network =
+        normalizeString(
+            value
+        ).toLowerCase();
 
-    if (!raw) {
-        throw createValidationError(
-            "Phone number is required.",
-            "phoneNumber"
-        );
-    }
-
-    // Accept common Nigerian formats:
-    // 08012345678
-    // 8012345678
-    // +2348012345678
-    // 2348012345678
-    let normalized = raw.replace(/[\s\-().]/g, "");
-
-    if (normalized.startsWith("+234")) {
-        normalized = `0${normalized.slice(4)}`;
-    } else if (normalized.startsWith("234")) {
-        normalized = `0${normalized.slice(3)}`;
-    }
-
-    if (!/^0\d{10}$/.test(normalized)) {
-        throw createValidationError(
-            "Enter a valid Nigerian phone number.",
-            "phoneNumber"
-        );
-    }
-
-    if (normalized.length !== MAX_PHONE_DIGITS) {
-        throw createValidationError(
-            "Enter a valid Nigerian phone number.",
-            "phoneNumber"
-        );
-    }
-
-    return normalized;
-}
-
-function parseAmountKobo(value) {
-    let amountKobo;
-
-    if (typeof value === "number") {
-        amountKobo = value;
-    } else if (
-        typeof value === "string" &&
-        /^\d+$/.test(value.trim())
+    if (
+        !network
     ) {
-        amountKobo = Number(value.trim());
-    } else {
-        throw createValidationError(
-            "Amount must be a valid integer in kobo.",
-            "amountKobo"
-        );
-    }
 
-    if (!Number.isSafeInteger(amountKobo)) {
         throw createValidationError(
-            "Amount is outside the supported range.",
-            "amountKobo"
+            "Data network is required.",
+            "DATA_NETWORK_REQUIRED"
         );
+
     }
 
     if (
-        amountKobo < MIN_AMOUNT_KOBO ||
-        amountKobo > MAX_AMOUNT_KOBO
+        !SUPPORTED_NETWORKS.includes(
+            network
+        )
     ) {
+
         throw createValidationError(
-            "Amount is outside the supported Data purchase range.",
-            "amountKobo"
+            "Unsupported Data network.",
+            "UNSUPPORTED_DATA_NETWORK"
         );
+
     }
 
-    return amountKobo;
+    return network;
+
 }
 
-function normalizePlanId(value) {
-    const planId = normalizeString(value);
 
-    if (!planId) {
-        throw createValidationError(
-            "Data plan is required.",
-            "planId"
+// =====================================================
+// PHONE NUMBER
+// =====================================================
+//
+// Accepted examples:
+//
+//     08012345678
+//     8012345678
+//     +2348012345678
+//     2348012345678
+//
+// Normalized output:
+//
+//     08012345678
+//
+// Separators such as spaces, hyphens, dots and parentheses
+// are removed.
+//
+// The provider layer will perform any additional provider-
+// specific validation required before fulfillment.
+// =====================================================
+
+function normalizePhoneNumber(
+    value
+) {
+
+    let phone =
+        normalizeString(
+            value
         );
+
+    if (
+        !phone
+    ) {
+
+        throw createValidationError(
+            "Data phone number is required.",
+            "DATA_PHONE_REQUIRED"
+        );
+
     }
 
     /*
-     * Plan IDs are identifiers, not arbitrary user-generated text.
+     * Remove common formatting characters.
      *
-     * Keep the accepted character set intentionally narrow so values
-     * cannot contain unexpected control characters or excessive data.
+     * We deliberately do not remove arbitrary characters.
+     * After these known separators are removed, anything
+     * else must still result in a numeric phone number.
      */
-    if (!/^[A-Za-z0-9._:-]{1,100}$/.test(planId)) {
-        throw createValidationError(
-            "Invalid Data plan.",
-            "planId"
+
+    phone =
+        phone.replace(
+            /[\s().-]/g,
+            ""
         );
+
+    /*
+     * Convert international Nigerian format to the local
+     * 11-digit format used throughout NovaPay.
+     */
+
+    if (
+        phone.startsWith(
+            "+234"
+        )
+    ) {
+
+        phone =
+            "0" +
+            phone.slice(
+                4
+            );
+
+    } else if (
+        phone.startsWith(
+            "234"
+        )
+    ) {
+
+        phone =
+            "0" +
+            phone.slice(
+                3
+            );
+
+    } else if (
+        phone.startsWith(
+            "80"
+        ) &&
+        phone.length ===
+        10
+    ) {
+
+        phone =
+            "0" +
+            phone;
+
+    }
+
+    /*
+     * Nigerian local mobile numbers must contain exactly
+     * 11 digits after normalization.
+     */
+
+    if (
+        !/^\d+$/.test(
+            phone
+        ) ||
+        phone.length !==
+        MAX_PHONE_DIGITS
+    ) {
+
+        throw createValidationError(
+            "Enter a valid Nigerian phone number.",
+            "INVALID_DATA_PHONE"
+        );
+
+    }
+
+    /*
+     * Local Nigerian mobile numbers begin with 0 followed
+     * by a valid Nigerian mobile-network prefix.
+     *
+     * The network-specific provider validation remains in
+     * the provider/catalog layer because the actual product
+     * selected by the customer determines the network.
+     */
+
+    if (
+        !/^0[789]\d{9}$/.test(
+            phone
+        )
+    ) {
+
+        throw createValidationError(
+            "Enter a valid Nigerian phone number.",
+            "INVALID_DATA_PHONE"
+        );
+
+    }
+
+    return phone;
+
+}
+
+
+// =====================================================
+// PLAN ID
+// =====================================================
+//
+// The plan ID identifies the product the customer selected.
+//
+// IMPORTANT:
+//
+// The client supplies identity only.
+//
+// The backend later resolves this ID to:
+//
+//     NovaPay product
+//     ↓
+//     exact provider variation
+//     ↓
+//     authoritative price
+//     ↓
+//     authoritative data amount
+//     ↓
+//     authoritative validity
+//
+// No price or product attributes are trusted from the
+// client.
+// =====================================================
+
+function normalizePlanId(
+    value
+) {
+
+    const planId =
+        normalizeString(
+            value
+        );
+
+    if (
+        !planId
+    ) {
+
+        throw createValidationError(
+            "Data plan is required.",
+            "DATA_PLAN_REQUIRED"
+        );
+
+    }
+
+    if (
+        planId.length >
+        MAX_PLAN_ID_LENGTH
+    ) {
+
+        throw createValidationError(
+            "Data plan ID is too long.",
+            "INVALID_DATA_PLAN_ID"
+        );
+
+    }
+
+    /*
+     * Restrict plan IDs to a predictable identifier format.
+     *
+     * Allowed:
+     *
+     *     letters
+     *     numbers
+     *     dot
+     *     underscore
+     *     colon
+     *     hyphen
+     *
+     * This prevents arbitrary strings from becoming
+     * backend product identifiers.
+     */
+
+    if (
+        !/^[A-Za-z0-9._:-]+$/.test(
+            planId
+        )
+    ) {
+
+        throw createValidationError(
+            "Invalid Data plan ID.",
+            "INVALID_DATA_PLAN_ID"
+        );
+
     }
 
     return planId;
+
 }
 
-function normalizeReference(value) {
-    const reference = normalizeString(value);
 
-    if (!reference) {
+// =====================================================
+// CLIENT REFERENCE
+// =====================================================
+//
+// A client reference can be used as an idempotency/correlation
+// value.
+//
+// It is NOT:
+//
+//     - a payment proof
+//     - a transaction ID
+//     - a wallet authorization
+//     - a provider request ID
+//
+// NovaPay creates the authoritative transaction ID itself.
+// =====================================================
+
+function normalizeReference(
+    value
+) {
+
+    if (
+        value ===
+        null ||
+        value ===
+        undefined
+    ) {
+
         return null;
+
     }
 
-    if (reference.length > 150) {
-        throw createValidationError(
-            "Reference is too long.",
-            "reference"
+    const reference =
+        normalizeString(
+            value
         );
+
+    if (
+        !reference
+    ) {
+
+        return null;
+
     }
 
-    /*
-     * The reference is useful for idempotency when supplied by our
-     * trusted client flow, but it is NEVER used as proof of payment
-     * or proof of wallet ownership.
-     */
-    if (!/^[A-Za-z0-9._:-]+$/.test(reference)) {
+    if (
+        reference.length >
+        MAX_REFERENCE_LENGTH
+    ) {
+
         throw createValidationError(
-            "Invalid reference.",
-            "reference"
+            "Data purchase reference is too long.",
+            "INVALID_REFERENCE"
         );
+
+    }
+
+    if (
+        !/^[A-Za-z0-9._:-]+$/.test(
+            reference
+        )
+    ) {
+
+        throw createValidationError(
+            "Invalid Data purchase reference.",
+            "INVALID_REFERENCE"
+        );
+
     }
 
     return reference;
+
 }
 
-function validateCurrency(value) {
-    if (value === undefined || value === null || value === "") {
-        return "NGN";
+
+// =====================================================
+// CURRENCY
+// =====================================================
+//
+// NovaPay Data wallet accounting currently operates in NGN.
+// The client cannot select another currency.
+// =====================================================
+
+function validateCurrency(
+    value
+) {
+
+    const currency =
+        normalizeString(
+            value
+        ).toUpperCase();
+
+    /*
+     * Currency may be omitted by the client because NGN is
+     * the only supported Data purchase currency.
+     */
+
+    if (
+        !currency
+    ) {
+
+        return SUPPORTED_CURRENCY;
+
     }
 
-    const currency = normalizeString(value).toUpperCase();
+    if (
+        currency !==
+        SUPPORTED_CURRENCY
+    ) {
 
-    if (currency !== "NGN") {
         throw createValidationError(
-            "Only NGN is supported.",
-            "currency"
+            "Unsupported currency.",
+            "UNSUPPORTED_CURRENCY"
         );
+
     }
 
-    return currency;
+    return SUPPORTED_CURRENCY;
+
 }
 
-function validatePurchaseInput(input) {
-    if (!input || typeof input !== "object" || Array.isArray(input)) {
-        throw createValidationError(
-            "Invalid Data purchase request."
-        );
-    }
 
-    const network = normalizeNetwork(input.network);
-    const phoneNumber = normalizePhoneNumber(input.phoneNumber);
-    const planId = normalizePlanId(input.planId);
-    const amountKobo = parseAmountKobo(input.amountKobo);
-    const currency = validateCurrency(input.currency);
-    const reference = normalizeReference(input.reference);
+// =====================================================
+// PURCHASE INPUT
+// =====================================================
+//
+// Final customer input contract:
+//
+//     {
+//         network,
+//         phoneNumber,
+//         planId,
+//         currency,
+//         reference
+//     }
+//
+// `amountKobo` is deliberately NOT accepted as an
+// authoritative purchase field.
+//
+// The backend catalog determines the customer price.
+// =====================================================
+
+function validatePurchaseInput({
+    network,
+    phoneNumber,
+    planId,
+    currency,
+    reference
+} = {}) {
+
+    const normalizedNetwork =
+        normalizeNetwork(
+            network
+        );
+
+    const normalizedPhoneNumber =
+        normalizePhoneNumber(
+            phoneNumber
+        );
+
+    const normalizedPlanId =
+        normalizePlanId(
+            planId
+        );
+
+    const normalizedCurrency =
+        validateCurrency(
+            currency
+        );
+
+    const normalizedReference =
+        normalizeReference(
+            reference
+        );
 
     return Object.freeze({
-        network,
-        phoneNumber,
-        planId,
-        amountKobo,
-        currency,
-        reference
+
+        network:
+            normalizedNetwork,
+
+        phoneNumber:
+            normalizedPhoneNumber,
+
+        planId:
+            normalizedPlanId,
+
+        currency:
+            normalizedCurrency,
+
+        reference:
+            normalizedReference
+
     });
+
 }
 
+
+// =====================================================
+// EXPORTS
+// =====================================================
+
 module.exports = Object.freeze({
+
     SUPPORTED_NETWORKS,
-    MIN_AMOUNT_KOBO,
-    MAX_AMOUNT_KOBO,
+
+    SUPPORTED_CURRENCY,
+
+    MAX_PHONE_DIGITS,
+
+    MAX_PLAN_ID_LENGTH,
+
+    MAX_REFERENCE_LENGTH,
+
     createValidationError,
+
+    normalizeString,
+
     normalizeNetwork,
+
     normalizePhoneNumber,
-    parseAmountKobo,
+
     normalizePlanId,
+
     normalizeReference,
+
     validateCurrency,
+
     validatePurchaseInput
+
 });
