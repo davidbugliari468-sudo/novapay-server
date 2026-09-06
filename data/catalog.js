@@ -178,6 +178,43 @@ function normalizeValidity(rawPlan) {
   return validity;
 }
 
+function normalizeProviderStatus(rawPlan) {
+  /*
+   * The current BabsPay /api/data_plans response observed
+   * in production does not include a status field.
+   *
+   * When BabsPay explicitly provides a status:
+   * - active = sellable
+   * - inactive/disabled/etc. = not sellable
+   *
+   * When the field is absent, the plan is accepted because
+   * it came directly from the current provider catalogue.
+   */
+  if (
+    rawPlan.status === undefined ||
+    rawPlan.status === null ||
+    String(rawPlan.status).trim() === ""
+  ) {
+    return "active";
+  }
+
+  const status = String(
+    rawPlan.status
+  )
+    .trim()
+    .toLowerCase();
+
+  if (
+    status === "active" ||
+    status === "enabled" ||
+    status === "available"
+  ) {
+    return "active";
+  }
+
+  return null;
+}
+
 function normalizePlan(rawPlan) {
   if (!rawPlan || typeof rawPlan !== "object") {
     const error = new Error(
@@ -194,16 +231,15 @@ function normalizePlan(rawPlan) {
     "plan_id"
   );
 
-  /*
-   * Only explicitly active BabsPay plans are sellable.
-   */
-  const status = String(
-    rawPlan.status ?? ""
-  )
-    .trim()
-    .toLowerCase();
+  const status =
+    normalizeProviderStatus(rawPlan);
 
-  if (status !== "active") {
+  /*
+   * Explicitly unavailable provider plans are ignored.
+   * Missing status is handled as active by
+   * normalizeProviderStatus().
+   */
+  if (!status) {
     return null;
   }
 
@@ -272,7 +308,8 @@ function normalizeCatalogue(rawPlans) {
       normalizePlan(rawPlan);
 
     /*
-     * Inactive provider plans are ignored.
+     * Explicitly inactive/unavailable provider
+     * plans are ignored.
      */
     if (!plan) {
       continue;
@@ -388,20 +425,6 @@ async function loadCatalogue({
     }
   );
 
-  /*
-   * BabsPay requires the network query parameter
-   * for the network-specific catalogue:
-   *
-   * 1 = MTN
-   * 2 = Glo
-   * 3 = Airtel
-   * 4 = 9mobile
-   *
-   * When no network is supplied, the provider may
-   * return an unusable/empty catalogue. Therefore,
-   * customer-facing catalogue requests should supply
-   * the selected network.
-   */
   const rawPlans =
     await getDataPlans({
       network:
@@ -535,11 +558,6 @@ async function getPlanById(
       "plan_id"
     );
 
-  /*
-   * Purchase lookups need the complete
-   * provider catalogue when no network is
-   * explicitly supplied.
-   */
   const plans =
     await loadCatalogue({
       network:
