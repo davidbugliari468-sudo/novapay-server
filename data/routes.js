@@ -3,655 +3,346 @@
 const express = require("express");
 
 const {
-    purchaseDataForCustomer,
-    getTransaction,
-    getDataPlans
+    purchaseData,
+    getPurchaseStatus
 } = require("./service");
 
-const router = express.Router();
+const {
+    validateUid
+} = require("./validation");
 
-const MAX_BODY_KEYS = 20;
-
-function resolveAuthMiddleware() {
-    try {
-        const authModule =
-            require("../auth");
-
-        if (
-            typeof authModule.requireAuth ===
-            "function"
-        ) {
-            return authModule.requireAuth;
-        }
-    } catch {
-        // Authentication middleware will be handled
-        // by the explicit configuration check below.
+function createDataRouter(requireAuth) {
+    if (typeof requireAuth !== "function") {
+        throw new Error(
+            "createDataRouter requires requireAuth middleware."
+        );
     }
 
-    throw new Error(
-        "Data routes could not load the authentication middleware."
+    const router = express.Router();
+
+    /*
+     * POST /api/data/purchase
+     *
+     * Customer submits:
+     * {
+     *   network: "1",
+     *   phoneNumber: "08012345678",
+     *   planId: "123",
+     *   reference: "..."
+     * }
+     *
+     * The server obtains the authoritative plan and
+     * price from BabsPay. The client never supplies
+     * the amount to debit.
+     */
+    router.post(
+        "/purchase",
+        requireAuth,
+        async (req, res) => {
+            try {
+                const uid =
+                    req.user &&
+                    (
+                        req.user.uid ||
+                        req.user.userId
+                    );
+
+                validateUid(uid);
+
+                const body =
+                    req.body || {};
+
+                const result =
+                    await purchaseData({
+                        uid,
+                        network:
+                            body.network,
+                        phoneNumber:
+                            body.phoneNumber,
+                        planId:
+                            body.planId,
+                        reference:
+                            body.reference
+                    });
+
+                return res.status(
+                    result.httpStatus ||
+                    200
+                ).json({
+                    ok:
+                        true,
+
+                    status:
+                        result.status,
+
+                    transactionId:
+                        result.transactionId,
+
+                    reference:
+                        result.reference,
+
+                    reservationId:
+                        result.reservationId,
+
+                    plan:
+                        result.plan,
+
+                    customerPriceKobo:
+                        result.customerPriceKobo,
+
+                    message:
+                        result.message ||
+                        getCustomerMessage(
+                            result.status
+                        )
+                });
+            } catch (error) {
+                return handleRouteError(
+                    res,
+                    error
+                );
+            }
+        }
     );
+
+    /*
+     * GET /api/data/status/:transactionId
+     *
+     * Used by the frontend to check a purchase that
+     * is pending/unknown without exposing internal
+     * provider details.
+     */
+    router.get(
+        "/status/:transactionId",
+        requireAuth,
+        async (req, res) => {
+            try {
+                const uid =
+                    req.user &&
+                    (
+                        req.user.uid ||
+                        req.user.userId
+                    );
+
+                validateUid(uid);
+
+                const transactionId =
+                    String(
+                        req.params.transactionId ||
+                        ""
+                    ).trim();
+
+                if (
+                    !transactionId ||
+                    transactionId.length > 200
+                ) {
+                    return res.status(400).json({
+                        ok:
+                            false,
+                        error:
+                            "Invalid transaction ID."
+                    });
+                }
+
+                const result =
+                    await getPurchaseStatus({
+                        uid,
+                        transactionId
+                    });
+
+                return res.status(
+                    200
+                ).json({
+                    ok:
+                        true,
+
+                    status:
+                        result.status,
+
+                    transactionId:
+                        result.transactionId,
+
+                    reference:
+                        result.reference,
+
+                    plan:
+                        result.plan,
+
+                    customerPriceKobo:
+                        result.customerPriceKobo,
+
+                    message:
+                        result.message ||
+                        getCustomerMessage(
+                            result.status
+                        )
+                });
+            } catch (error) {
+                return handleRouteError(
+                    res,
+                    error
+                );
+            }
+        }
+    );
+
+    return router;
 }
 
-const requireAuth =
-    resolveAuthMiddleware();
-
-function getAuthenticatedUid(
-    req
+function getCustomerMessage(
+    status
 ) {
-    const uid =
-        req?.user?.uid ||
-        req?.auth?.uid ||
-        req?.firebaseUser?.uid;
+    switch (status) {
+        case "successful":
+            return "Data purchase successful.";
 
-    if (
-        typeof uid !== "string" ||
-        !uid.trim()
-    ) {
-        const error =
-            new Error(
-                "Authenticated user ID is missing."
+        case "pending":
+            return "Your data purchase is being processed.";
+
+        case "unknown":
+            return "Your data purchase is still being verified.";
+
+        case "failed":
+        case "reversed":
+            return "Data purchase was not completed.";
+
+        default:
+            return "Unable to determine the current transaction status.";
+    }
+}
+
+function handleRouteError(
+    res,
+    error
+) {
+    const code =
+        error &&
+        error.code;
+
+    switch (code) {
+        case "INVALID_UID":
+        case "INVALID_NETWORK":
+        case "INVALID_PHONE":
+        case "INVALID_PHONE_NUMBER":
+        case "INVALID_PLAN_ID":
+        case "INVALID_REFERENCE":
+            return res.status(400).json({
+                ok:
+                    false,
+                error:
+                    "Invalid Data purchase information."
+            });
+
+        case "PLAN_NOT_FOUND":
+        case "PLAN_INACTIVE":
+        case "PLAN_NETWORK_MISMATCH":
+            return res.status(400).json({
+                ok:
+                    false,
+                error:
+                    "The selected Data plan is no longer available. Please refresh and try again."
+            });
+
+        case "INSUFFICIENT_WALLET_BALANCE":
+            return res.status(400).json({
+                ok:
+                    false,
+                error:
+                    "Insufficient wallet balance."
+            });
+
+        case "RESERVATION_TRANSACTION_MISMATCH":
+        case "RESERVATION_METADATA_MISMATCH":
+        case "INVALID_RESERVATION_STATE":
+        case "MISSING_RESERVATION_ID":
+            console.error(
+                "Data reservation integrity error:",
+                code
             );
 
-        error.code =
-            "AUTH_REQUIRED";
-
-        error.statusCode =
-            401;
-
-        throw error;
-    }
-
-    return uid.trim();
-}
-
-function createRouteError(
-    message,
-    code,
-    statusCode = 400
-) {
-    const error =
-        new Error(message);
-
-    error.code =
-        code;
-
-    error.statusCode =
-        statusCode;
-
-    return error;
-}
-
-function validateRequestBody(
-    req
-) {
-    if (
-        !req.body ||
-        typeof req.body !== "object" ||
-        Array.isArray(req.body)
-    ) {
-        throw createRouteError(
-            "Invalid request body.",
-            "INVALID_REQUEST_BODY",
-            400
-        );
-    }
-
-    const keys =
-        Object.keys(
-            req.body
-        );
-
-    if (
-        keys.length >
-        MAX_BODY_KEYS
-    ) {
-        throw createRouteError(
-            "Invalid request body.",
-            "INVALID_REQUEST_BODY",
-            400
-        );
-    }
-
-    return req.body;
-}
-
-function getStringField(
-    body,
-    fieldName,
-    {
-        required = true,
-        maxLength = 200
-    } = {}
-) {
-    const value =
-        body[fieldName];
-
-    if (
-        value === undefined ||
-        value === null
-    ) {
-        if (!required) {
-            return null;
-        }
-
-        throw createRouteError(
-            `${fieldName} is required.`,
-            `MISSING_${fieldName
-                .toUpperCase()
-                .replace(/[^A-Z0-9]+/g, "_")}`,
-            400
-        );
-    }
-
-    if (
-        typeof value !== "string"
-    ) {
-        throw createRouteError(
-            `Invalid ${fieldName}.`,
-            `INVALID_${fieldName
-                .toUpperCase()
-                .replace(/[^A-Z0-9]+/g, "_")}`,
-            400
-        );
-    }
-
-    const normalized =
-        value.trim();
-
-    if (
-        required &&
-        !normalized
-    ) {
-        throw createRouteError(
-            `${fieldName} is required.`,
-            `MISSING_${fieldName
-                .toUpperCase()
-                .replace(/[^A-Z0-9]+/g, "_")}`,
-            400
-        );
-    }
-
-    if (
-        normalized.length >
-        maxLength
-    ) {
-        throw createRouteError(
-            `Invalid ${fieldName}.`,
-            `INVALID_${fieldName
-                .toUpperCase()
-                .replace(/[^A-Z0-9]+/g, "_")}`,
-            400
-        );
-    }
-
-    return normalized || null;
-}
-
-function normalizeNetwork(
-    value
-) {
-    const normalized =
-        getStringField(
-            {
-                network: value
-            },
-            "network",
-            {
-                required: true,
-                maxLength: 20
-            }
-        );
-
-    const allowed =
-        new Set([
-            "mtn",
-            "airtel",
-            "glo",
-            "9mobile"
-        ]);
-
-    if (
-        !allowed.has(
-            normalized.toLowerCase()
-        )
-    ) {
-        throw createRouteError(
-            "Unsupported network.",
-            "INVALID_NETWORK",
-            400
-        );
-    }
-
-    return normalized.toLowerCase();
-}
-
-function getSafeCustomerError(
-    error
-) {
-    const safeMessages =
-        new Map([
-            [
-                "AUTH_REQUIRED",
-                "Authentication is required."
-            ],
-            [
-                "INVALID_REQUEST_BODY",
-                "Invalid request."
-            ],
-            [
-                "MISSING_NETWORK",
-                "Please select a network."
-            ],
-            [
-                "INVALID_NETWORK",
-                "Please select a valid network."
-            ],
-            [
-                "MISSING_PHONENUMBER",
-                "Please enter a valid phone number."
-            ],
-            [
-                "INVALID_PHONENUMBER",
-                "Please enter a valid phone number."
-            ],
-            [
-                "MISSING_PLANID",
-                "Please select a data plan."
-            ],
-            [
-                "INVALID_PLANID",
-                "Please select a valid data plan."
-            ],
-            [
-                "MISSING_REFERENCE",
-                "Invalid transaction reference."
-            ],
-            [
-                "INVALID_REFERENCE",
-                "Invalid transaction reference."
-            ],
-            [
-                "DATA_PLAN_NOT_FOUND",
-                "This data plan is no longer available."
-            ],
-            [
-                "DATA_PLAN_UNAVAILABLE",
-                "This data plan is currently unavailable."
-            ],
-            [
-                "DATA_PLAN_CHANGED",
-                "This data plan has changed. Please refresh and try again."
-            ],
-            [
-                "DATA_PLAN_PRICE_CHANGED",
-                "The price of this data plan has changed. Please refresh and try again."
-            ],
-            [
-                "DATA_PLAN_NETWORK_MISMATCH",
-                "The selected data plan does not match the selected network."
-            ],
-            [
-                "DATA_PROVIDER_REJECTED",
-                "Data purchase could not be completed."
-            ],
-            [
-                "DATA_RECONCILIATION_REQUIRED",
-                "Your data purchase is being confirmed. Please check your transaction history shortly."
-            ],
-            [
-                "DATA_COMMIT_RECONCILIATION_REQUIRED",
-                "Your data purchase was received and is being finalized."
-            ],
-            [
-                "INSUFFICIENT_WALLET_BALANCE",
-                "Insufficient wallet balance."
-            ],
-            [
-                "WALLET_NOT_FOUND",
-                "Your wallet could not be found."
-            ],
-            [
-                "INVALID_AMOUNT",
-                "Invalid transaction amount."
-            ],
-            [
-                "RESERVATION_FAILED",
-                "Unable to reserve funds for this purchase."
-            ]
-        ]);
-
-    if (
-        error?.code &&
-        safeMessages.has(
-            error.code
-        )
-    ) {
-        return safeMessages.get(
-            error.code
-        );
-    }
-
-    return "Data purchase could not be completed.";
-}
-
-function getStatusCode(
-    error
-) {
-    const statusCode =
-        Number(error?.statusCode);
-
-    if (
-        Number.isInteger(statusCode) &&
-        statusCode >= 400 &&
-        statusCode <= 599
-    ) {
-        return statusCode;
-    }
-
-    if (
-        error?.code ===
-        "AUTH_REQUIRED"
-    ) {
-        return 401;
-    }
-
-    if (
-        error?.code ===
-        "DATA_PLAN_CHANGED" ||
-        error?.code ===
-        "DATA_PLAN_PRICE_CHANGED" ||
-        error?.code ===
-        "DATA_PLAN_UNAVAILABLE" ||
-        error?.code ===
-        "DATA_PLAN_NOT_FOUND"
-    ) {
-        return 409;
-    }
-
-    return 400;
-}
-
-/*
- * GET /api/data/plans
- *
- * Returns the current server-authoritative Data catalog.
- *
- * The frontend may display these plans, but it must
- * send only the plan identity back when purchasing.
- */
-router.get(
-    "/plans",
-    requireAuth,
-    async (req, res) => {
-        try {
-            const forceRefresh =
-                req.query?.refresh === "true";
-
-            const plans =
-                await getDataPlans({
-                    forceRefresh
-                });
-
-            return res.status(200).json({
-                success: true,
-                plans
+            return res.status(500).json({
+                ok:
+                    false,
+                error:
+                    "We could not safely complete this transaction. Please try again or contact support."
             });
-        } catch (error) {
+
+        case "PROVIDER_AUTH_ERROR":
             console.error(
-                "Data catalog error:",
-                {
-                    code:
-                        error?.code ||
-                        "UNKNOWN",
-                    message:
-                        error?.message ||
-                        "Unknown error"
-                }
+                "BabsPay authentication error."
             );
 
             return res.status(503).json({
-                success: false,
+                ok:
+                    false,
                 error:
-                    "Data plans are temporarily unavailable. Please try again later."
+                    "Data service is temporarily unavailable."
             });
-        }
-    }
-);
 
-/*
- * POST /api/data/purchase
- *
- * Expected body:
- *
- * {
- *   "network": "mtn",
- *   "phoneNumber": "08012345678",
- *   "planId": "provider-variation-id",
- *   "reference": "optional-client-reference"
- * }
- *
- * IMPORTANT:
- * There is intentionally NO amount field.
- *
- * The server obtains the authoritative customer price
- * from the Data catalog.
- */
-router.post(
-    "/purchase",
-    requireAuth,
-    async (req, res) => {
-        try {
-            const body =
-                validateRequestBody(
-                    req
-                );
+        case "PROVIDER_RATE_LIMIT":
+            return res.status(503).json({
+                ok:
+                    false,
+                error:
+                    "Data service is temporarily busy. Please try again shortly."
+            });
 
-            const network =
-                normalizeNetwork(
-                    body.network
-                );
-
-            const phoneNumber =
-                getStringField(
-                    body,
-                    "phoneNumber",
-                    {
-                        required: true,
-                        maxLength: 30
-                    }
-                );
-
-            const planId =
-                getStringField(
-                    body,
-                    "planId",
-                    {
-                        required: true,
-                        maxLength: 150
-                    }
-                );
-
-            const reference =
-                getStringField(
-                    body,
-                    "reference",
-                    {
-                        required: false,
-                        maxLength: 150
-                    }
-                );
-
-            const uid =
-                getAuthenticatedUid(
-                    req
-                );
-
-            const result =
-                await purchaseDataForCustomer({
-                    uid,
-                    network,
-                    phoneNumber,
-                    planId,
-                    reference
-                });
-
-            if (
-                result.status ===
-                "successful"
-            ) {
-                return res.status(200).json({
-                    success: true,
-                    status: "successful",
-                    transactionId:
-                        result.transactionId,
-                    reference:
-                        result.reference,
-                    plan:
-                        result.plan,
-                    message:
-                        result.message
-                });
-            }
-
-            if (
-                result.status ===
-                "pending"
-            ) {
-                return res.status(202).json({
-                    success: false,
-                    status: "pending",
-                    transactionId:
-                        result.transactionId,
-                    reference:
-                        result.reference,
-                    message:
-                        result.message
-                });
-            }
-
-            return res.status(400).json({
-                success: false,
+        case "PROVIDER_TIMEOUT":
+        case "PROVIDER_NETWORK_ERROR":
+        case "PROVIDER_REQUERY_UNAVAILABLE":
+            return res.status(202).json({
+                ok:
+                    true,
                 status:
-                    result.status ||
-                    "failed",
-                transactionId:
-                    result.transactionId ||
-                    null,
-                reference:
-                    result.reference ||
-                    null,
+                    "unknown",
+                message:
+                    "Your request is being verified. Please check the transaction status shortly."
+            });
+
+        case "PROVIDER_FAILURE":
+        case "DATA_PURCHASE_FAILED":
+            return res.status(400).json({
+                ok:
+                    false,
                 error:
                     "Data purchase could not be completed."
             });
-        } catch (error) {
+
+        case "TRANSACTION_NOT_FOUND":
+            return res.status(404).json({
+                ok:
+                    false,
+                error:
+                    "Data transaction not found."
+            });
+
+        case "UNAUTHORIZED":
+        case "FORBIDDEN":
+            return res.status(403).json({
+                ok:
+                    false,
+                error:
+                    "You are not authorized to access this transaction."
+            });
+
+        default:
             console.error(
-                "Data purchase error:",
-                {
-                    code:
-                        error?.code ||
-                        "UNKNOWN",
-                    statusCode:
-                        error?.statusCode ||
-                        null,
-                    message:
-                        error?.message ||
-                        "Unknown error"
-                }
+                "Unhandled Data route error:",
+                error &&
+                    error.message
+                    ? error.message
+                    : error
             );
 
-            const statusCode =
-                getStatusCode(
-                    error
-                );
-
-            return res.status(
-                statusCode
-            ).json({
-                success: false,
+            return res.status(500).json({
+                ok:
+                    false,
                 error:
-                    getSafeCustomerError(
-                        error
-                    )
+                    "Unable to process the Data request right now."
             });
-        }
     }
-);
+}
 
-/*
- * GET /api/data/transactions/:transactionId
- *
- * Customer can only retrieve their own transaction.
- * Ownership is enforced again inside the service.
- */
-router.get(
-    "/transactions/:transactionId",
-    requireAuth,
-    async (req, res) => {
-        try {
-            const uid =
-                getAuthenticatedUid(
-                    req
-                );
-
-            const transactionId =
-                getStringField(
-                    {
-                        transactionId:
-                            req.params
-                                .transactionId
-                    },
-                    "transactionId",
-                    {
-                        required: true,
-                        maxLength: 200
-                    }
-                );
-
-            const transaction =
-                await getTransaction(
-                    uid,
-                    transactionId
-                );
-
-            if (!transaction) {
-                return res.status(404).json({
-                    success: false,
-                    error:
-                        "Transaction not found."
-                });
-            }
-
-            return res.status(200).json({
-                success: true,
-                transaction
-            });
-        } catch (error) {
-            console.error(
-                "Data transaction lookup error:",
-                {
-                    code:
-                        error?.code ||
-                        "UNKNOWN",
-                    message:
-                        error?.message ||
-                        "Unknown error"
-                }
-            );
-
-            return res.status(
-                getStatusCode(
-                    error
-                )
-            ).json({
-                success: false,
-                error:
-                    getSafeCustomerError(
-                        error
-                    )
-            });
-        }
-    }
-);
-
-module.exports = router;
+module.exports = {
+    createDataRouter
+};

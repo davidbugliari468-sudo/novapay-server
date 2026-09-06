@@ -20,6 +20,7 @@ const {
 const airtimeRoutes = require("./airtime/routes");
 const addMoneyRoutes = require("./add-money/routes");
 const dataRoutes = require("./data/routes");
+
 const {
   handlePaystackWebhook
 } = require("./add-money/paystack/webhook");
@@ -238,7 +239,7 @@ app.use(
 );
 app.use(
   "/api/data",
-  dataRoutes
+  dataRoutes.createDataRouter(requireAuth)
 );
 
 

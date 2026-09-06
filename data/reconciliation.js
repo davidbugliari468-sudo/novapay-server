@@ -1,214 +1,235 @@
 "use strict";
 
-const crypto = require("crypto");
+const { db } = require("../firebase-admin");
+
+const babspay = require("./provider/babspay");
 
 const {
-    db
-} = require("../firebase-admin");
-
-const {
-    reconcileDataTransaction
-} = require("./service");
+    getReservation,
+    commitReservation,
+    releaseReservation
+} = require("../wallet/reservation");
 
 const DATA_TRANSACTIONS_COLLECTION =
     "dataTransactions";
 
+const SERVICE_NAME = "data";
+const PROVIDER_NAME = "babspay";
+
+const STATUS_PENDING = "pending";
+const STATUS_UNKNOWN = "unknown";
+const STATUS_SUCCESSFUL = "successful";
+const STATUS_FAILED = "failed";
+
+const DEFAULT_INTERVAL_MS = 60 * 1000;
 const DEFAULT_BATCH_SIZE = 25;
-const MAX_BATCH_SIZE = 100;
+const DEFAULT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
-const DEFAULT_CLAIM_TTL_MS =
-    5 * 60 * 1000;
+const RECONCILIATION_INTERVAL_MS =
+    parseIntegerEnv(
+        "DATA_RECONCILIATION_INTERVAL_MS",
+        DEFAULT_INTERVAL_MS,
+        10_000,
+        60 * 60 * 1000
+    );
 
-const DEFAULT_RECONCILIATION_INTERVAL_MS =
-    60 * 1000;
+const RECONCILIATION_BATCH_SIZE =
+    parseIntegerEnv(
+        "DATA_RECONCILIATION_BATCH_SIZE",
+        DEFAULT_BATCH_SIZE,
+        1,
+        100
+    );
 
-let workerTimer = null;
+const RECONCILIATION_MAX_AGE_MS =
+    parseIntegerEnv(
+        "DATA_RECONCILIATION_MAX_AGE_MS",
+        DEFAULT_MAX_AGE_MS,
+        60 * 1000,
+        7 * 24 * 60 * 60 * 1000
+    );
+
 let workerRunning = false;
+let workerTimer = null;
 
-const WORKER_ID =
-    `DATA_RECON_${crypto
-        .randomBytes(8)
-        .toString("hex")}`;
+function parseIntegerEnv(
+    name,
+    fallback,
+    minimum,
+    maximum
+) {
+    const raw =
+        process.env[name];
 
-function createReconciliationError(
+    if (
+        raw === undefined ||
+        raw === null ||
+        raw === ""
+    ) {
+        return fallback;
+    }
+
+    const value =
+        Number.parseInt(
+            String(raw).trim(),
+            10
+        );
+
+    if (
+        !Number.isSafeInteger(value) ||
+        value < minimum ||
+        value > maximum
+    ) {
+        throw new Error(
+            `Invalid ${name} configuration`
+        );
+    }
+
+    return value;
+}
+
+function createError(
     message,
-    {
-        code = "DATA_RECONCILIATION_ERROR",
-        cause = null
-    } = {}
+    code = "DATA_RECONCILIATION_ERROR"
 ) {
     const error =
         new Error(message);
 
-    error.code =
-        code;
-
-    if (cause) {
-        error.cause =
-            cause;
-    }
+    error.code = code;
 
     return error;
 }
 
-function normalizeBatchSize(
-    value
+function normalizeOutcome(
+    result
 ) {
-    const parsed =
-        Number.parseInt(
-            value,
-            10
-        );
-
     if (
-        !Number.isInteger(parsed) ||
-        parsed <= 0
+        !result ||
+        typeof result !== "object"
     ) {
-        return DEFAULT_BATCH_SIZE;
+        return {
+            outcome:
+                STATUS_UNKNOWN,
+            providerReference:
+                null,
+            message:
+                "Invalid provider requery response."
+        };
     }
 
-    return Math.min(
-        parsed,
-        MAX_BATCH_SIZE
-    );
-}
-
-function normalizeClaimTtl(
-    value
-) {
-    const parsed =
-        Number.parseInt(
-            value,
-            10
-        );
-
-    if (
-        !Number.isInteger(parsed) ||
-        parsed <= 0
-    ) {
-        return DEFAULT_CLAIM_TTL_MS;
-    }
-
-    return Math.max(
-        30 * 1000,
-        parsed
-    );
-}
-
-function normalizeInterval(
-    value
-) {
-    const parsed =
-        Number.parseInt(
-            value,
-            10
-        );
-
-    if (
-        !Number.isInteger(parsed) ||
-        parsed <= 0
-    ) {
-        return DEFAULT_RECONCILIATION_INTERVAL_MS;
-    }
-
-    return Math.max(
-        10 * 1000,
-        parsed
-    );
-}
-
-function isClaimExpired(
-    transaction
-) {
-    const claimedAt =
-        transaction?.reconciliationClaimedAt;
-
-    if (!claimedAt) {
-        return true;
-    }
-
-    let claimedAtMs = null;
-
-    if (
-        typeof claimedAt.toMillis ===
-        "function"
-    ) {
-        claimedAtMs =
-            claimedAt.toMillis();
-    } else if (
-        claimedAt instanceof Date
-    ) {
-        claimedAtMs =
-            claimedAt.getTime();
-    } else if (
-        typeof claimedAt === "number"
-    ) {
-        claimedAtMs =
-            claimedAt;
-    } else if (
-        typeof claimedAt === "string"
-    ) {
-        const parsed =
-            Date.parse(
-                claimedAt
-            );
-
-        if (
-            Number.isFinite(parsed)
-        ) {
-            claimedAtMs =
-                parsed;
-        }
-    }
-
-    if (
-        !Number.isFinite(
-            claimedAtMs
+    const rawOutcome =
+        String(
+            result.outcome ||
+            result.status ||
+            ""
         )
-    ) {
-        return true;
-    }
+            .trim()
+            .toLowerCase();
 
-    const ttl =
-        normalizeClaimTtl(
-            process.env
-                .DATA_RECONCILIATION_CLAIM_TTL_MS
+    const providerReference =
+        normalizeProviderReference(
+            result.providerReference ||
+            result.ref ||
+            result.reference ||
+            result.transref ||
+            null
         );
 
-    return (
-        Date.now() -
-            claimedAtMs >=
-        ttl
+    const message =
+        String(
+            result.message ||
+            result.msg ||
+            ""
+        )
+            .trim()
+            .slice(0, 500);
+
+    if (
+        rawOutcome ===
+            STATUS_SUCCESSFUL ||
+        rawOutcome === "success"
+    ) {
+        return {
+            outcome:
+                STATUS_SUCCESSFUL,
+            providerReference,
+            message
+        };
+    }
+
+    if (
+        rawOutcome ===
+            STATUS_FAILED ||
+        rawOutcome === "failed" ||
+        rawOutcome === "fail" ||
+        rawOutcome === "failure" ||
+        rawOutcome === "reversed" ||
+        rawOutcome === "reverse"
+    ) {
+        return {
+            outcome:
+                STATUS_FAILED,
+            providerReference,
+            message
+        };
+    }
+
+    if (
+        rawOutcome ===
+            STATUS_PENDING ||
+        rawOutcome === "processing" ||
+        rawOutcome === "queued"
+    ) {
+        return {
+            outcome:
+                STATUS_PENDING,
+            providerReference,
+            message
+        };
+    }
+
+    return {
+        outcome:
+            STATUS_UNKNOWN,
+        providerReference,
+        message
+    };
+}
+
+function normalizeProviderReference(
+    value
+) {
+    if (
+        value === undefined ||
+        value === null
+    ) {
+        return null;
+    }
+
+    const normalized =
+        String(value).trim();
+
+    if (!normalized) {
+        return null;
+    }
+
+    return normalized.slice(
+        0,
+        200
     );
 }
 
 function getTransactionRef(
     transactionId
 ) {
-    if (
-        typeof transactionId !==
-            "string" ||
-        !transactionId.trim()
-    ) {
-        throw createReconciliationError(
-            "Invalid transaction ID.",
-            {
-                code:
-                    "INVALID_TRANSACTION_ID"
-            }
-        );
-    }
-
     return db
         .collection(
             DATA_TRANSACTIONS_COLLECTION
         )
-        .doc(
-            transactionId.trim()
-        );
+        .doc(transactionId);
 }
 
-async function claimTransaction(
+async function getTransaction(
     transactionId
 ) {
     const transactionRef =
@@ -216,148 +237,23 @@ async function claimTransaction(
             transactionId
         );
 
-    const claimResult =
-        await db.runTransaction(
-            async transaction => {
-                const snapshot =
-                    await transaction.get(
-                        transactionRef
-                    );
+    const snapshot =
+        await transactionRef.get();
 
-                if (
-                    !snapshot.exists
-                ) {
-                    return {
-                        claimed: false,
-                        reason:
-                            "not_found"
-                    };
-                }
-
-                const data =
-                    snapshot.data();
-
-                if (
-                    data.service !==
-                    "data"
-                ) {
-                    return {
-                        claimed: false,
-                        reason:
-                            "not_data"
-                    };
-                }
-
-                if (
-                    data.status ===
-                    "successful" ||
-                    data.status ===
-                    "failed"
-                ) {
-                    return {
-                        claimed: false,
-                        reason:
-                            "terminal"
-                    };
-                }
-
-                if (
-                    data.reconciliationRequired !==
-                    true
-                ) {
-                    return {
-                        claimed: false,
-                        reason:
-                            "not_required"
-                    };
-                }
-
-                if (
-                    data.reconciliationClaimedBy &&
-                    data.reconciliationClaimedBy !==
-                        WORKER_ID &&
-                    !isClaimExpired(
-                        data
-                    )
-                ) {
-                    return {
-                        claimed: false,
-                        reason:
-                            "claimed"
-                    };
-                }
-
-                const now =
-                    new Date();
-
-                transaction.update(
-                    transactionRef,
-                    {
-                        reconciliationClaimedBy:
-                            WORKER_ID,
-                        reconciliationClaimedAt:
-                            now,
-                        reconciliationAttempts:
-                            (
-                                Number(
-                                    data.reconciliationAttempts
-                                ) || 0
-                            ) + 1,
-                        updatedAt:
-                            now
-                    }
-                );
-
-                return {
-                    claimed: true,
-                    uid:
-                        data.uid
-                };
-            }
-        );
-
-    return claimResult;
-}
-
-async function releaseClaim(
-    transactionId
-) {
-    const transactionRef =
-        getTransactionRef(
-            transactionId
-        );
-
-    try {
-        await transactionRef.update({
-            reconciliationClaimedBy:
-                null,
-            reconciliationClaimedAt:
-                null,
-            updatedAt:
-                new Date()
-        });
-    } catch (error) {
-        /*
-         * The transaction may already have become
-         * terminal during reconciliation. Failure to
-         * clear the claim is therefore logged rather
-         * than allowed to hide the actual result.
-         */
-        console.error(
-            "Unable to clear Data reconciliation claim:",
-            {
-                transactionId,
-                message:
-                    error?.message ||
-                    "Unknown error"
-            }
-        );
+    if (!snapshot.exists) {
+        return null;
     }
+
+    return {
+        id:
+            snapshot.id,
+        ...snapshot.data()
+    };
 }
 
-async function markReconciliationRequired(
+async function updateTransaction(
     transactionId,
-    error
+    updates
 ) {
     const transactionRef =
         getTransactionRef(
@@ -365,414 +261,1117 @@ async function markReconciliationRequired(
         );
 
     await transactionRef.update({
-        status: "pending",
-        reconciliationRequired:
-            true,
-        reconciliationClaimedBy:
-            null,
-        reconciliationClaimedAt:
-            null,
-        reconciliationError:
-            error?.message ||
-            "Reconciliation failed.",
-        reconciliationErrorCode:
-            error?.code ||
-            "DATA_RECONCILIATION_ERROR",
+        ...updates,
         updatedAt:
             new Date()
     });
 }
 
-async function reconcileOne(
-    transactionId
+function transactionIdFromDocument(
+    document
 ) {
-    const claim =
-        await claimTransaction(
-            transactionId
+    if (
+        document &&
+        document.id
+    ) {
+        return document.id;
+    }
+
+    return null;
+}
+
+function reservationMatchesTransaction(
+    reservation,
+    transaction
+) {
+    if (
+        !reservation ||
+        !transaction
+    ) {
+        return false;
+    }
+
+    if (
+        reservation.uid !==
+        transaction.uid
+    ) {
+        return false;
+    }
+
+    if (
+        reservation.reference !==
+        transaction.reference
+    ) {
+        return false;
+    }
+
+    if (
+        reservation.service !==
+        SERVICE_NAME
+    ) {
+        return false;
+    }
+
+    if (
+        reservation.id !==
+        transaction.reservationId
+    ) {
+        return false;
+    }
+
+    if (
+        reservation.amountKobo !==
+        transaction.customerPriceKobo
+    ) {
+        return false;
+    }
+
+    return true;
+}
+
+function metadataMatchesTransaction(
+    reservation,
+    transaction
+) {
+    const metadata =
+        reservation &&
+        reservation.metadata;
+
+    if (
+        !metadata ||
+        typeof metadata !==
+            "object"
+    ) {
+        return false;
+    }
+
+    if (
+        String(
+            metadata.provider || ""
+        ).toLowerCase() !==
+        PROVIDER_NAME
+    ) {
+        return false;
+    }
+
+    if (
+        String(
+            metadata.planId || ""
+        ) !==
+        String(
+            transaction.planId || ""
+        )
+    ) {
+        return false;
+    }
+
+    if (
+        String(
+            metadata.networkId || ""
+        ) !==
+        String(
+            transaction.networkId || ""
+        )
+    ) {
+        return false;
+    }
+
+    if (
+        metadata.providerPriceKobo !==
+        transaction.providerPriceKobo
+    ) {
+        return false;
+    }
+
+    if (
+        metadata.customerPriceKobo !==
+        transaction.customerPriceKobo
+    ) {
+        return false;
+    }
+
+    if (
+        String(
+            metadata.phoneNumber || ""
+        ) !==
+        String(
+            transaction.phoneNumber || ""
+        )
+    ) {
+        return false;
+    }
+
+    return true;
+}
+
+async function safelyLoadReservation(
+    transaction
+) {
+    if (
+        !transaction.reservationId
+    ) {
+        throw createError(
+            "Data transaction has no reservation ID.",
+            "MISSING_RESERVATION_ID"
+        );
+    }
+
+    const reservation =
+        await getReservation(
+            transaction.reservationId
         );
 
     if (
-        !claim.claimed
+        !reservationMatchesTransaction(
+            reservation,
+            transaction
+        )
+    ) {
+        throw createError(
+            "Reservation does not match the Data transaction.",
+            "RESERVATION_TRANSACTION_MISMATCH"
+        );
+    }
+
+    if (
+        !metadataMatchesTransaction(
+            reservation,
+            transaction
+        )
+    ) {
+        throw createError(
+            "Reservation metadata does not match the Data transaction.",
+            "RESERVATION_METADATA_MISMATCH"
+        );
+    }
+
+    return reservation;
+}
+
+async function reconcileTransaction(
+    transaction
+) {
+    if (
+        !transaction ||
+        typeof transaction !==
+            "object"
+    ) {
+        throw createError(
+            "Invalid Data transaction."
+        );
+    }
+
+    const transactionId =
+        transaction.id;
+
+    if (!transactionId) {
+        throw createError(
+            "Data transaction ID is missing."
+        );
+    }
+
+    if (
+        transaction.service !==
+        SERVICE_NAME
     ) {
         return {
-            transactionId,
-            status: "skipped",
-            reason:
-                claim.reason
+            ok:
+                false,
+            status:
+                "ignored",
+            transactionId
         };
     }
+
+    if (
+        transaction.status ===
+            STATUS_SUCCESSFUL ||
+        transaction.status ===
+            STATUS_FAILED
+    ) {
+        return {
+            ok:
+                true,
+            status:
+                transaction.status,
+            transactionId
+        };
+    }
+
+    let reservation;
+
+    try {
+        reservation =
+            await safelyLoadReservation(
+                transaction
+            );
+    } catch (error) {
+        await updateTransaction(
+            transactionId,
+            {
+                reconciliationRequired:
+                    true,
+                reconciliationError:
+                    error.code ||
+                    "RESERVATION_VALIDATION_ERROR"
+            }
+        );
+
+        return {
+            ok:
+                false,
+            status:
+                STATUS_UNKNOWN,
+            transactionId,
+            error:
+                error.code
+        };
+    }
+
+    /*
+     * If the wallet reservation is already committed,
+     * the financial side is already final.
+     *
+     * We can safely synchronize the Data transaction
+     * without touching the wallet again.
+     */
+    if (
+        reservation.status ===
+        "committed"
+    ) {
+        await updateTransaction(
+            transactionId,
+            {
+                status:
+                    STATUS_SUCCESSFUL,
+
+                reconciliationRequired:
+                    false,
+
+                completedAt:
+                    transaction.completedAt ||
+                    new Date(),
+
+                walletReservationStatus:
+                    "committed",
+
+                reconciliationError:
+                    null
+            }
+        );
+
+        return {
+            ok:
+                true,
+            status:
+                STATUS_SUCCESSFUL,
+            transactionId
+        };
+    }
+
+    /*
+     * A released reservation means the wallet has
+     * already been restored.
+     *
+     * Never call release again.
+     */
+    if (
+        reservation.status ===
+        "released"
+    ) {
+        await updateTransaction(
+            transactionId,
+            {
+                status:
+                    STATUS_FAILED,
+
+                reconciliationRequired:
+                    false,
+
+                completedAt:
+                    transaction.completedAt ||
+                    new Date(),
+
+                walletReservationStatus:
+                    "released",
+
+                reconciliationError:
+                    null
+            }
+        );
+
+        return {
+            ok:
+                true,
+            status:
+                STATUS_FAILED,
+            transactionId
+        };
+    }
+
+    /*
+     * Only pending reservations are eligible for
+     * provider requery.
+     */
+    if (
+        reservation.status !==
+        "pending"
+    ) {
+        await updateTransaction(
+            transactionId,
+            {
+                reconciliationRequired:
+                    true,
+
+                reconciliationError:
+                    "INVALID_RESERVATION_STATE"
+            }
+        );
+
+        return {
+            ok:
+                false,
+            status:
+                STATUS_UNKNOWN,
+            transactionId
+        };
+    }
+
+    /*
+     * BabsPay's purchase reference is our own unique
+     * reference unless a confirmed provider reference
+     * has already been recorded.
+     */
+    const providerReference =
+        normalizeProviderReference(
+            transaction.providerReference
+        );
+
+    const requeryReference =
+        providerReference ||
+        transaction.reference;
+
+    if (!requeryReference) {
+        await updateTransaction(
+            transactionId,
+            {
+                status:
+                    STATUS_UNKNOWN,
+
+                reconciliationRequired:
+                    true,
+
+                reconciliationError:
+                    "MISSING_REQUERY_REFERENCE"
+            }
+        );
+
+        return {
+            ok:
+                false,
+            status:
+                STATUS_UNKNOWN,
+            transactionId
+        };
+    }
+
+    let providerResult;
 
     try {
         /*
-         * The service performs the authoritative
-         * provider requery and reservation handling.
+         * BabsPay:
          *
-         * It commits only on confirmed provider success,
-         * releases only on confirmed provider failure,
-         * and keeps unknown outcomes pending.
+         * GET /api/transaction/status?reference=...
+         *
+         * The provider adapter owns the actual HTTP
+         * authentication and response interpretation.
          */
-        const result =
-            await reconcileDataTransaction({
-                uid:
-                    claim.uid,
-                transactionId
+        providerResult =
+            await babspay.requeryTransaction({
+                reference:
+                    requeryReference
             });
-
-        await releaseClaim(
-            transactionId
-        );
-
-        return {
-            transactionId,
-            status:
-                result.status ||
-                "pending",
-            result
-        };
     } catch (error) {
         /*
-         * Never convert a reconciliation error into
-         * a wallet release.
+         * A failed requery does NOT prove failure.
          *
-         * The transaction remains pending and will be
-         * retried on a later worker pass.
+         * Keep the reservation locked and try again
+         * during the next reconciliation cycle.
          */
-        try {
-            await markReconciliationRequired(
-                transactionId,
-                error
-            );
-        } catch (markError) {
-            console.error(
-                "Unable to preserve Data reconciliation state:",
-                {
-                    transactionId,
-                    message:
-                        markError?.message ||
-                        "Unknown error"
-                }
-            );
-        }
-
-        return {
+        await updateTransaction(
             transactionId,
-            status: "pending",
-            error:
-                error?.message ||
-                "Reconciliation failed."
-        };
-    }
-}
+            {
+                status:
+                    STATUS_UNKNOWN,
 
-async function getPendingTransactions(
-    batchSize
-) {
-    const limit =
-        normalizeBatchSize(
-            batchSize
+                reconciliationRequired:
+                    true,
+
+                reconciliationError:
+                    "PROVIDER_REQUERY_UNAVAILABLE"
+            }
         );
 
-    /*
-     * We intentionally query by status only.
-     *
-     * This avoids requiring a composite Firestore
-     * index for the recovery worker.
-     */
-    const snapshot =
-        await db
-            .collection(
-                DATA_TRANSACTIONS_COLLECTION
-            )
-            .where(
-                "status",
-                "==",
-                "pending"
-            )
-            .limit(limit)
-            .get();
-
-    const transactions = [];
-
-    for (const document of snapshot.docs) {
-        const data =
-            document.data();
-
-        if (
-            data.service !==
-            "data"
-        ) {
-            continue;
-        }
-
-        if (
-            data.reconciliationRequired !==
-            true
-        ) {
-            continue;
-        }
-
-        if (
-            !data.uid ||
-            typeof data.uid !==
-                "string"
-        ) {
-            continue;
-        }
-
-        transactions.push({
-            id:
-                document.id,
-            ...data
-        });
+        return {
+            ok:
+                false,
+            status:
+                STATUS_UNKNOWN,
+            transactionId
+        };
     }
 
-    return transactions;
+    /*
+     * A provider "not found" or otherwise ambiguous
+     * response must not release customer funds.
+     */
+    const outcome =
+        normalizeOutcome(
+            providerResult
+        );
+
+    if (
+        outcome.outcome ===
+        STATUS_SUCCESSFUL
+    ) {
+        /*
+         * Provider explicitly confirms success.
+         *
+         * Verify that any returned provider
+         * reference is consistent with what we already
+         * recorded.
+         */
+        if (
+            transaction.providerReference &&
+            outcome.providerReference &&
+            transaction.providerReference !==
+                outcome.providerReference
+        ) {
+            await updateTransaction(
+                transactionId,
+                {
+                    status:
+                        STATUS_UNKNOWN,
+
+                    reconciliationRequired:
+                        true,
+
+                    reconciliationError:
+                        "PROVIDER_REFERENCE_MISMATCH"
+                }
+            );
+
+            return {
+                ok:
+                    false,
+                status:
+                    STATUS_UNKNOWN,
+                transactionId
+            };
+        }
+
+        /*
+         * Commit is idempotent. If another process
+         * committed immediately before this one, the
+         * reservation implementation returns the
+         * committed state rather than debiting twice.
+         */
+        let committed;
+
+        try {
+            committed =
+                await commitReservation({
+                    uid:
+                        transaction.uid,
+
+                    reservationId:
+                        transaction.reservationId,
+
+                    provider:
+                        PROVIDER_NAME
+                });
+        } catch (error) {
+            /*
+             * Never release after provider success.
+             *
+             * If wallet commitment fails, leave the
+             * reservation pending and flag it for the
+             * next reconciliation attempt/manual review.
+             */
+            await updateTransaction(
+                transactionId,
+                {
+                    status:
+                        STATUS_UNKNOWN,
+
+                    reconciliationRequired:
+                        true,
+
+                    reconciliationError:
+                        error.code ||
+                        "WALLET_COMMIT_FAILED",
+
+                    providerReference:
+                        outcome.providerReference ||
+                        transaction.providerReference ||
+                        null
+                }
+            );
+
+            return {
+                ok:
+                    false,
+                status:
+                    STATUS_UNKNOWN,
+                transactionId
+            };
+        }
+
+        await updateTransaction(
+            transactionId,
+            {
+                status:
+                    STATUS_SUCCESSFUL,
+
+                providerReference:
+                    outcome.providerReference ||
+                    transaction.providerReference ||
+                    null,
+
+                providerMessage:
+                    outcome.message ||
+                    "Data purchase confirmed successfully.",
+
+                reconciliationRequired:
+                    false,
+
+                reconciliationError:
+                    null,
+
+                completedAt:
+                    new Date(),
+
+                walletReservationStatus:
+                    committed.status
+            }
+        );
+
+        return {
+            ok:
+                true,
+            status:
+                STATUS_SUCCESSFUL,
+            transactionId
+        };
+    }
+
+    if (
+        outcome.outcome ===
+        STATUS_FAILED
+    ) {
+        /*
+         * An explicit provider failure/reversal is the
+         * only normal condition here that permits us to
+         * release the wallet hold.
+         */
+        let released;
+
+        try {
+            released =
+                await releaseReservation({
+                    uid:
+                        transaction.uid,
+
+                    reservationId:
+                        transaction.reservationId,
+
+                    reason:
+                        outcome.message ||
+                        "BabsPay confirmed Data transaction failure.",
+
+                    provider:
+                        PROVIDER_NAME
+                });
+        } catch (error) {
+            /*
+             * If release fails, DO NOT mark the
+             * transaction failed as though the wallet
+             * was restored.
+             *
+             * The customer funds remain reserved until
+             * release succeeds.
+             */
+            await updateTransaction(
+                transactionId,
+                {
+                    status:
+                        STATUS_UNKNOWN,
+
+                    reconciliationRequired:
+                        true,
+
+                    reconciliationError:
+                        error.code ||
+                        "WALLET_RELEASE_FAILED",
+
+                    providerReference:
+                        outcome.providerReference ||
+                        transaction.providerReference ||
+                        null
+                }
+            );
+
+            return {
+                ok:
+                    false,
+                status:
+                    STATUS_UNKNOWN,
+                transactionId
+            };
+        }
+
+        await updateTransaction(
+            transactionId,
+            {
+                status:
+                    STATUS_FAILED,
+
+                providerReference:
+                    outcome.providerReference ||
+                    transaction.providerReference ||
+                    null,
+
+                providerMessage:
+                    outcome.message ||
+                    "BabsPay confirmed Data transaction failure.",
+
+                reconciliationRequired:
+                    false,
+
+                reconciliationError:
+                    null,
+
+                completedAt:
+                    new Date(),
+
+                walletReservationStatus:
+                    released.status
+            }
+        );
+
+        return {
+            ok:
+                true,
+            status:
+                STATUS_FAILED,
+            transactionId
+        };
+    }
+
+    /*
+     * Pending, not-found, malformed, or otherwise
+     * ambiguous provider results stay unresolved.
+     *
+     * NEVER release the wallet here.
+     */
+    await updateTransaction(
+        transactionId,
+        {
+            status:
+                outcome.outcome ===
+                STATUS_PENDING
+                    ? STATUS_PENDING
+                    : STATUS_UNKNOWN,
+
+            providerReference:
+                outcome.providerReference ||
+                transaction.providerReference ||
+                null,
+
+            providerMessage:
+                outcome.message ||
+                "BabsPay transaction is not yet conclusively resolved.",
+
+            reconciliationRequired:
+                true,
+
+            reconciliationError:
+                null
+        }
+    );
+
+    return {
+        ok:
+            false,
+        status:
+            outcome.outcome ===
+            STATUS_PENDING
+                ? STATUS_PENDING
+                : STATUS_UNKNOWN,
+        transactionId
+    };
 }
 
-async function runReconciliationBatch({
-    batchSize = DEFAULT_BATCH_SIZE
-} = {}) {
+function getEligibleQueryDate() {
+    return new Date(
+        Date.now() -
+            RECONCILIATION_MAX_AGE_MS
+    );
+}
+
+async function findTransactionsForReconciliation() {
+    const cutoff =
+        getEligibleQueryDate();
+
+    /*
+     * Two separate queries are used because Firestore
+     * does not need a compound "status IN" query here.
+     */
+    const [pendingSnapshot, unknownSnapshot] =
+        await Promise.all([
+            db
+                .collection(
+                    DATA_TRANSACTIONS_COLLECTION
+                )
+                .where(
+                    "service",
+                    "==",
+                    SERVICE_NAME
+                )
+                .where(
+                    "status",
+                    "==",
+                    STATUS_PENDING
+                )
+                .where(
+                    "createdAt",
+                    ">=",
+                    cutoff
+                )
+                .orderBy(
+                    "createdAt",
+                    "asc"
+                )
+                .limit(
+                    RECONCILIATION_BATCH_SIZE
+                )
+                .get(),
+
+            db
+                .collection(
+                    DATA_TRANSACTIONS_COLLECTION
+                )
+                .where(
+                    "service",
+                    "==",
+                    SERVICE_NAME
+                )
+                .where(
+                    "status",
+                    "==",
+                    STATUS_UNKNOWN
+                )
+                .where(
+                    "createdAt",
+                    ">=",
+                    cutoff
+                )
+                .orderBy(
+                    "createdAt",
+                    "asc"
+                )
+                .limit(
+                    RECONCILIATION_BATCH_SIZE
+                )
+                .get()
+        ]);
+
+    const records =
+        new Map();
+
+    for (
+        const document of
+        pendingSnapshot.docs
+    ) {
+        records.set(
+            document.id,
+            {
+                id:
+                    document.id,
+                ...document.data()
+            }
+        );
+    }
+
+    for (
+        const document of
+        unknownSnapshot.docs
+    ) {
+        records.set(
+            document.id,
+            {
+                id:
+                    document.id,
+                ...document.data()
+            }
+        );
+    }
+
+    return Array.from(
+        records.values()
+    )
+        .sort(
+            (a, b) => {
+                const aTime =
+                    a.createdAt &&
+                    typeof a.createdAt.toMillis ===
+                        "function"
+                        ? a.createdAt.toMillis()
+                        : 0;
+
+                const bTime =
+                    b.createdAt &&
+                    typeof b.createdAt.toMillis ===
+                        "function"
+                        ? b.createdAt.toMillis()
+                        : 0;
+
+                return aTime - bTime;
+            }
+        )
+        .slice(
+            0,
+            RECONCILIATION_BATCH_SIZE
+        );
+}
+
+async function reconcileBatch() {
+    const transactions =
+        await findTransactionsForReconciliation();
+
+    if (
+        transactions.length === 0
+    ) {
+        return {
+            scanned:
+                0,
+            successful:
+                0,
+            failed:
+                0,
+            pending:
+                0,
+            unknown:
+                0,
+            errors:
+                0
+        };
+    }
+
+    const summary = {
+        scanned:
+            transactions.length,
+        successful:
+            0,
+        failed:
+            0,
+        pending:
+            0,
+        unknown:
+            0,
+        errors:
+            0
+    };
+
+    for (
+        const transaction of
+        transactions
+    ) {
+        try {
+            const result =
+                await reconcileTransaction(
+                    transaction
+                );
+
+            if (
+                result.status ===
+                STATUS_SUCCESSFUL
+            ) {
+                summary.successful += 1;
+            } else if (
+                result.status ===
+                STATUS_FAILED
+            ) {
+                summary.failed += 1;
+            } else if (
+                result.status ===
+                STATUS_PENDING
+            ) {
+                summary.pending += 1;
+            } else {
+                summary.unknown += 1;
+            }
+        } catch (error) {
+            summary.errors += 1;
+
+            try {
+                await updateTransaction(
+                    transaction.id,
+                    {
+                        reconciliationRequired:
+                            true,
+
+                        reconciliationError:
+                            error.code ||
+                            "RECONCILIATION_ERROR"
+                    }
+                );
+            } catch {
+                /*
+                 * Nothing else is safe to do here.
+                 *
+                 * Most importantly, this worker never
+                 * releases funds simply because an internal
+                 * reconciliation operation failed.
+                 */
+            }
+        }
+    }
+
+    return summary;
+}
+
+async function runReconciliationOnce() {
     if (workerRunning) {
         return {
-            running: true,
-            processed: 0,
-            skipped: true,
+            skipped:
+                true,
             reason:
-                "A reconciliation batch is already running."
+                "Reconciliation worker is already running."
         };
     }
 
     workerRunning = true;
 
-    const startedAt =
-        Date.now();
-
-    const summary = {
-        running: false,
-        processed: 0,
-        successful: 0,
-        failed: 0,
-        pending: 0,
-        skipped: 0,
-        errors: 0,
-        durationMs: 0
-    };
-
     try {
-        const transactions =
-            await getPendingTransactions(
-                batchSize
-            );
+        const summary =
+            await reconcileBatch();
 
-        for (
-            const transaction
-            of transactions
-        ) {
-            const result =
-                await reconcileOne(
-                    transaction.id
-                );
-
-            summary.processed += 1;
-
-            if (
-                result.status ===
-                "successful"
-            ) {
-                summary.successful += 1;
-            } else if (
-                result.status ===
-                "failed"
-            ) {
-                summary.failed += 1;
-            } else if (
-                result.status ===
-                "pending"
-            ) {
-                summary.pending += 1;
-            } else if (
-                result.status ===
-                "skipped"
-            ) {
-                summary.skipped += 1;
-            }
-
-            if (result.error) {
-                summary.errors += 1;
-            }
-        }
+        console.log(
+            "Data reconciliation completed:",
+            summary
+        );
 
         return summary;
-    } finally {
-        summary.durationMs =
-            Date.now() -
-            startedAt;
+    } catch (error) {
+        console.error(
+            "Data reconciliation failed:",
+            error.message
+        );
 
+        return {
+            scanned:
+                0,
+            successful:
+                0,
+            failed:
+                0,
+            pending:
+                0,
+            unknown:
+                0,
+            errors:
+                1
+        };
+    } finally {
         workerRunning = false;
     }
 }
 
-function startReconciliationWorker({
-    intervalMs =
-        normalizeInterval(
-            process.env
-                .DATA_RECONCILIATION_INTERVAL_MS
-        ),
-    batchSize =
-        normalizeBatchSize(
-            process.env
-                .DATA_RECONCILIATION_BATCH_SIZE
-        ),
-    runImmediately = true
-} = {}) {
+function startReconciliationWorker() {
     if (workerTimer) {
         return {
-            started: false,
-            reason:
-                "Data reconciliation worker is already running.",
-            workerId:
-                WORKER_ID
+            running:
+                true,
+            intervalMs:
+                RECONCILIATION_INTERVAL_MS,
+            batchSize:
+                RECONCILIATION_BATCH_SIZE,
+            maxAgeMs:
+                RECONCILIATION_MAX_AGE_MS
         };
-    }
-
-    const normalizedInterval =
-        normalizeInterval(
-            intervalMs
-        );
-
-    const normalizedBatchSize =
-        normalizeBatchSize(
-            batchSize
-        );
-
-    const execute =
-        async () => {
-            try {
-                const result =
-                    await runReconciliationBatch({
-                        batchSize:
-                            normalizedBatchSize
-                    });
-
-                if (
-                    result.processed >
-                    0
-                ) {
-                    console.log(
-                        "Data reconciliation batch completed:",
-                        result
-                    );
-                }
-            } catch (error) {
-                console.error(
-                    "Data reconciliation worker error:",
-                    {
-                        code:
-                            error?.code ||
-                            "DATA_RECONCILIATION_ERROR",
-                        message:
-                            error?.message ||
-                            "Unknown error"
-                    }
-                );
-            }
-        };
-
-    if (runImmediately) {
-        void execute();
     }
 
     workerTimer =
         setInterval(
-            execute,
-            normalizedInterval
+            () => {
+                runReconciliationOnce()
+                    .catch((error) => {
+                        console.error(
+                            "Unhandled Data reconciliation error:",
+                            error.message
+                        );
+                    });
+            },
+            RECONCILIATION_INTERVAL_MS
         );
 
-    workerTimer.unref?.();
+    /*
+     * Do not keep Node alive solely because of the
+     * reconciliation timer. The server itself owns
+     * the process lifetime.
+     */
+    if (
+        workerTimer &&
+        typeof workerTimer.unref ===
+            "function"
+    ) {
+        workerTimer.unref();
+    }
 
     console.log(
         "Data reconciliation worker started:",
         {
-            workerId:
-                WORKER_ID,
             intervalMs:
-                normalizedInterval,
+                RECONCILIATION_INTERVAL_MS,
             batchSize:
-                normalizedBatchSize
+                RECONCILIATION_BATCH_SIZE,
+            maxAgeMs:
+                RECONCILIATION_MAX_AGE_MS
         }
     );
 
     return {
-        started: true,
-        workerId:
-            WORKER_ID,
+        running:
+            true,
         intervalMs:
-            normalizedInterval,
+            RECONCILIATION_INTERVAL_MS,
         batchSize:
-            normalizedBatchSize
+            RECONCILIATION_BATCH_SIZE,
+        maxAgeMs:
+            RECONCILIATION_MAX_AGE_MS
     };
 }
 
 function stopReconciliationWorker() {
-    if (!workerTimer) {
-        return {
-            stopped: false,
-            reason:
-                "Data reconciliation worker is not running."
-        };
+    if (workerTimer) {
+        clearInterval(
+            workerTimer
+        );
+
+        workerTimer = null;
     }
 
-    clearInterval(
-        workerTimer
-    );
-
-    workerTimer = null;
-
-    console.log(
-        "Data reconciliation worker stopped:",
-        {
-            workerId:
-                WORKER_ID
-        }
-    );
-
     return {
-        stopped: true,
-        workerId:
-            WORKER_ID
-    };
-}
-
-function getWorkerInfo() {
-    return {
-        workerId:
-            WORKER_ID,
         running:
-            workerRunning,
-        scheduled:
-            Boolean(workerTimer),
-        batchSize:
-            normalizeBatchSize(
-                process.env
-                    .DATA_RECONCILIATION_BATCH_SIZE
-            ),
-        intervalMs:
-            normalizeInterval(
-                process.env
-                    .DATA_RECONCILIATION_INTERVAL_MS
-            ),
-        claimTtlMs:
-            normalizeClaimTtl(
-                process.env
-                    .DATA_RECONCILIATION_CLAIM_TTL_MS
-            )
+            false
     };
 }
 
 module.exports = {
-    runReconciliationBatch,
-    reconcileOne,
+    reconcileTransaction,
+    reconcileBatch,
+    runReconciliationOnce,
     startReconciliationWorker,
-    stopReconciliationWorker,
-    getWorkerInfo
+    stopReconciliationWorker
 };
