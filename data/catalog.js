@@ -280,131 +280,37 @@ function resolveNetworkName(
   return NETWORK_NAMES[networkId] || null;
 }
 
-/*
- * TEMPORARY SAFE DIAGNOSTIC
- *
- * This only runs for BabsPay plan 691.
- * It exposes catalogue field names and value types,
- * not credentials, headers, or the full provider response.
- *
- * REMOVE THIS FUNCTION AFTER DIAGNOSIS.
- */
-function logDiagnosticForPlan691(rawPlan) {
-  if (
-    !rawPlan ||
-    typeof rawPlan !== "object" ||
-    Array.isArray(rawPlan)
-  ) {
-    return;
-  }
-
-  const planId = String(
-    rawPlan.plan_id ?? ""
+function resolvePlanName(rawPlan) {
+  const planName = String(
+    rawPlan.plan_name ??
+      rawPlan.name ??
+      ""
   ).trim();
 
-  if (planId !== "691") {
-    return;
-  }
+  return planName || null;
+}
 
-  const safeDiagnostic = {};
+function resolvePlanType(rawPlan) {
+  const planType = String(
+    rawPlan.plan_type ??
+      rawPlan.type ??
+      ""
+  )
+    .trim()
+    .toLowerCase();
 
-  for (const [key, value] of Object.entries(rawPlan)) {
-    if (
-      key === "password" ||
-      key === "api_key" ||
-      key === "apikey" ||
-      key === "authorization" ||
-      key === "token" ||
-      key === "secret"
-    ) {
-      safeDiagnostic[key] = "[REDACTED]";
-      continue;
-    }
+  return planType || null;
+}
 
-    if (
-      value === null ||
-      value === undefined
-    ) {
-      safeDiagnostic[key] = {
-        type: value === null
-          ? "null"
-          : "undefined",
-        value: null
-      };
-      continue;
-    }
-
-    if (
-      typeof value === "string"
-    ) {
-      safeDiagnostic[key] = {
-        type: "string",
-        value: value.length > 120
-          ? `${value.slice(0, 120)}...[truncated]`
-          : value
-      };
-      continue;
-    }
-
-    if (
-      typeof value === "number"
-    ) {
-      safeDiagnostic[key] = {
-        type: "number",
-        value: Number.isFinite(value)
-          ? value
-          : "[non-finite-number]"
-      };
-      continue;
-    }
-
-    if (
-      typeof value === "boolean"
-    ) {
-      safeDiagnostic[key] = {
-        type: "boolean",
-        value
-      };
-      continue;
-    }
-
-    if (Array.isArray(value)) {
-      safeDiagnostic[key] = {
-        type: "array",
-        length: value.length
-      };
-      continue;
-    }
-
-    if (
-      typeof value === "object"
-    ) {
-      safeDiagnostic[key] = {
-        type: "object",
-        keys: Object.keys(value)
-      };
-      continue;
-    }
-
-    safeDiagnostic[key] = {
-      type: typeof value,
-      value: "[unsupported]"
-    };
-  }
-
-  console.log(
-    "BabsPay SAFE DIAGNOSTIC PLAN 691:",
-    JSON.stringify(
-      safeDiagnostic,
-      null,
-      2
-    )
+function resolveNetworkProviderName(rawPlan) {
+  return (
+    rawPlan.network_name ??
+    rawPlan.network ??
+    ""
   );
 }
 
 function normalizePlan(rawPlan) {
-  logDiagnosticForPlan691(rawPlan);
-
   if (
     !rawPlan ||
     typeof rawPlan !== "object" ||
@@ -436,7 +342,9 @@ function normalizePlan(rawPlan) {
   const networkName =
     resolveNetworkName(
       networkId,
-      rawPlan.network_name
+      resolveNetworkProviderName(
+        rawPlan
+      )
     );
 
   if (!networkName) {
@@ -446,9 +354,8 @@ function normalizePlan(rawPlan) {
     );
   }
 
-  const planName = String(
-    rawPlan.plan_name ?? ""
-  ).trim();
+  const planName =
+    resolvePlanName(rawPlan);
 
   if (!planName) {
     throw createCatalogueError(
@@ -457,13 +364,11 @@ function normalizePlan(rawPlan) {
     );
   }
 
-  const planType = String(
-    rawPlan.plan_type ?? ""
-  )
-    .trim()
-    .toLowerCase();
+  const planType =
+    resolvePlanType(rawPlan);
 
   if (
+    !planType ||
     !SUPPORTED_TYPES.has(planType)
   ) {
     throw createCatalogueError(
@@ -793,7 +698,8 @@ async function fetchPlans(
     );
 
   const type =
-    normalizeType(options.type
+    normalizeType(
+      options.type
     );
 
   const url =
@@ -854,7 +760,9 @@ async function getPlans(
     );
 
   const type =
-    normalizeType(options.type);
+    normalizeType(
+      options.type
+    );
 
   const forceRefresh =
     options.forceRefresh === true;
