@@ -31,7 +31,9 @@ function createCatalogueError(message, code, details = {}) {
 }
 
 function getConfig() {
-  const apiKey = String(process.env.BABSPAY_API_KEY || "").trim();
+  const apiKey = String(
+    process.env.BABSPAY_API_KEY || ""
+  ).trim();
 
   if (!apiKey) {
     throw createCatalogueError(
@@ -101,7 +103,9 @@ function getConfig() {
 
   return {
     apiKey,
-    baseUrl: parsedBaseUrl.toString().replace(/\/+$/, ""),
+    baseUrl: parsedBaseUrl
+      .toString()
+      .replace(/\/+$/, ""),
     timeoutMs,
     cacheTtlMs
   };
@@ -137,7 +141,9 @@ function normalizeType(type) {
     return null;
   }
 
-  const value = String(type).trim().toLowerCase();
+  const value = String(type)
+    .trim()
+    .toLowerCase();
 
   if (!SUPPORTED_TYPES.has(value)) {
     throw createCatalogueError(
@@ -163,7 +169,10 @@ function normalizePlanId(planId) {
 
   const value = String(planId).trim();
 
-  if (!/^\d+$/.test(value) || value.length > 30) {
+  if (
+    !/^\d+$/.test(value) ||
+    value.length > 30
+  ) {
     throw createCatalogueError(
       "Invalid BabsPay plan ID.",
       "DATA_INVALID_PLAN_ID"
@@ -177,7 +186,10 @@ function parseMoneyToKobo(value) {
   let normalized;
 
   if (typeof value === "number") {
-    if (!Number.isFinite(value) || value < 0) {
+    if (
+      !Number.isFinite(value) ||
+      value < 0
+    ) {
       throw createCatalogueError(
         "Invalid BabsPay plan price.",
         "DATA_INVALID_PLAN_PRICE"
@@ -186,7 +198,9 @@ function parseMoneyToKobo(value) {
 
     normalized = value.toFixed(2);
   } else if (typeof value === "string") {
-    normalized = value.trim().replace(/,/g, "");
+    normalized = value
+      .trim()
+      .replace(/,/g, "");
   } else {
     throw createCatalogueError(
       "Invalid BabsPay plan price.",
@@ -194,30 +208,48 @@ function parseMoneyToKobo(value) {
     );
   }
 
-  if (!/^\d+(?:\.\d{1,2})?$/.test(normalized)) {
+  if (
+    !/^\d+(?:\.\d{1,2})?$/.test(
+      normalized
+    )
+  ) {
     throw createCatalogueError(
       "Invalid BabsPay plan price.",
       "DATA_INVALID_PLAN_PRICE"
     );
   }
 
-  const [nairaPart, decimalPart = ""] = normalized.split(".");
+  const [
+    nairaPart,
+    decimalPart = ""
+  ] = normalized.split(".");
 
   const naira = Number(nairaPart);
 
-  if (!Number.isSafeInteger(naira) || naira < 0) {
+  if (
+    !Number.isSafeInteger(naira) ||
+    naira < 0
+  ) {
     throw createCatalogueError(
       "Invalid BabsPay plan price.",
       "DATA_INVALID_PLAN_PRICE"
     );
   }
 
-  const paddedDecimal = decimalPart.padEnd(2, "0");
-  const koboDecimal = Number(paddedDecimal.slice(0, 2));
+  const paddedDecimal =
+    decimalPart.padEnd(2, "0");
 
-  const kobo = naira * 100 + koboDecimal;
+  const koboDecimal = Number(
+    paddedDecimal.slice(0, 2)
+  );
 
-  if (!Number.isSafeInteger(kobo) || kobo < 0) {
+  const kobo =
+    naira * 100 + koboDecimal;
+
+  if (
+    !Number.isSafeInteger(kobo) ||
+    kobo < 0
+  ) {
     throw createCatalogueError(
       "Invalid BabsPay plan price.",
       "DATA_INVALID_PLAN_PRICE"
@@ -233,6 +265,21 @@ function normalizeStatus(status) {
     .toLowerCase();
 }
 
+function resolveNetworkName(
+  networkId,
+  providerNetworkName
+) {
+  const suppliedName = String(
+    providerNetworkName ?? ""
+  ).trim();
+
+  if (suppliedName) {
+    return suppliedName;
+  }
+
+  return NETWORK_NAMES[networkId] || null;
+}
+
 function normalizePlan(rawPlan) {
   if (
     !rawPlan ||
@@ -245,26 +292,32 @@ function normalizePlan(rawPlan) {
     );
   }
 
-  const planId = normalizePlanId(rawPlan.plan_id);
+  const planId = normalizePlanId(
+    rawPlan.plan_id
+  );
 
   const networkId = String(
     rawPlan.network_id ?? ""
   ).trim();
 
-  if (!SUPPORTED_NETWORKS.has(networkId)) {
+  if (
+    !SUPPORTED_NETWORKS.has(networkId)
+  ) {
     throw createCatalogueError(
       `Invalid network for BabsPay plan ${planId}.`,
       "DATA_INVALID_PLAN_NETWORK"
     );
   }
 
-  const networkName = String(
-    rawPlan.network_name ?? ""
-  ).trim();
+  const networkName =
+    resolveNetworkName(
+      networkId,
+      rawPlan.network_name
+    );
 
   if (!networkName) {
     throw createCatalogueError(
-      `Missing network name for BabsPay plan ${planId}.`,
+      `Unable to resolve network name for BabsPay plan ${planId}.`,
       "DATA_INVALID_PLAN_NETWORK_NAME"
     );
   }
@@ -286,7 +339,9 @@ function normalizePlan(rawPlan) {
     .trim()
     .toLowerCase();
 
-  if (!SUPPORTED_TYPES.has(planType)) {
+  if (
+    !SUPPORTED_TYPES.has(planType)
+  ) {
     throw createCatalogueError(
       `Invalid plan type for BabsPay plan ${planId}.`,
       "DATA_INVALID_PLAN_TYPE"
@@ -304,7 +359,9 @@ function normalizePlan(rawPlan) {
     );
   }
 
-  const status = normalizeStatus(rawPlan.status);
+  const status = normalizeStatus(
+    rawPlan.status
+  );
 
   if (status !== "active") {
     throw createCatalogueError(
@@ -313,13 +370,16 @@ function normalizePlan(rawPlan) {
     );
   }
 
-  const priceKobo = parseMoneyToKobo(rawPlan.price);
+  const providerPriceKobo =
+    parseMoneyToKobo(rawPlan.price);
 
   const planCode =
     rawPlan.plan_code === undefined ||
     rawPlan.plan_code === null
       ? null
-      : String(rawPlan.plan_code).trim();
+      : String(
+          rawPlan.plan_code
+        ).trim();
 
   return Object.freeze({
     planId,
@@ -328,30 +388,46 @@ function normalizePlan(rawPlan) {
     networkName,
     planName,
     planType,
-    priceKobo,
+    providerPriceKobo,
+    priceKobo: providerPriceKobo,
     validity,
     status: "active"
   });
 }
 
-function createRequestUrl(baseUrl, network, type) {
+function createRequestUrl(
+  baseUrl,
+  network,
+  type
+) {
   const url = new URL(
     `${baseUrl}${CATALOGUE_PATH}`
   );
 
   if (network) {
-    url.searchParams.set("network", network);
+    url.searchParams.set(
+      "network",
+      network
+    );
   }
 
   if (type) {
-    url.searchParams.set("type", type);
+    url.searchParams.set(
+      "type",
+      type
+    );
   }
 
   return url;
 }
 
-async function requestJson(url, timeoutMs, apiKey) {
-  const controller = new AbortController();
+async function requestJson(
+  url,
+  timeoutMs,
+  apiKey
+) {
+  const controller =
+    new AbortController();
 
   const timeout = setTimeout(() => {
     controller.abort();
@@ -365,12 +441,16 @@ async function requestJson(url, timeoutMs, apiKey) {
       headers: {
         Accept: "application/json",
         Authorization: `Token ${apiKey}`,
-        "User-Agent": "NovaPay-DataCatalog/1.0"
+        "User-Agent":
+          "NovaPay-DataCatalog/1.0"
       },
       signal: controller.signal
     });
   } catch (error) {
-    if (error && error.name === "AbortError") {
+    if (
+      error &&
+      error.name === "AbortError"
+    ) {
       throw createCatalogueError(
         "BabsPay catalogue request timed out.",
         "BABSPAY_CATALOG_TIMEOUT",
@@ -391,7 +471,8 @@ async function requestJson(url, timeoutMs, apiKey) {
     clearTimeout(timeout);
   }
 
-  const text = await response.text();
+  const text =
+    await response.text();
 
   let payload = null;
 
@@ -404,19 +485,24 @@ async function requestJson(url, timeoutMs, apiKey) {
         "BABSPAY_INVALID_JSON",
         {
           retryable: true,
-          statusCode: response.status
+          statusCode:
+            response.status
         }
       );
     }
   }
 
-  if (response.status === 401 || response.status === 403) {
+  if (
+    response.status === 401 ||
+    response.status === 403
+  ) {
     throw createCatalogueError(
       "BabsPay catalogue authentication was rejected.",
       "BABSPAY_AUTH_ERROR",
       {
         retryable: false,
-        statusCode: response.status,
+        statusCode:
+          response.status,
         providerResponse: payload
       }
     );
@@ -428,7 +514,8 @@ async function requestJson(url, timeoutMs, apiKey) {
       "BABSPAY_RATE_LIMITED",
       {
         retryable: true,
-        statusCode: response.status,
+        statusCode:
+          response.status,
         providerResponse: payload
       }
     );
@@ -440,7 +527,8 @@ async function requestJson(url, timeoutMs, apiKey) {
       "BABSPAY_PROVIDER_ERROR",
       {
         retryable: true,
-        statusCode: response.status,
+        statusCode:
+          response.status,
         providerResponse: payload
       }
     );
@@ -452,7 +540,8 @@ async function requestJson(url, timeoutMs, apiKey) {
       "BABSPAY_HTTP_ERROR",
       {
         retryable: false,
-        statusCode: response.status,
+        statusCode:
+          response.status,
         providerResponse: payload
       }
     );
@@ -464,7 +553,9 @@ async function requestJson(url, timeoutMs, apiKey) {
   };
 }
 
-function validateCatalogueResponse(payload) {
+function validateCatalogueResponse(
+  payload
+) {
   if (
     !payload ||
     typeof payload !== "object" ||
@@ -477,7 +568,8 @@ function validateCatalogueResponse(payload) {
   }
 
   if (
-    normalizeStatus(payload.status) !== "success"
+    normalizeStatus(payload.status) !==
+    "success"
   ) {
     throw createCatalogueError(
       "BabsPay did not return a successful catalogue response.",
@@ -501,7 +593,9 @@ function validateCatalogueResponse(payload) {
   return payload.data;
 }
 
-function normalizeCatalogue(rawPlans) {
+function normalizeCatalogue(
+  rawPlans
+) {
   if (!Array.isArray(rawPlans)) {
     throw createCatalogueError(
       "BabsPay catalogue is not a plan array.",
@@ -513,9 +607,13 @@ function normalizeCatalogue(rawPlans) {
   const seenPlanIds = new Set();
 
   for (const rawPlan of rawPlans) {
-    const plan = normalizePlan(rawPlan);
+    const plan = normalizePlan(
+      rawPlan
+    );
 
-    if (seenPlanIds.has(plan.planId)) {
+    if (
+      seenPlanIds.has(plan.planId)
+    ) {
       throw createCatalogueError(
         `Duplicate BabsPay plan ID: ${plan.planId}.`,
         "DATA_DUPLICATE_PLAN_ID"
@@ -527,12 +625,23 @@ function normalizeCatalogue(rawPlans) {
   }
 
   plans.sort((a, b) => {
-    if (a.networkId !== b.networkId) {
-      return Number(a.networkId) - Number(b.networkId);
+    if (
+      a.networkId !== b.networkId
+    ) {
+      return (
+        Number(a.networkId) -
+        Number(b.networkId)
+      );
     }
 
-    if (a.priceKobo !== b.priceKobo) {
-      return a.priceKobo - b.priceKobo;
+    if (
+      a.providerPriceKobo !==
+      b.providerPriceKobo
+    ) {
+      return (
+        a.providerPriceKobo -
+        b.providerPriceKobo
+      );
     }
 
     return a.planId.localeCompare(
@@ -547,45 +656,61 @@ function normalizeCatalogue(rawPlans) {
   return Object.freeze(plans);
 }
 
-async function fetchPlans(options = {}) {
+async function fetchPlans(
+  options = {}
+) {
   const config = getConfig();
 
-  const network = normalizeNetwork(options.network);
-  const type = normalizeType(options.type);
+  const network =
+    normalizeNetwork(
+      options.network
+    );
 
-  const url = createRequestUrl(
-    config.baseUrl,
-    network,
-    type
+  const type =
+    normalizeType(options.type);
+
+  const url =
+    createRequestUrl(
+      config.baseUrl,
+      network,
+      type
+    );
+
+  const result =
+    await requestJson(
+      url,
+      config.timeoutMs,
+      config.apiKey
+    );
+
+  const rawPlans =
+    validateCatalogueResponse(
+      result.payload
+    );
+
+  return normalizeCatalogue(
+    rawPlans
   );
-
-  const result = await requestJson(
-    url,
-    config.timeoutMs,
-    config.apiKey
-  );
-
-  const rawPlans = validateCatalogueResponse(
-    result.payload
-  );
-
-  const plans = normalizeCatalogue(rawPlans);
-
-  return plans;
 }
 
-function buildCacheKey(network, type) {
+function buildCacheKey(
+  network,
+  type
+) {
   return `${network || "all"}:${type || "all"}`;
 }
 
 function getCachedEntry(key) {
-  const entry = catalogueCache.get(key);
+  const entry =
+    catalogueCache.get(key);
 
   if (!entry) {
     return null;
   }
 
-  if (entry.expiresAt <= Date.now()) {
+  if (
+    entry.expiresAt <= Date.now()
+  ) {
     catalogueCache.delete(key);
     return null;
   }
@@ -593,15 +718,29 @@ function getCachedEntry(key) {
   return entry;
 }
 
-async function getPlans(options = {}) {
-  const network = normalizeNetwork(options.network);
-  const type = normalizeType(options.type);
+async function getPlans(
+  options = {}
+) {
+  const network =
+    normalizeNetwork(
+      options.network
+    );
 
-  const forceRefresh = options.forceRefresh === true;
-  const cacheKey = buildCacheKey(network, type);
+  const type =
+    normalizeType(options.type);
+
+  const forceRefresh =
+    options.forceRefresh === true;
+
+  const cacheKey =
+    buildCacheKey(
+      network,
+      type
+    );
 
   if (!forceRefresh) {
-    const cached = getCachedEntry(cacheKey);
+    const cached =
+      getCachedEntry(cacheKey);
 
     if (cached) {
       return cached.plans;
@@ -609,60 +748,88 @@ async function getPlans(options = {}) {
   }
 
   if (!forceRefresh) {
-    const existingRefresh = refreshPromises.get(cacheKey);
+    const existingRefresh =
+      refreshPromises.get(
+        cacheKey
+      );
 
     if (existingRefresh) {
       return existingRefresh;
     }
   }
 
-  const refreshPromise = fetchPlans({
-    network,
-    type
-  })
-    .then((plans) => {
-      const fetchedAt = Date.now();
+  const refreshPromise =
+    fetchPlans({
+      network,
+      type
+    })
+      .then((plans) => {
+        const fetchedAt =
+          Date.now();
 
-      const config = getConfig();
+        const config =
+          getConfig();
 
-      catalogueCache.set(cacheKey, {
-        plans,
-        fetchedAt,
-        expiresAt: fetchedAt + config.cacheTtlMs
+        catalogueCache.set(
+          cacheKey,
+          {
+            plans,
+            fetchedAt,
+            expiresAt:
+              fetchedAt +
+              config.cacheTtlMs
+          }
+        );
+
+        return plans;
+      })
+      .finally(() => {
+        refreshPromises.delete(
+          cacheKey
+        );
       });
 
-      return plans;
-    })
-    .finally(() => {
-      refreshPromises.delete(cacheKey);
-    });
-
-  refreshPromises.set(cacheKey, refreshPromise);
+  refreshPromises.set(
+    cacheKey,
+    refreshPromise
+  );
 
   return refreshPromise;
 }
 
-async function getPlanById(planId, options = {}) {
-  const normalizedPlanId = normalizePlanId(planId);
+async function getPlanById(
+  planId,
+  options = {}
+) {
+  const normalizedPlanId =
+    normalizePlanId(planId);
 
-  const plans = await getPlans({
-    network: options.network,
-    type: options.type,
-    forceRefresh: options.forceRefresh === true
-  });
+  const plans =
+    await getPlans({
+      network: options.network,
+      type: options.type,
+      forceRefresh:
+        options.forceRefresh === true
+    });
 
   return (
     plans.find(
-      (plan) => plan.planId === normalizedPlanId
+      (plan) =>
+        plan.planId ===
+        normalizedPlanId
     ) || null
   );
 }
 
-async function requirePlan(planId, options = {}) {
-  const plan = await getPlanById(
-    planId,
-    options
-  );
+async function requirePlan(
+  planId,
+  options = {}
+) {
+  const plan =
+    await getPlanById(
+      planId,
+      options
+    );
 
   if (!plan) {
     throw createCatalogueError(
@@ -671,7 +838,9 @@ async function requirePlan(planId, options = {}) {
     );
   }
 
-  if (plan.status !== "active") {
+  if (
+    plan.status !== "active"
+  ) {
     throw createCatalogueError(
       "Data plan is not active.",
       "DATA_PLAN_NOT_ACTIVE"
@@ -679,7 +848,8 @@ async function requirePlan(planId, options = {}) {
   }
 
   if (
-    options.network !== undefined &&
+    options.network !==
+      undefined &&
     options.network !== null &&
     String(plan.networkId) !==
       String(options.network)
@@ -691,10 +861,15 @@ async function requirePlan(planId, options = {}) {
   }
 
   if (
-    options.type !== undefined &&
+    options.type !==
+      undefined &&
     options.type !== null &&
-    String(plan.planType).toLowerCase() !==
-      String(options.type).toLowerCase()
+    String(
+      plan.planType
+    ).toLowerCase() !==
+      String(
+        options.type
+      ).toLowerCase()
   ) {
     throw createCatalogueError(
       "Data plan type mismatch.",
@@ -711,13 +886,18 @@ function clearCache() {
 }
 
 function getNetworkName(network) {
-  const normalizedNetwork = normalizeNetwork(network);
+  const normalizedNetwork =
+    normalizeNetwork(network);
 
   if (!normalizedNetwork) {
     return null;
   }
 
-  return NETWORK_NAMES[normalizedNetwork] || null;
+  return (
+    NETWORK_NAMES[
+      normalizedNetwork
+    ] || null
+  );
 }
 
 module.exports = {
