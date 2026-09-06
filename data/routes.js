@@ -32,17 +32,80 @@ function createDataRouter(requireAuth) {
         const forceRefresh =
           req.query.refresh === "true";
 
+        /*
+         * TEMPORARY DATA CATALOGUE DIAGNOSTICS
+         *
+         * This does not change catalogue behaviour.
+         * It only tells us whether this route is being
+         * reached and what getPlans() returns.
+         */
+        console.log(
+          "[DATA DEBUG] GET /api/data/plans requested",
+          {
+            network: network ?? null,
+            type: type ?? null,
+            forceRefresh,
+            uid: req.user?.uid || req.user?.userId || null,
+          }
+        );
+
+        console.log(
+          "[DATA DEBUG] Calling getPlans()..."
+        );
+
         const plans = await getPlans({
           network,
           type,
           forceRefresh,
         });
 
+        console.log(
+          "[DATA DEBUG] getPlans() completed",
+          {
+            isArray: Array.isArray(plans),
+            planCount: Array.isArray(plans)
+              ? plans.length
+              : null,
+          }
+        );
+
+        if (
+          Array.isArray(plans) &&
+          plans.length > 0
+        ) {
+          console.log(
+            "[DATA DEBUG] First returned plan:",
+            plans[0]
+          );
+        } else {
+          console.log(
+            "[DATA DEBUG] NO PLANS RETURNED BY getPlans()"
+          );
+        }
+
+        console.log(
+          "[DATA DEBUG] Sending catalogue response to frontend",
+          {
+            planCount: Array.isArray(plans)
+              ? plans.length
+              : 0,
+          }
+        );
+
         return res.status(200).json({
           ok: true,
           plans,
         });
       } catch (error) {
+        console.error(
+          "[DATA DEBUG] Catalogue request FAILED",
+          {
+            message: error?.message,
+            code: error?.code,
+            stack: error?.stack,
+          }
+        );
+
         console.error(
           "Data catalogue error:",
           error
