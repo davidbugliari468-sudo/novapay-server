@@ -5,8 +5,12 @@ const SUPPORTED_NETWORKS = new Set(["1", "2", "3", "4"]);
 const MAX_REFERENCE_LENGTH = 150;
 const MAX_PLAN_ID_LENGTH = 100;
 const MAX_PHONE_LENGTH = 15;
+const MAX_UID_LENGTH = 200;
 
-const PHONE_PATTERN = /^0[789][01]\d{8}$/;
+const LOCAL_PHONE_PATTERN = /^0[789]\d{9}$/;
+const INTERNATIONAL_PHONE_PATTERN = /^234[789]\d{9}$/;
+const PLUS_INTERNATIONAL_PHONE_PATTERN = /^\+234[789]\d{9}$/;
+
 const REFERENCE_PATTERN = /^[A-Za-z0-9._:-]+$/;
 const PLAN_ID_PATTERN = /^[A-Za-z0-9._:-]+$/;
 
@@ -33,19 +37,33 @@ function normalizeNetwork(value) {
 function normalizePhoneNumber(value) {
   const raw = String(value ?? "").trim();
 
-  const digitsOnly = raw.replace(/[\s()-]/g, "");
+  if (!raw) {
+    throw createValidationError(
+      "Phone number is required.",
+      "INVALID_PHONE_NUMBER"
+    );
+  }
 
-  let normalized = digitsOnly;
+  const compact = raw.replace(/[\s()-]/g, "");
 
-  if (/^234[789]\d{9}$/.test(normalized)) {
-    normalized = `0${normalized.slice(3)}`;
-  } else if (/^\+234[789]\d{9}$/.test(normalized)) {
-    normalized = `0${normalized.slice(4)}`;
+  let normalized;
+
+  if (LOCAL_PHONE_PATTERN.test(compact)) {
+    normalized = compact;
+  } else if (INTERNATIONAL_PHONE_PATTERN.test(compact)) {
+    normalized = `0${compact.slice(3)}`;
+  } else if (PLUS_INTERNATIONAL_PHONE_PATTERN.test(compact)) {
+    normalized = `0${compact.slice(4)}`;
+  } else {
+    throw createValidationError(
+      "Invalid Nigerian phone number.",
+      "INVALID_PHONE_NUMBER"
+    );
   }
 
   if (
     normalized.length > MAX_PHONE_LENGTH ||
-    !PHONE_PATTERN.test(normalized)
+    !LOCAL_PHONE_PATTERN.test(normalized)
   ) {
     throw createValidationError(
       "Invalid Nigerian phone number.",
@@ -74,11 +92,15 @@ function normalizePlanId(value) {
 }
 
 function normalizeReference(value) {
-  const reference = String(value ?? "").trim();
-
-  if (!reference) {
+  if (
+    value === undefined ||
+    value === null ||
+    String(value).trim() === ""
+  ) {
     return null;
   }
+
+  const reference = String(value).trim();
 
   if (
     reference.length > MAX_REFERENCE_LENGTH ||
@@ -94,7 +116,11 @@ function normalizeReference(value) {
 }
 
 function validatePurchaseInput(input) {
-  if (!input || typeof input !== "object" || Array.isArray(input)) {
+  if (
+    !input ||
+    typeof input !== "object" ||
+    Array.isArray(input)
+  ) {
     throw createValidationError(
       "Invalid purchase request.",
       "INVALID_REQUEST"
@@ -105,14 +131,17 @@ function validatePurchaseInput(input) {
     network: normalizeNetwork(input.network),
     phoneNumber: normalizePhoneNumber(input.phoneNumber),
     planId: normalizePlanId(input.planId),
-    reference: normalizeReference(input.reference),
+    reference: normalizeReference(input.reference)
   };
 }
 
 function validateUid(uid) {
   const value = String(uid ?? "").trim();
 
-  if (!value || value.length > 200) {
+  if (
+    !value ||
+    value.length > MAX_UID_LENGTH
+  ) {
     throw createValidationError(
       "Invalid user.",
       "INVALID_UID"
@@ -129,5 +158,5 @@ module.exports = {
   normalizePlanId,
   normalizeReference,
   validatePurchaseInput,
-  validateUid,
+  validateUid
 };

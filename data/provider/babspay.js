@@ -10,7 +10,7 @@ const REQUERY_PATH = "/api/transaction/status";
 const SAFE_REFERENCE_PATTERN = /^[A-Za-z0-9._:-]{1,150}$/;
 const SAFE_PLAN_ID_PATTERN = /^[A-Za-z0-9._:-]{1,100}$/;
 const NETWORK_PATTERN = /^[0-9]{1,10}$/;
-const PHONE_PATTERN = /^0[789][01][0-9]{8}$/;
+const NIGERIAN_LOCAL_PHONE_PATTERN = /^0[789][0-9]{9}$/;
 
 function getConfig() {
   const apiKey = String(process.env.BABSPAY_API_KEY || "").trim();
@@ -23,7 +23,9 @@ function getConfig() {
   }
 
   const baseUrl = String(
-    process.env.BABSPAY_API_BASE_URL || DEFAULT_BASE_URL
+    process.env.BABSPAY_API_BASE_URL ||
+      process.env.BABSPAY_BASE_URL ||
+      DEFAULT_BASE_URL
   )
     .trim()
     .replace(/\/+$/, "");
@@ -33,7 +35,9 @@ function getConfig() {
   );
 
   const timeoutMs =
-    Number.isFinite(timeoutValue) && timeoutValue >= 1000 && timeoutValue <= 60000
+    Number.isFinite(timeoutValue) &&
+    timeoutValue >= 1000 &&
+    timeoutValue <= 60000
       ? Math.floor(timeoutValue)
       : DEFAULT_TIMEOUT_MS;
 
@@ -56,18 +60,34 @@ function createProviderError(message, code, details = {}) {
 function normalizePhoneNumber(value) {
   const phone = String(value || "").trim().replace(/\s+/g, "");
 
-  if (!PHONE_PATTERN.test(phone)) {
-    throw createProviderError(
-      "Invalid Nigerian phone number.",
-      "BABSPAY_INVALID_PHONE"
-    );
+  if (phone.startsWith("+234")) {
+    const localPhone = `0${phone.slice(4)}`;
+
+    if (NIGERIAN_LOCAL_PHONE_PATTERN.test(localPhone)) {
+      return localPhone;
+    }
   }
 
-  return phone;
+  if (phone.startsWith("234")) {
+    const localPhone = `0${phone.slice(3)}`;
+
+    if (NIGERIAN_LOCAL_PHONE_PATTERN.test(localPhone)) {
+      return localPhone;
+    }
+  }
+
+  if (NIGERIAN_LOCAL_PHONE_PATTERN.test(phone)) {
+    return phone;
+  }
+
+  throw createProviderError(
+    "Invalid Nigerian phone number.",
+    "BABSPAY_INVALID_PHONE"
+  );
 }
 
 function normalizeNetwork(value) {
-  const network = String(value || "").trim();
+  const network = String(value ?? "").trim();
 
   if (!NETWORK_PATTERN.test(network)) {
     throw createProviderError(
@@ -80,7 +100,7 @@ function normalizeNetwork(value) {
 }
 
 function normalizePlanId(value) {
-  const planId = String(value || "").trim();
+  const planId = String(value ?? "").trim();
 
   if (!SAFE_PLAN_ID_PATTERN.test(planId)) {
     throw createProviderError(
@@ -93,7 +113,7 @@ function normalizePlanId(value) {
 }
 
 function normalizeReference(value) {
-  const reference = String(value || "").trim();
+  const reference = String(value ?? "").trim();
 
   if (!SAFE_REFERENCE_PATTERN.test(reference)) {
     throw createProviderError(
@@ -103,6 +123,22 @@ function normalizeReference(value) {
   }
 
   return reference;
+}
+
+function safeString(value) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+
+  const result = String(value).trim();
+
+  return result || null;
+}
+
+function normalizeStatus(value) {
+  return String(value ?? "")
+    .trim()
+    .toLowerCase();
 }
 
 async function parseResponseBody(response) {
@@ -130,9 +166,17 @@ async function request({
   const config = getConfig();
 
   const controller = new AbortController();
+
+  const effectiveTimeoutMs =
+    Number.isFinite(timeoutMs) &&
+    timeoutMs >= 1000 &&
+    timeoutMs <= 60000
+      ? Math.floor(timeoutMs)
+      : config.timeoutMs;
+
   const timeout = setTimeout(() => {
     controller.abort();
-  }, timeoutMs || config.timeoutMs);
+  }, effectiveTimeoutMs);
 
   const headers = {
     Accept: "application/json",
@@ -235,11 +279,9 @@ function getPurchaseStatus(providerResponse) {
     return "unknown";
   }
 
-  const status = String(
-    providerResponse.status ?? providerResponse.Status ?? ""
-  )
-    .trim()
-    .toLowerCase();
+  const status = normalizeStatus(
+    providerResponse.status ?? providerResponse.Status
+  );
 
   if (status === "success" || status === "successful") {
     return "successful";
@@ -261,10 +303,7 @@ function getPurchaseStatus(providerResponse) {
     return "failed";
   }
 
-  if (
-    status === "reversed" ||
-    status === "reverse"
-  ) {
+  if (status === "reversed" || status === "reverse") {
     return "reversed";
   }
 
@@ -278,12 +317,12 @@ function getProviderReference(providerResponse) {
 
   const candidates = [
     providerResponse.ref,
-    providerResponse.data && providerResponse.data.ref,
+    providerResponse.data?.ref,
     providerResponse.ident,
   ];
 
   for (const candidate of candidates) {
-    const value = String(candidate || "").trim();
+    const value = safeString(candidate);
 
     if (value && SAFE_REFERENCE_PATTERN.test(value)) {
       return value;
@@ -298,13 +337,115 @@ function getCustomerReference(providerResponse) {
     return null;
   }
 
-  const value = String(
-    providerResponse.customer_ref ||
-      providerResponse.customerReference ||
-      ""
-  ).trim();
+  return (
+    safeString(providerResponse.customer_ref) ||
+    safeString(providerResponse.customerReference)
+  );
+}
 
-  return value || null;
+function getProviderPlanId(providerResponse) {
+  if (!providerResponse || typeof providerResponse !== "object") {
+    return null;
+  }
+
+  return (
+    safeString(providerResponse.plan) ||
+    safeString(providerResponse.plan_id) ||
+    safeString(providerResponse.data_plan)
+  );
+}
+
+function getProviderNetwork(providerResponse) {
+  if (!providerResponse || typeof providerResponse !== "object") {
+    return null;
+  }
+
+  return (
+    safeString(providerResponse.network) ||
+    safeString(providerResponse.network_id)
+  );
+}
+
+function getProviderPhone(providerResponse) {
+  if (!providerResponse || typeof providerResponse !== "object") {
+    return null;
+  }
+
+  return (
+    safeString(providerResponse.mobile_number) ||
+    safeString(providerResponse.phone) ||
+    safeString(providerResponse.phone_number)
+  );
+}
+
+function getProviderAmountNaira(providerResponse) {
+  if (!providerResponse || typeof providerResponse !== "object") {
+    return null;
+  }
+
+  const value =
+    providerResponse.plan_amount ??
+    providerResponse.amount ??
+    providerResponse.price ??
+    providerResponse.data?.amount;
+
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+
+  const amount = Number(String(value).replace(/,/g, ""));
+
+  return Number.isFinite(amount) && amount >= 0 ? amount : null;
+}
+
+function verifyPurchaseIdentity({
+  providerResponse,
+  requestReference,
+  requestPlanId,
+  requestNetwork,
+  requestPhone,
+}) {
+  const providerReference = getProviderReference(providerResponse);
+  const customerReference = getCustomerReference(providerResponse);
+  const providerPlanId = getProviderPlanId(providerResponse);
+  const providerNetwork = getProviderNetwork(providerResponse);
+  const providerPhone = getProviderPhone(providerResponse);
+
+  const mismatches = [];
+
+  if (customerReference && customerReference !== requestReference) {
+    mismatches.push("customer_reference");
+  }
+
+  if (providerPlanId && providerPlanId !== requestPlanId) {
+    mismatches.push("plan_id");
+  }
+
+  if (providerNetwork && providerNetwork !== requestNetwork) {
+    mismatches.push("network");
+  }
+
+  if (providerPhone) {
+    try {
+      const normalizedProviderPhone = normalizePhoneNumber(providerPhone);
+
+      if (normalizedProviderPhone !== requestPhone) {
+        mismatches.push("phone");
+      }
+    } catch {
+      mismatches.push("phone");
+    }
+  }
+
+  return {
+    valid: mismatches.length === 0,
+    mismatches,
+    providerReference,
+    customerReference,
+    providerPlanId,
+    providerNetwork,
+    providerPhone,
+  };
 }
 
 async function purchaseData({
@@ -331,18 +472,47 @@ async function purchaseData({
 
   const providerResponse = result.response;
   const status = getPurchaseStatus(providerResponse);
-  const providerReference = getProviderReference(providerResponse);
-  const customerReference = getCustomerReference(providerResponse);
+  const identity = verifyPurchaseIdentity({
+    providerResponse,
+    requestReference: normalizedReference,
+    requestPlanId: normalizedPlanId,
+    requestNetwork: normalizedNetwork,
+    requestPhone: normalizedPhone,
+  });
 
-  if (status === "successful" && !providerReference) {
+  if (status === "successful" && !identity.providerReference) {
     return {
       ok: false,
       outcome: "unknown",
       httpStatus: result.httpStatus,
       providerReference: null,
-      customerReference,
+      customerReference: identity.customerReference,
+      providerPlanId: identity.providerPlanId,
+      providerNetwork: identity.providerNetwork,
+      providerPhone: identity.providerPhone,
+      providerAmountNaira: getProviderAmountNaira(providerResponse),
+      identityVerified: false,
+      identityMismatches: ["missing_provider_reference"],
       response: providerResponse,
       errorCode: "BABSPAY_SUCCESS_MISSING_REFERENCE",
+    };
+  }
+
+  if (!identity.valid) {
+    return {
+      ok: false,
+      outcome: "unknown",
+      httpStatus: result.httpStatus,
+      providerReference: identity.providerReference,
+      customerReference: identity.customerReference,
+      providerPlanId: identity.providerPlanId,
+      providerNetwork: identity.providerNetwork,
+      providerPhone: identity.providerPhone,
+      providerAmountNaira: getProviderAmountNaira(providerResponse),
+      identityVerified: false,
+      identityMismatches: identity.mismatches,
+      response: providerResponse,
+      errorCode: "BABSPAY_RESPONSE_MISMATCH",
     };
   }
 
@@ -350,8 +520,14 @@ async function purchaseData({
     ok: true,
     outcome: status,
     httpStatus: result.httpStatus,
-    providerReference,
-    customerReference,
+    providerReference: identity.providerReference,
+    customerReference: identity.customerReference,
+    providerPlanId: identity.providerPlanId,
+    providerNetwork: identity.providerNetwork,
+    providerPhone: identity.providerPhone,
+    providerAmountNaira: getProviderAmountNaira(providerResponse),
+    identityVerified: true,
+    identityMismatches: [],
     response: providerResponse,
   };
 }
@@ -367,7 +543,7 @@ async function getWalletBalance() {
   if (
     !providerResponse ||
     typeof providerResponse !== "object" ||
-    String(providerResponse.status || "").toLowerCase() !== "success"
+    normalizeStatus(providerResponse.status) !== "success"
   ) {
     throw createProviderError(
       "BabsPay returned an invalid wallet balance response.",
@@ -380,7 +556,7 @@ async function getWalletBalance() {
   }
 
   const balance = Number(
-    String(providerResponse.balance || "").replace(/,/g, "")
+    String(providerResponse.balance ?? "").replace(/,/g, "")
   );
 
   if (!Number.isFinite(balance) || balance < 0) {
@@ -413,9 +589,11 @@ function getRequeryStatus(providerResponse) {
       ? providerResponse.response
       : null;
 
-  const status = String(transaction?.status || "")
-    .trim()
-    .toLowerCase();
+  if (!transaction) {
+    return "unknown";
+  }
+
+  const status = normalizeStatus(transaction.status);
 
   if (status === "success" || status === "successful") {
     return "successful";
@@ -437,10 +615,7 @@ function getRequeryStatus(providerResponse) {
     return "failed";
   }
 
-  if (
-    status === "reversed" ||
-    status === "reverse"
-  ) {
+  if (status === "reversed" || status === "reverse") {
     return "reversed";
   }
 
@@ -463,7 +638,7 @@ async function requeryTransaction(reference) {
   if (
     providerResponse &&
     typeof providerResponse === "object" &&
-    String(providerResponse.status || "").toLowerCase() === "error"
+    normalizeStatus(providerResponse.status) === "error"
   ) {
     const code = Number(providerResponse.code);
 
@@ -473,12 +648,21 @@ async function requeryTransaction(reference) {
         outcome: "not_found",
         httpStatus: result.httpStatus,
         providerReference: normalizedReference,
+        identityVerified: false,
         response: providerResponse,
       };
     }
-  }
 
-  const outcome = getRequeryStatus(providerResponse);
+    return {
+      ok: false,
+      outcome: "unknown",
+      httpStatus: result.httpStatus,
+      providerReference: normalizedReference,
+      identityVerified: false,
+      response: providerResponse,
+      errorCode: "BABSPAY_REQUERY_ERROR",
+    };
+  }
 
   const transaction =
     providerResponse &&
@@ -486,16 +670,54 @@ async function requeryTransaction(reference) {
       ? providerResponse.response
       : null;
 
-  const providerReference = String(
-    transaction?.transref || normalizedReference
-  ).trim();
+  if (!transaction) {
+    return {
+      ok: false,
+      outcome: "unknown",
+      httpStatus: result.httpStatus,
+      providerReference: null,
+      identityVerified: false,
+      response: providerResponse,
+      errorCode: "BABSPAY_INVALID_REQUERY_RESPONSE",
+    };
+  }
+
+  const providerReference = safeString(transaction.transref);
+
+  if (!providerReference) {
+    return {
+      ok: false,
+      outcome: "unknown",
+      httpStatus: result.httpStatus,
+      providerReference: null,
+      identityVerified: false,
+      response: providerResponse,
+      errorCode: "BABSPAY_REQUERY_MISSING_REFERENCE",
+    };
+  }
+
+  if (providerReference !== normalizedReference) {
+    return {
+      ok: false,
+      outcome: "unknown",
+      httpStatus: result.httpStatus,
+      providerReference,
+      identityVerified: false,
+      response: providerResponse,
+      errorCode: "BABSPAY_REQUERY_REFERENCE_MISMATCH",
+    };
+  }
+
+  const outcome = getRequeryStatus(providerResponse);
 
   return {
     ok: true,
     outcome,
     httpStatus: result.httpStatus,
     providerReference,
-    amountNaira: transaction?.amount ?? null,
+    identityVerified: true,
+    amountNaira: transaction.amount ?? null,
+    service: safeString(transaction.service),
     response: providerResponse,
   };
 }

@@ -1,22 +1,10 @@
 "use strict";
 
-const https = require("https");
+const DEFAULT_BASE_URL = "https://babspay.com.ng";
+const DEFAULT_TIMEOUT_MS = 15000;
+const DEFAULT_CACHE_TTL_MS = 60000;
 
-const BABSPAY_BASE_URL = (
-  process.env.BABSPAY_BASE_URL || "https://babspay.com.ng"
-).replace(/\/+$/, "");
-
-const BABSPAY_API_KEY = String(process.env.BABSPAY_API_KEY || "").trim();
-
-const REQUEST_TIMEOUT_MS = Number.parseInt(
-  process.env.BABSPAY_CATALOG_TIMEOUT_MS || "15000",
-  10
-);
-
-const CACHE_TTL_MS = Number.parseInt(
-  process.env.BABSPAY_CATALOG_CACHE_TTL_MS || "60000",
-  10
-);
+const CATALOGUE_PATH = "/api/data_plans";
 
 const SUPPORTED_NETWORKS = new Set(["1", "2", "3", "4"]);
 const SUPPORTED_TYPES = new Set(["sme", "gifting", "corporate"]);
@@ -28,163 +16,301 @@ const NETWORK_NAMES = Object.freeze({
   "4": "9mobile"
 });
 
-let catalogueCache = null;
-let catalogueCacheExpiresAt = 0;
-let catalogueRefreshPromise = null;
+let catalogueCache = new Map();
+let refreshPromises = new Map();
 
-function assertConfiguration() {
-  if (!BABSPAY_API_KEY) {
-    throw new Error("BABSPAY_API_KEY is not configured");
+function createCatalogueError(message, code, details = {}) {
+  const error = new Error(message);
+
+  error.code = code;
+  error.retryable = Boolean(details.retryable);
+  error.statusCode = details.statusCode ?? null;
+  error.providerResponse = details.providerResponse ?? null;
+
+  return error;
+}
+
+function getConfig() {
+  const apiKey = String(process.env.BABSPAY_API_KEY || "").trim();
+
+  if (!apiKey) {
+    throw createCatalogueError(
+      "BabsPay API key is not configured.",
+      "BABSPAY_NOT_CONFIGURED",
+      {
+        retryable: false
+      }
+    );
   }
 
-  if (
-    !Number.isInteger(REQUEST_TIMEOUT_MS) ||
-    REQUEST_TIMEOUT_MS < 1000 ||
-    REQUEST_TIMEOUT_MS > 60000
-  ) {
-    throw new Error("Invalid BABSPAY_CATALOG_TIMEOUT_MS configuration");
+  const baseUrl = String(
+    process.env.BABSPAY_API_BASE_URL ||
+      process.env.BABSPAY_BASE_URL ||
+      DEFAULT_BASE_URL
+  )
+    .trim()
+    .replace(/\/+$/, "");
+
+  let parsedBaseUrl;
+
+  try {
+    parsedBaseUrl = new URL(baseUrl);
+  } catch {
+    throw createCatalogueError(
+      "Invalid BabsPay API base URL.",
+      "BABSPAY_INVALID_BASE_URL",
+      {
+        retryable: false
+      }
+    );
   }
 
-  if (
-    !Number.isInteger(CACHE_TTL_MS) ||
-    CACHE_TTL_MS < 5000 ||
-    CACHE_TTL_MS > 3600000
-  ) {
-    throw new Error("Invalid BABSPAY_CATALOG_CACHE_TTL_MS configuration");
+  if (parsedBaseUrl.protocol !== "https:") {
+    throw createCatalogueError(
+      "BabsPay API base URL must use HTTPS.",
+      "BABSPAY_INSECURE_BASE_URL",
+      {
+        retryable: false
+      }
+    );
   }
+
+  const timeoutValue = Number(
+    process.env.BABSPAY_CATALOG_TIMEOUT_MS ||
+      DEFAULT_TIMEOUT_MS
+  );
+
+  const timeoutMs =
+    Number.isFinite(timeoutValue) &&
+    timeoutValue >= 1000 &&
+    timeoutValue <= 60000
+      ? Math.floor(timeoutValue)
+      : DEFAULT_TIMEOUT_MS;
+
+  const cacheTtlValue = Number(
+    process.env.BABSPAY_CATALOG_CACHE_TTL_MS ||
+      DEFAULT_CACHE_TTL_MS
+  );
+
+  const cacheTtlMs =
+    Number.isFinite(cacheTtlValue) &&
+    cacheTtlValue >= 5000 &&
+    cacheTtlValue <= 3600000
+      ? Math.floor(cacheTtlValue)
+      : DEFAULT_CACHE_TTL_MS;
+
+  return {
+    apiKey,
+    baseUrl: parsedBaseUrl.toString().replace(/\/+$/, ""),
+    timeoutMs,
+    cacheTtlMs
+  };
 }
 
 function normalizeNetwork(network) {
-  if (network === undefined || network === null || network === "") {
+  if (
+    network === undefined ||
+    network === null ||
+    network === ""
+  ) {
     return null;
   }
 
   const value = String(network).trim();
 
   if (!SUPPORTED_NETWORKS.has(value)) {
-    throw new Error("Unsupported network");
+    throw createCatalogueError(
+      "Unsupported network.",
+      "DATA_UNSUPPORTED_NETWORK"
+    );
   }
 
   return value;
 }
 
 function normalizeType(type) {
-  if (type === undefined || type === null || type === "") {
+  if (
+    type === undefined ||
+    type === null ||
+    type === ""
+  ) {
     return null;
   }
 
   const value = String(type).trim().toLowerCase();
 
   if (!SUPPORTED_TYPES.has(value)) {
-    throw new Error("Unsupported data plan type");
+    throw createCatalogueError(
+      "Unsupported data plan type.",
+      "DATA_UNSUPPORTED_PLAN_TYPE"
+    );
   }
 
   return value;
 }
 
 function normalizePlanId(planId) {
-  if (planId === undefined || planId === null) {
-    throw new Error("Invalid BabsPay plan ID");
+  if (
+    planId === undefined ||
+    planId === null ||
+    planId === ""
+  ) {
+    throw createCatalogueError(
+      "Invalid BabsPay plan ID.",
+      "DATA_INVALID_PLAN_ID"
+    );
   }
 
   const value = String(planId).trim();
 
-  if (!/^\d+$/.test(value)) {
-    throw new Error("Invalid BabsPay plan ID");
-  }
-
-  if (value.length > 30) {
-    throw new Error("BabsPay plan ID is too long");
+  if (!/^\d+$/.test(value) || value.length > 30) {
+    throw createCatalogueError(
+      "Invalid BabsPay plan ID.",
+      "DATA_INVALID_PLAN_ID"
+    );
   }
 
   return value;
 }
 
 function parseMoneyToKobo(value) {
+  let normalized;
+
   if (typeof value === "number") {
     if (!Number.isFinite(value) || value < 0) {
-      throw new Error("Invalid BabsPay plan price");
+      throw createCatalogueError(
+        "Invalid BabsPay plan price.",
+        "DATA_INVALID_PLAN_PRICE"
+      );
     }
 
-    return Math.round(value * 100);
+    normalized = value.toFixed(2);
+  } else if (typeof value === "string") {
+    normalized = value.trim().replace(/,/g, "");
+  } else {
+    throw createCatalogueError(
+      "Invalid BabsPay plan price.",
+      "DATA_INVALID_PLAN_PRICE"
+    );
   }
-
-  if (typeof value !== "string") {
-    throw new Error("Invalid BabsPay plan price");
-  }
-
-  const normalized = value.trim().replace(/,/g, "");
 
   if (!/^\d+(?:\.\d{1,2})?$/.test(normalized)) {
-    throw new Error("Invalid BabsPay plan price");
+    throw createCatalogueError(
+      "Invalid BabsPay plan price.",
+      "DATA_INVALID_PLAN_PRICE"
+    );
   }
 
   const [nairaPart, decimalPart = ""] = normalized.split(".");
 
-  const naira = Number.parseInt(nairaPart, 10);
+  const naira = Number(nairaPart);
 
   if (!Number.isSafeInteger(naira) || naira < 0) {
-    throw new Error("Invalid BabsPay plan price");
+    throw createCatalogueError(
+      "Invalid BabsPay plan price.",
+      "DATA_INVALID_PLAN_PRICE"
+    );
   }
 
-  const decimal = Number(
-    decimalPart.padEnd(2, "0").slice(0, 2)
-  );
+  const paddedDecimal = decimalPart.padEnd(2, "0");
+  const koboDecimal = Number(paddedDecimal.slice(0, 2));
 
-  const kobo = naira * 100 + decimal;
+  const kobo = naira * 100 + koboDecimal;
 
   if (!Number.isSafeInteger(kobo) || kobo < 0) {
-    throw new Error("Invalid BabsPay plan price");
+    throw createCatalogueError(
+      "Invalid BabsPay plan price.",
+      "DATA_INVALID_PLAN_PRICE"
+    );
   }
 
   return kobo;
 }
 
 function normalizeStatus(status) {
-  return String(status || "").trim().toLowerCase();
+  return String(status ?? "")
+    .trim()
+    .toLowerCase();
 }
 
 function normalizePlan(rawPlan) {
-  if (!rawPlan || typeof rawPlan !== "object" || Array.isArray(rawPlan)) {
-    throw new Error("Invalid BabsPay plan record");
+  if (
+    !rawPlan ||
+    typeof rawPlan !== "object" ||
+    Array.isArray(rawPlan)
+  ) {
+    throw createCatalogueError(
+      "Invalid BabsPay plan record.",
+      "DATA_INVALID_PLAN_RECORD"
+    );
   }
 
   const planId = normalizePlanId(rawPlan.plan_id);
 
-  const networkId = String(rawPlan.network_id ?? "").trim();
+  const networkId = String(
+    rawPlan.network_id ?? ""
+  ).trim();
 
   if (!SUPPORTED_NETWORKS.has(networkId)) {
-    throw new Error(`Invalid network for BabsPay plan ${planId}`);
+    throw createCatalogueError(
+      `Invalid network for BabsPay plan ${planId}.`,
+      "DATA_INVALID_PLAN_NETWORK"
+    );
   }
 
-  const networkName = String(rawPlan.network_name || "").trim();
+  const networkName = String(
+    rawPlan.network_name ?? ""
+  ).trim();
 
   if (!networkName) {
-    throw new Error(`Missing network name for BabsPay plan ${planId}`);
+    throw createCatalogueError(
+      `Missing network name for BabsPay plan ${planId}.`,
+      "DATA_INVALID_PLAN_NETWORK_NAME"
+    );
   }
 
-  const planName = String(rawPlan.plan_name || "").trim();
+  const planName = String(
+    rawPlan.plan_name ?? ""
+  ).trim();
 
   if (!planName) {
-    throw new Error(`Missing plan name for BabsPay plan ${planId}`);
+    throw createCatalogueError(
+      `Missing plan name for BabsPay plan ${planId}.`,
+      "DATA_INVALID_PLAN_NAME"
+    );
   }
 
-  const planType = String(rawPlan.plan_type || "").trim().toLowerCase();
+  const planType = String(
+    rawPlan.plan_type ?? ""
+  )
+    .trim()
+    .toLowerCase();
 
   if (!SUPPORTED_TYPES.has(planType)) {
-    throw new Error(`Invalid plan type for BabsPay plan ${planId}`);
+    throw createCatalogueError(
+      `Invalid plan type for BabsPay plan ${planId}.`,
+      "DATA_INVALID_PLAN_TYPE"
+    );
   }
 
-  const validity = String(rawPlan.validity || "").trim();
+  const validity = String(
+    rawPlan.validity ?? ""
+  ).trim();
 
   if (!validity) {
-    throw new Error(`Missing validity for BabsPay plan ${planId}`);
+    throw createCatalogueError(
+      `Missing validity for BabsPay plan ${planId}.`,
+      "DATA_INVALID_PLAN_VALIDITY"
+    );
   }
 
   const status = normalizeStatus(rawPlan.status);
 
   if (status !== "active") {
-    throw new Error(`Inactive BabsPay plan received: ${planId}`);
+    throw createCatalogueError(
+      `Inactive BabsPay plan received: ${planId}.`,
+      "DATA_INACTIVE_PLAN"
+    );
   }
 
   const priceKobo = parseMoneyToKobo(rawPlan.price);
@@ -208,9 +334,9 @@ function normalizePlan(rawPlan) {
   });
 }
 
-function createRequestUrl(network, type) {
+function createRequestUrl(baseUrl, network, type) {
   const url = new URL(
-    `${BABSPAY_BASE_URL}/api/data_plans`
+    `${baseUrl}${CATALOGUE_PATH}`
   );
 
   if (network) {
@@ -224,95 +350,118 @@ function createRequestUrl(network, type) {
   return url;
 }
 
-function requestJson(url) {
-  return new Promise((resolve, reject) => {
-    const request = https.request(
-      url,
-      {
-        method: "GET",
-        headers: {
-          Accept: "application/json",
-          Authorization: `Token ${BABSPAY_API_KEY}`,
-          "User-Agent": "NovaPay-DataCatalog/1.0"
-        },
-        timeout: REQUEST_TIMEOUT_MS
+async function requestJson(url, timeoutMs, apiKey) {
+  const controller = new AbortController();
+
+  const timeout = setTimeout(() => {
+    controller.abort();
+  }, timeoutMs);
+
+  let response;
+
+  try {
+    response = await fetch(url, {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+        Authorization: `Token ${apiKey}`,
+        "User-Agent": "NovaPay-DataCatalog/1.0"
       },
-      (response) => {
-        let body = "";
+      signal: controller.signal
+    });
+  } catch (error) {
+    if (error && error.name === "AbortError") {
+      throw createCatalogueError(
+        "BabsPay catalogue request timed out.",
+        "BABSPAY_CATALOG_TIMEOUT",
+        {
+          retryable: true
+        }
+      );
+    }
 
-        response.setEncoding("utf8");
-
-        response.on("data", (chunk) => {
-          body += chunk;
-
-          if (body.length > 2 * 1024 * 1024) {
-            request.destroy(
-              new Error("BabsPay catalogue response is too large")
-            );
-          }
-        });
-
-        response.on("end", () => {
-          const statusCode = response.statusCode || 0;
-
-          let parsed;
-
-          try {
-            parsed = body ? JSON.parse(body) : null;
-          } catch {
-            const error = new Error(
-              "BabsPay returned invalid JSON"
-            );
-
-            error.code = "BABSPAY_INVALID_JSON";
-            error.statusCode = statusCode;
-
-            reject(error);
-            return;
-          }
-
-          if (statusCode < 200 || statusCode >= 300) {
-            const error = new Error(
-              `BabsPay catalogue request failed with HTTP ${statusCode}`
-            );
-
-            error.code =
-              statusCode === 401 || statusCode === 403
-                ? "BABSPAY_AUTH_ERROR"
-                : statusCode === 429
-                  ? "BABSPAY_RATE_LIMITED"
-                  : statusCode >= 500
-                    ? "BABSPAY_PROVIDER_ERROR"
-                    : "BABSPAY_HTTP_ERROR";
-
-            error.statusCode = statusCode;
-
-            reject(error);
-            return;
-          }
-
-          resolve(parsed);
-        });
+    throw createCatalogueError(
+      "Unable to reach BabsPay data catalogue.",
+      "BABSPAY_CATALOG_REQUEST_ERROR",
+      {
+        retryable: true
       }
     );
+  } finally {
+    clearTimeout(timeout);
+  }
 
-    request.on("timeout", () => {
-      request.destroy(new Error("BabsPay catalogue request timed out"));
-    });
+  const text = await response.text();
 
-    request.on("error", (error) => {
-      const wrappedError = new Error(
-        "Unable to retrieve Data plans from BabsPay"
+  let payload = null;
+
+  if (text) {
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      throw createCatalogueError(
+        "BabsPay returned invalid catalogue JSON.",
+        "BABSPAY_INVALID_JSON",
+        {
+          retryable: true,
+          statusCode: response.status
+        }
       );
+    }
+  }
 
-      wrappedError.code = "BABSPAY_CATALOG_REQUEST_ERROR";
-      wrappedError.cause = error;
+  if (response.status === 401 || response.status === 403) {
+    throw createCatalogueError(
+      "BabsPay catalogue authentication was rejected.",
+      "BABSPAY_AUTH_ERROR",
+      {
+        retryable: false,
+        statusCode: response.status,
+        providerResponse: payload
+      }
+    );
+  }
 
-      reject(wrappedError);
-    });
+  if (response.status === 429) {
+    throw createCatalogueError(
+      "BabsPay catalogue rate limit reached.",
+      "BABSPAY_RATE_LIMITED",
+      {
+        retryable: true,
+        statusCode: response.status,
+        providerResponse: payload
+      }
+    );
+  }
 
-    request.end();
-  });
+  if (response.status >= 500) {
+    throw createCatalogueError(
+      "BabsPay catalogue service is temporarily unavailable.",
+      "BABSPAY_PROVIDER_ERROR",
+      {
+        retryable: true,
+        statusCode: response.status,
+        providerResponse: payload
+      }
+    );
+  }
+
+  if (!response.ok) {
+    throw createCatalogueError(
+      "BabsPay rejected the catalogue request.",
+      "BABSPAY_HTTP_ERROR",
+      {
+        retryable: false,
+        statusCode: response.status,
+        providerResponse: payload
+      }
+    );
+  }
+
+  return {
+    statusCode: response.status,
+    payload
+  };
 }
 
 function validateCatalogueResponse(payload) {
@@ -321,50 +470,60 @@ function validateCatalogueResponse(payload) {
     typeof payload !== "object" ||
     Array.isArray(payload)
   ) {
-    throw new Error("Invalid BabsPay catalogue response");
+    throw createCatalogueError(
+      "Invalid BabsPay catalogue response.",
+      "BABSPAY_INVALID_CATALOGUE_RESPONSE"
+    );
   }
 
-  if (String(payload.status || "").trim().toLowerCase() !== "success") {
-    const error = new Error(
-      "BabsPay did not return a successful catalogue response"
+  if (
+    normalizeStatus(payload.status) !== "success"
+  ) {
+    throw createCatalogueError(
+      "BabsPay did not return a successful catalogue response.",
+      "BABSPAY_CATALOGUE_NOT_SUCCESSFUL",
+      {
+        providerResponse: payload
+      }
     );
-
-    error.code = "BABSPAY_CATALOGUE_NOT_SUCCESSFUL";
-    throw error;
   }
 
   if (!Array.isArray(payload.data)) {
-    throw new Error("BabsPay catalogue response contains no plan list");
+    throw createCatalogueError(
+      "BabsPay catalogue response contains no plan list.",
+      "BABSPAY_CATALOGUE_NO_PLANS",
+      {
+        providerResponse: payload
+      }
+    );
   }
 
   return payload.data;
 }
 
 function normalizeCatalogue(rawPlans) {
+  if (!Array.isArray(rawPlans)) {
+    throw createCatalogueError(
+      "BabsPay catalogue is not a plan array.",
+      "DATA_INVALID_CATALOGUE"
+    );
+  }
+
   const plans = [];
   const seenPlanIds = new Set();
 
   for (const rawPlan of rawPlans) {
-    try {
-      const plan = normalizePlan(rawPlan);
+    const plan = normalizePlan(rawPlan);
 
-      if (seenPlanIds.has(plan.planId)) {
-        throw new Error(
-          `Duplicate BabsPay plan ID: ${plan.planId}`
-        );
-      }
-
-      seenPlanIds.add(plan.planId);
-      plans.push(plan);
-    } catch (error) {
-      /*
-       * Invalid/inactive records are ignored rather than allowing
-       * one bad provider record to destroy the entire catalogue.
-       *
-       * The purchase service will only be able to use plans that
-       * successfully pass normalization here.
-       */
+    if (seenPlanIds.has(plan.planId)) {
+      throw createCatalogueError(
+        `Duplicate BabsPay plan ID: ${plan.planId}.`,
+        "DATA_DUPLICATE_PLAN_ID"
+      );
     }
+
+    seenPlanIds.add(plan.planId);
+    plans.push(plan);
   }
 
   plans.sort((a, b) => {
@@ -376,24 +535,40 @@ function normalizeCatalogue(rawPlans) {
       return a.priceKobo - b.priceKobo;
     }
 
-    return a.planId.localeCompare(b.planId, undefined, {
-      numeric: true
-    });
+    return a.planId.localeCompare(
+      b.planId,
+      undefined,
+      {
+        numeric: true
+      }
+    );
   });
 
   return Object.freeze(plans);
 }
 
 async function fetchPlans(options = {}) {
-  assertConfiguration();
+  const config = getConfig();
 
   const network = normalizeNetwork(options.network);
   const type = normalizeType(options.type);
 
-  const url = createRequestUrl(network, type);
+  const url = createRequestUrl(
+    config.baseUrl,
+    network,
+    type
+  );
 
-  const payload = await requestJson(url);
-  const rawPlans = validateCatalogueResponse(payload);
+  const result = await requestJson(
+    url,
+    config.timeoutMs,
+    config.apiKey
+  );
+
+  const rawPlans = validateCatalogueResponse(
+    result.payload
+  );
+
   const plans = normalizeCatalogue(rawPlans);
 
   return plans;
@@ -404,10 +579,6 @@ function buildCacheKey(network, type) {
 }
 
 function getCachedEntry(key) {
-  if (!catalogueCache) {
-    return null;
-  }
-
   const entry = catalogueCache.get(key);
 
   if (!entry) {
@@ -422,17 +593,7 @@ function getCachedEntry(key) {
   return entry;
 }
 
-function ensureCache() {
-  if (!catalogueCache) {
-    catalogueCache = new Map();
-  }
-
-  return catalogueCache;
-}
-
 async function getPlans(options = {}) {
-  assertConfiguration();
-
   const network = normalizeNetwork(options.network);
   const type = normalizeType(options.type);
 
@@ -447,10 +608,12 @@ async function getPlans(options = {}) {
     }
   }
 
-  const cache = ensureCache();
+  if (!forceRefresh) {
+    const existingRefresh = refreshPromises.get(cacheKey);
 
-  if (catalogueRefreshPromise && cacheKey === "all:all") {
-    return catalogueRefreshPromise;
+    if (existingRefresh) {
+      return existingRefresh;
+    }
   }
 
   const refreshPromise = fetchPlans({
@@ -458,23 +621,23 @@ async function getPlans(options = {}) {
     type
   })
     .then((plans) => {
-      cache.set(cacheKey, {
+      const fetchedAt = Date.now();
+
+      const config = getConfig();
+
+      catalogueCache.set(cacheKey, {
         plans,
-        fetchedAt: Date.now(),
-        expiresAt: Date.now() + CACHE_TTL_MS
+        fetchedAt,
+        expiresAt: fetchedAt + config.cacheTtlMs
       });
 
       return plans;
     })
     .finally(() => {
-      if (cacheKey === "all:all") {
-        catalogueRefreshPromise = null;
-      }
+      refreshPromises.delete(cacheKey);
     });
 
-  if (cacheKey === "all:all") {
-    catalogueRefreshPromise = refreshPromise;
-  }
+  refreshPromises.set(cacheKey, refreshPromise);
 
   return refreshPromise;
 }
@@ -489,33 +652,42 @@ async function getPlanById(planId, options = {}) {
   });
 
   return (
-    plans.find((plan) => plan.planId === normalizedPlanId) || null
+    plans.find(
+      (plan) => plan.planId === normalizedPlanId
+    ) || null
   );
 }
 
 async function requirePlan(planId, options = {}) {
-  const plan = await getPlanById(planId, options);
+  const plan = await getPlanById(
+    planId,
+    options
+  );
 
   if (!plan) {
-    const error = new Error("Data plan is not available");
-    error.code = "DATA_PLAN_NOT_FOUND";
-    throw error;
+    throw createCatalogueError(
+      "Data plan is not available.",
+      "DATA_PLAN_NOT_FOUND"
+    );
   }
 
   if (plan.status !== "active") {
-    const error = new Error("Data plan is not active");
-    error.code = "DATA_PLAN_NOT_ACTIVE";
-    throw error;
+    throw createCatalogueError(
+      "Data plan is not active.",
+      "DATA_PLAN_NOT_ACTIVE"
+    );
   }
 
   if (
     options.network !== undefined &&
     options.network !== null &&
-    String(plan.networkId) !== String(options.network)
+    String(plan.networkId) !==
+      String(options.network)
   ) {
-    const error = new Error("Data plan does not belong to the selected network");
-    error.code = "DATA_PLAN_NETWORK_MISMATCH";
-    throw error;
+    throw createCatalogueError(
+      "Data plan does not belong to the selected network.",
+      "DATA_PLAN_NETWORK_MISMATCH"
+    );
   }
 
   if (
@@ -524,26 +696,28 @@ async function requirePlan(planId, options = {}) {
     String(plan.planType).toLowerCase() !==
       String(options.type).toLowerCase()
   ) {
-    const error = new Error("Data plan type mismatch");
-    error.code = "DATA_PLAN_TYPE_MISMATCH";
-    throw error;
+    throw createCatalogueError(
+      "Data plan type mismatch.",
+      "DATA_PLAN_TYPE_MISMATCH"
+    );
   }
 
   return plan;
 }
 
 function clearCache() {
-  if (catalogueCache) {
-    catalogueCache.clear();
-  }
-
-  catalogueRefreshPromise = null;
+  catalogueCache.clear();
+  refreshPromises.clear();
 }
 
 function getNetworkName(network) {
   const normalizedNetwork = normalizeNetwork(network);
 
-  return NETWORK_NAMES[normalizedNetwork];
+  if (!normalizedNetwork) {
+    return null;
+  }
+
+  return NETWORK_NAMES[normalizedNetwork] || null;
 }
 
 module.exports = {

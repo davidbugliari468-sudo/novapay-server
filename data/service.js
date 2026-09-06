@@ -4,16 +4,17 @@ const crypto = require("crypto");
 
 const { db } = require("../firebase-admin");
 const babspay = require("./provider/babspay");
+
 const {
   validatePurchaseInput,
   validateUid,
-  normalizePhoneNumber,
   normalizeReference,
 } = require("./validation");
+
 const {
   getPlanById,
-  requirePlan,
 } = require("./catalog");
+
 const {
   reserveFunds,
   getReservation,
@@ -46,7 +47,11 @@ function createServiceError(message, code, details = {}) {
 function getMarkupKobo() {
   const raw = process.env.DATA_CUSTOMER_MARKUP_KOBO;
 
-  if (raw === undefined || raw === null || String(raw).trim() === "") {
+  if (
+    raw === undefined ||
+    raw === null ||
+    String(raw).trim() === ""
+  ) {
     return DEFAULT_MARKUP_KOBO;
   }
 
@@ -65,7 +70,11 @@ function getMarkupKobo() {
 function getMaxCustomerPriceKobo() {
   const raw = process.env.DATA_MAX_CUSTOMER_PRICE_KOBO;
 
-  if (raw === undefined || raw === null || String(raw).trim() === "") {
+  if (
+    raw === undefined ||
+    raw === null ||
+    String(raw).trim() === ""
+  ) {
     return DEFAULT_MAX_CUSTOMER_PRICE_KOBO;
   }
 
@@ -84,7 +93,10 @@ function getMaxCustomerPriceKobo() {
 function calculateCustomerPriceKobo(providerPriceKobo) {
   const providerPrice = Number(providerPriceKobo);
 
-  if (!Number.isSafeInteger(providerPrice) || providerPrice <= 0) {
+  if (
+    !Number.isSafeInteger(providerPrice) ||
+    providerPrice <= 0
+  ) {
     throw createServiceError(
       "Invalid provider data plan price.",
       "INVALID_PROVIDER_PLAN_PRICE"
@@ -109,6 +121,15 @@ function calculateCustomerPriceKobo(providerPriceKobo) {
   return customerPrice;
 }
 
+function createReservationIdForData(uid, reference) {
+  const hash = crypto
+    .createHash("sha256")
+    .update(`${uid}:${reference}`)
+    .digest("hex");
+
+  return `NPRES_${hash}`;
+}
+
 function createTransactionId(reservationId) {
   return `DATA_${reservationId}`;
 }
@@ -119,72 +140,18 @@ function transactionRef(transactionId) {
     .doc(transactionId);
 }
 
-function normalizeTransactionPhone(value) {
-  const normalized = normalizePhoneNumber(value);
-
-  if (!normalized) {
-    throw createServiceError(
-      "Invalid phone number.",
-      "INVALID_PHONE_NUMBER"
-    );
-  }
-
-  return normalized;
-}
-
 function normalizeProviderStatus(value) {
   return String(value || "")
     .trim()
     .toLowerCase();
 }
 
-function normalizeProviderOutcome(providerResult) {
-  if (!providerResult || typeof providerResult !== "object") {
-    return {
-      outcome: STATUS_UNKNOWN,
-      providerReference: null,
-      customerReference: null,
-      response: null,
-      message: null,
-    };
-  }
-
-  const outcome = normalizeProviderStatus(providerResult.outcome);
-
-  if (
-    outcome !== STATUS_SUCCESSFUL &&
-    outcome !== STATUS_PENDING &&
-    outcome !== STATUS_FAILED &&
-    outcome !== "reversed" &&
-    outcome !== STATUS_UNKNOWN
-  ) {
-    return {
-      outcome: STATUS_UNKNOWN,
-      providerReference:
-        providerResult.providerReference || null,
-      customerReference:
-        providerResult.customerReference || null,
-      response: providerResult.response || null,
-      message: providerResult.message || null,
-    };
-  }
-
-  return {
-    outcome:
-      outcome === "reversed"
-        ? STATUS_FAILED
-        : outcome,
-    providerReference:
-      providerResult.providerReference || null,
-    customerReference:
-      providerResult.customerReference || null,
-    response: providerResult.response || null,
-    message: providerResult.message || null,
-  };
-}
-
 function normalizeMoneyToKobo(value) {
-  if (value === null || value === undefined || value === "") {
+  if (
+    value === null ||
+    value === undefined ||
+    value === ""
+  ) {
     return null;
   }
 
@@ -203,12 +170,24 @@ function normalizeMoneyToKobo(value) {
   return Number.isSafeInteger(kobo) ? kobo : null;
 }
 
-function normalizeProviderResponse(response) {
-  if (!response || typeof response !== "object") {
+function normalizeComparablePhone(value) {
+  const raw = String(value || "")
+    .trim()
+    .replace(/[\s()-]/g, "");
+
+  if (!raw) {
     return null;
   }
 
-  return response;
+  if (/^\+234[789]\d{9}$/.test(raw)) {
+    return `0${raw.slice(4)}`;
+  }
+
+  if (/^234[789]\d{9}$/.test(raw)) {
+    return `0${raw.slice(3)}`;
+  }
+
+  return raw;
 }
 
 function getProviderPlanId(response) {
@@ -222,7 +201,10 @@ function getProviderPlanId(response) {
     response.data_plan ??
     null;
 
-  if (value === null || value === undefined) {
+  if (
+    value === null ||
+    value === undefined
+  ) {
     return null;
   }
 
@@ -239,7 +221,10 @@ function getProviderNetworkId(response) {
     response.network_id ??
     null;
 
-  if (value === null || value === undefined) {
+  if (
+    value === null ||
+    value === undefined
+  ) {
     return null;
   }
 
@@ -257,7 +242,10 @@ function getProviderPhone(response) {
     response.phone_number ??
     null;
 
-  if (value === null || value === undefined) {
+  if (
+    value === null ||
+    value === undefined
+  ) {
     return null;
   }
 
@@ -286,59 +274,64 @@ function getProviderCustomerReference(response) {
     response.customerReference ??
     null;
 
-  if (value === null || value === undefined) {
+  if (
+    value === null ||
+    value === undefined
+  ) {
     return null;
   }
 
   return String(value).trim() || null;
 }
 
-function normalizeComparablePhone(value) {
-  const raw = String(value || "")
-    .trim()
-    .replace(/\s+/g, "");
-
-  if (!raw) {
-    return null;
-  }
-
-  if (/^\+234\d{10}$/.test(raw)) {
-    return `0${raw.slice(4)}`;
-  }
-
-  if (/^234\d{10}$/.test(raw)) {
-    return `0${raw.slice(3)}`;
-  }
-
-  return raw;
-}
-
 function verifyProviderSuccess({
   providerResult,
   transaction,
 }) {
-  const response = normalizeProviderResponse(
-    providerResult.response
-  );
+  if (
+    !providerResult ||
+    typeof providerResult !== "object"
+  ) {
+    return {
+      verified: false,
+      reason: "missing_provider_result",
+    };
+  }
 
-  if (!response) {
+  const response =
+    providerResult.response;
+
+  if (
+    !response ||
+    typeof response !== "object"
+  ) {
     return {
       verified: false,
       reason: "missing_provider_response",
     };
   }
 
-  const requestedPlanId = String(transaction.planId);
-  const requestedNetworkId = String(transaction.networkId);
-  const requestedPhone = normalizeComparablePhone(
-    transaction.phoneNumber
-  );
+  const requestedPlanId =
+    String(transaction.planId);
 
-  const returnedPlanId = getProviderPlanId(response);
-  const returnedNetworkId = getProviderNetworkId(response);
-  const returnedPhone = normalizeComparablePhone(
-    getProviderPhone(response)
-  );
+  const requestedNetworkId =
+    String(transaction.networkId);
+
+  const requestedPhone =
+    normalizeComparablePhone(
+      transaction.phoneNumber
+    );
+
+  const returnedPlanId =
+    getProviderPlanId(response);
+
+  const returnedNetworkId =
+    getProviderNetworkId(response);
+
+  const returnedPhone =
+    normalizeComparablePhone(
+      getProviderPhone(response)
+    );
 
   const returnedPlanAmountKobo =
     getProviderPlanAmountKobo(response);
@@ -346,11 +339,13 @@ function verifyProviderSuccess({
   const returnedCustomerReference =
     getProviderCustomerReference(response);
 
-  if (returnedPlanId !== null && returnedPlanId !== requestedPlanId) {
+  if (
+    returnedPlanId !== null &&
+    returnedPlanId !== requestedPlanId
+  ) {
     return {
       verified: false,
       reason: "provider_plan_mismatch",
-      returnedPlanId,
     };
   }
 
@@ -361,7 +356,6 @@ function verifyProviderSuccess({
     return {
       verified: false,
       reason: "provider_network_mismatch",
-      returnedNetworkId,
     };
   }
 
@@ -372,42 +366,47 @@ function verifyProviderSuccess({
     return {
       verified: false,
       reason: "provider_phone_mismatch",
-      returnedPhone,
     };
   }
 
   if (
     returnedPlanAmountKobo !== null &&
-    returnedPlanAmountKobo !== transaction.providerPriceKobo
+    returnedPlanAmountKobo !==
+      transaction.providerPriceKobo
   ) {
     return {
       verified: false,
       reason: "provider_amount_mismatch",
-      returnedPlanAmountKobo,
     };
   }
 
   if (
     providerResult.customerReference &&
-    providerResult.customerReference !== transaction.reference
+    providerResult.customerReference !==
+      transaction.reference
   ) {
     return {
       verified: false,
-      reason: "provider_customer_reference_mismatch",
+      reason:
+        "provider_customer_reference_mismatch",
     };
   }
 
   if (
     returnedCustomerReference &&
-    returnedCustomerReference !== transaction.reference
+    returnedCustomerReference !==
+      transaction.reference
   ) {
     return {
       verified: false,
-      reason: "provider_customer_reference_mismatch",
+      reason:
+        "provider_customer_reference_mismatch",
     };
   }
 
-  if (!providerResult.providerReference) {
+  if (
+    !providerResult.providerReference
+  ) {
     return {
       verified: false,
       reason: "missing_provider_reference",
@@ -420,45 +419,151 @@ function verifyProviderSuccess({
   };
 }
 
-function createSafeTransactionSnapshot(transaction) {
+function normalizeProviderOutcome(providerResult) {
+  if (
+    !providerResult ||
+    typeof providerResult !== "object"
+  ) {
+    return {
+      outcome: STATUS_UNKNOWN,
+      providerReference: null,
+      customerReference: null,
+    };
+  }
+
+  const rawOutcome =
+    normalizeProviderStatus(
+      providerResult.outcome
+    );
+
+  let outcome = rawOutcome;
+
+  if (rawOutcome === "reversed") {
+    outcome = STATUS_FAILED;
+  }
+
+  if (
+    outcome !== STATUS_SUCCESSFUL &&
+    outcome !== STATUS_PENDING &&
+    outcome !== STATUS_FAILED &&
+    outcome !== STATUS_UNKNOWN
+  ) {
+    outcome = STATUS_UNKNOWN;
+  }
+
   return {
-    transactionId: transaction.transactionId,
-    uid: transaction.uid,
-    service: transaction.service,
-    provider: transaction.provider,
-    reference: transaction.reference,
+    outcome,
     providerReference:
-      transaction.providerReference || null,
-    networkId: transaction.networkId,
-    networkName: transaction.networkName,
-    planId: transaction.planId,
-    planCode: transaction.planCode,
-    planName: transaction.planName,
-    planType: transaction.planType,
-    validity: transaction.validity,
-    phoneNumber: transaction.phoneNumber,
-    providerPriceKobo: transaction.providerPriceKobo,
-    customerPriceKobo: transaction.customerPriceKobo,
-    status: transaction.status,
-    reconciliationRequired:
-      Boolean(transaction.reconciliationRequired),
-    createdAt: transaction.createdAt,
-    updatedAt: transaction.updatedAt,
-    completedAt: transaction.completedAt || null,
+      providerResult.providerReference ||
+      null,
+    customerReference:
+      providerResult.customerReference ||
+      null,
   };
 }
 
-async function getTransaction(transactionId) {
-  const id = String(transactionId || "").trim();
+function createSafeTransactionSnapshot(
+  transaction
+) {
+  return {
+    transactionId:
+      transaction.transactionId,
 
-  if (!/^DATA_NPRES_[a-f0-9]{64}$/.test(id)) {
+    uid: transaction.uid,
+
+    service:
+      transaction.service,
+
+    provider:
+      transaction.provider,
+
+    reference:
+      transaction.reference,
+
+    providerReference:
+      transaction.providerReference ||
+      null,
+
+    networkId:
+      transaction.networkId,
+
+    networkName:
+      transaction.networkName ||
+      null,
+
+    planId:
+      transaction.planId,
+
+    planCode:
+      transaction.planCode ||
+      null,
+
+    planName:
+      transaction.planName ||
+      null,
+
+    planType:
+      transaction.planType ||
+      null,
+
+    validity:
+      transaction.validity ||
+      null,
+
+    phoneNumber:
+      transaction.phoneNumber,
+
+    providerPriceKobo:
+      transaction.providerPriceKobo,
+
+    customerPriceKobo:
+      transaction.customerPriceKobo,
+
+    status:
+      transaction.status,
+
+    reconciliationRequired:
+      Boolean(
+        transaction.reconciliationRequired
+      ),
+
+    createdAt:
+      transaction.createdAt,
+
+    updatedAt:
+      transaction.updatedAt,
+
+    completedAt:
+      transaction.completedAt ||
+      null,
+
+    failureCode:
+      transaction.failureCode ||
+      null,
+
+    failureReason:
+      transaction.failureReason ||
+      null,
+  };
+}
+
+async function getTransaction(
+  transactionId
+) {
+  const id =
+    String(transactionId || "").trim();
+
+  if (
+    !/^DATA_NPRES_[a-f0-9]{64}$/.test(id)
+  ) {
     throw createServiceError(
       "Invalid data transaction ID.",
       "INVALID_DATA_TRANSACTION_ID"
     );
   }
 
-  const snapshot = await transactionRef(id).get();
+  const snapshot =
+    await transactionRef(id).get();
 
   if (!snapshot.exists) {
     throw createServiceError(
@@ -468,27 +573,32 @@ async function getTransaction(transactionId) {
   }
 
   return {
-    transactionId: snapshot.id,
+    transactionId:
+      snapshot.id,
     ...snapshot.data(),
   };
 }
 
-async function createTransactionRecord(transaction) {
-  const reference = transactionRef(
+async function createTransactionRecord(
+  transaction
+) {
+  await transactionRef(
     transaction.transactionId
-  );
-
-  await reference.create(transaction);
+  ).create(transaction);
 
   return transaction;
 }
 
-async function updateTransaction(transactionId, updates) {
-  const reference = transactionRef(transactionId);
-
-  await reference.update({
+async function updateTransaction(
+  transactionId,
+  updates
+) {
+  await transactionRef(
+    transactionId
+  ).update({
     ...updates,
-    updatedAt: new Date().toISOString(),
+    updatedAt:
+      new Date().toISOString(),
   });
 }
 
@@ -497,11 +607,16 @@ async function getLivePlan({
   network,
   type,
 }) {
-  const normalizedPlanId = String(planId || "").trim();
-  const normalizedNetwork = String(network || "").trim();
-  const normalizedType = String(type || "")
-    .trim()
-    .toLowerCase();
+  const normalizedPlanId =
+    String(planId || "").trim();
+
+  const normalizedNetwork =
+    String(network || "").trim();
+
+  const normalizedType =
+    String(type || "")
+      .trim()
+      .toLowerCase();
 
   if (!normalizedPlanId) {
     throw createServiceError(
@@ -517,16 +632,22 @@ async function getLivePlan({
     );
   }
 
-  const existingPlan = await getPlanById(
-    normalizedPlanId,
-    {
-      network: normalizedNetwork,
-      type: normalizedType || undefined,
-      forceRefresh: true,
-    }
-  );
+  const plan =
+    await getPlanById(
+      normalizedPlanId,
+      {
+        network:
+          normalizedNetwork,
 
-  if (!existingPlan) {
+        type:
+          normalizedType ||
+          undefined,
+
+        forceRefresh: true,
+      }
+    );
+
+  if (!plan) {
     throw createServiceError(
       "Selected data plan is no longer available.",
       "DATA_PLAN_NOT_AVAILABLE"
@@ -534,7 +655,8 @@ async function getLivePlan({
   }
 
   if (
-    String(existingPlan.networkId) !== normalizedNetwork
+    String(plan.networkId) !==
+    normalizedNetwork
   ) {
     throw createServiceError(
       "Selected data plan does not belong to the requested network.",
@@ -544,7 +666,9 @@ async function getLivePlan({
 
   if (
     normalizedType &&
-    String(existingPlan.planType || "").toLowerCase() !==
+    String(plan.planType || "")
+      .trim()
+      .toLowerCase() !==
       normalizedType
   ) {
     throw createServiceError(
@@ -553,7 +677,124 @@ async function getLivePlan({
     );
   }
 
-  return existingPlan;
+  if (
+    String(plan.status || "")
+      .trim()
+      .toLowerCase() !== "active"
+  ) {
+    throw createServiceError(
+      "Selected data plan is no longer available.",
+      "DATA_PLAN_NOT_ACTIVE"
+    );
+  }
+
+  return plan;
+}
+
+async function recoverExistingTransaction({
+  transactionId,
+  uid,
+  reference,
+  network,
+  phoneNumber,
+  planId,
+}) {
+  let transaction;
+
+  try {
+    transaction =
+      await getTransaction(transactionId);
+  } catch (error) {
+    if (
+      error.code ===
+      "DATA_TRANSACTION_NOT_FOUND"
+    ) {
+      return null;
+    }
+
+    throw error;
+  }
+
+  if (transaction.uid !== uid) {
+    throw createServiceError(
+      "Transaction ownership mismatch.",
+      "DATA_TRANSACTION_OWNERSHIP_MISMATCH"
+    );
+  }
+
+  if (
+    transaction.reference !==
+    reference
+  ) {
+    throw createServiceError(
+      "Transaction reference mismatch.",
+      "DATA_TRANSACTION_REFERENCE_MISMATCH"
+    );
+  }
+
+  if (
+    String(transaction.networkId) !==
+    String(network)
+  ) {
+    throw createServiceError(
+      "Existing transaction network does not match this purchase request.",
+      "DATA_TRANSACTION_REQUEST_MISMATCH"
+    );
+  }
+
+  if (
+    String(transaction.planId) !==
+    String(planId)
+  ) {
+    throw createServiceError(
+      "Existing transaction plan does not match this purchase request.",
+      "DATA_TRANSACTION_REQUEST_MISMATCH"
+    );
+  }
+
+  if (
+    normalizeComparablePhone(
+      transaction.phoneNumber
+    ) !==
+    normalizeComparablePhone(
+      phoneNumber
+    )
+  ) {
+    throw createServiceError(
+      "Existing transaction phone number does not match this purchase request.",
+      "DATA_TRANSACTION_REQUEST_MISMATCH"
+    );
+  }
+
+  return transaction;
+}
+
+async function ensureReservationOwnership({
+  reservationId,
+  uid,
+}) {
+  const reservation =
+    await getReservation(
+      reservationId
+    );
+
+  if (!reservation) {
+    throw createServiceError(
+      "Wallet reservation was not found.",
+      "RESERVATION_NOT_FOUND"
+    );
+  }
+
+  if (
+    reservation.uid !== uid
+  ) {
+    throw createServiceError(
+      "Reservation ownership mismatch.",
+      "RESERVATION_OWNERSHIP_MISMATCH"
+    );
+  }
+
+  return reservation;
 }
 
 async function purchaseData({
@@ -564,61 +805,65 @@ async function purchaseData({
   reference,
   type,
 }) {
-  const normalizedUid = validateUid(uid);
+  const normalizedUid =
+    validateUid(uid);
 
-  const normalizedReference =
-    normalizeReference(reference);
+  const validation =
+    validatePurchaseInput({
+      network,
+      phoneNumber,
+      planId,
+      reference,
+    });
 
-  const normalizedPhone =
-    normalizeTransactionPhone(phoneNumber);
-
-  const validation = validatePurchaseInput({
-    network,
-    phoneNumber: normalizedPhone,
-    planId,
-    reference: normalizedReference,
-  });
-
-  if (!validation.valid) {
-    throw createServiceError(
-      validation.message || "Invalid data purchase request.",
-      validation.code || "INVALID_DATA_PURCHASE"
-    );
-  }
-
-  const validatedNetwork = String(
-    validation.network || network
-  ).trim();
+  const validatedNetwork =
+    validation.network;
 
   const validatedPhone =
-    String(
-      validation.phoneNumber ||
-        validation.normalizedPhone ||
-        normalizedPhone
-    ).trim();
+    validation.phoneNumber;
 
-  const validatedPlanId = String(
-    validation.planId || planId
-  ).trim();
+  const validatedPlanId =
+    validation.planId;
 
-  const validatedReference = String(
-    validation.reference || normalizedReference
-  ).trim();
+  let validatedReference =
+    normalizeReference(
+      validation.reference
+    );
 
-  const livePlan = await getLivePlan({
-    planId: validatedPlanId,
-    network: validatedNetwork,
-    type,
-  });
+  /*
+   * The frontend normally supplies a unique reference.
+   * If an older client omits it, generate one on the server.
+   *
+   * This keeps financial values server-controlled while allowing
+   * legacy callers to continue functioning.
+   */
+  if (!validatedReference) {
+    validatedReference =
+      `DATA_${crypto
+        .randomBytes(24)
+        .toString("hex")}`;
+  }
 
-  const providerPriceKobo = Number(
-    livePlan.providerPriceKobo ??
-      livePlan.priceKobo ??
-      0
-  );
+  const livePlan =
+    await getLivePlan({
+      planId:
+        validatedPlanId,
+
+      network:
+        validatedNetwork,
+
+      type,
+    });
+
+  const providerPriceKobo =
+    Number(
+      livePlan.providerPriceKobo
+    );
 
   if (
-    !Number.isSafeInteger(providerPriceKobo) ||
+    !Number.isSafeInteger(
+      providerPriceKobo
+    ) ||
     providerPriceKobo <= 0
   ) {
     throw createServiceError(
@@ -628,72 +873,64 @@ async function purchaseData({
   }
 
   const customerPriceKobo =
-    calculateCustomerPriceKobo(providerPriceKobo);
+    calculateCustomerPriceKobo(
+      providerPriceKobo
+    );
 
-  const reservationId = createReservationIdForData(
-    normalizedUid,
-    validatedReference
-  );
+  const reservationId =
+    createReservationIdForData(
+      normalizedUid,
+      validatedReference
+    );
 
   const transactionId =
-    createTransactionId(reservationId);
+    createTransactionId(
+      reservationId
+    );
 
-  let existingTransaction = null;
-
-  try {
-    existingTransaction =
-      await getTransaction(transactionId);
-  } catch (error) {
-    if (error.code !== "DATA_TRANSACTION_NOT_FOUND") {
-      throw error;
-    }
-  }
+  const existingTransaction =
+    await recoverExistingTransaction({
+      transactionId,
+      uid:
+        normalizedUid,
+      reference:
+        validatedReference,
+      network:
+        validatedNetwork,
+      phoneNumber:
+        validatedPhone,
+      planId:
+        validatedPlanId,
+    });
 
   if (existingTransaction) {
-    if (existingTransaction.uid !== normalizedUid) {
-      throw createServiceError(
-        "Transaction ownership mismatch.",
-        "DATA_TRANSACTION_OWNERSHIP_MISMATCH"
-      );
-    }
-
-    if (
-      existingTransaction.reference !==
-      validatedReference
-    ) {
-      throw createServiceError(
-        "Transaction reference mismatch.",
-        "DATA_TRANSACTION_REFERENCE_MISMATCH"
-      );
-    }
-
-    if (
-      existingTransaction.planId !== validatedPlanId ||
-      String(existingTransaction.networkId) !==
-        validatedNetwork ||
-      existingTransaction.phoneNumber !==
-        validatedPhone
-    ) {
-      throw createServiceError(
-        "Existing transaction does not match this purchase request.",
-        "DATA_TRANSACTION_REQUEST_MISMATCH"
-      );
-    }
-
     return createSafeTransactionSnapshot(
       existingTransaction
     );
   }
 
-  const reservation = await reserveFunds({
-    uid: normalizedUid,
-    amountKobo: customerPriceKobo,
-    currency: CURRENCY,
-    service: SERVICE_NAME,
-    reference: validatedReference,
-  });
+  const reservation =
+    await reserveFunds({
+      uid:
+        normalizedUid,
 
-  if (!reservation || !reservation.id) {
+      amountKobo:
+        customerPriceKobo,
+
+      currency:
+        CURRENCY,
+
+      service:
+        SERVICE_NAME,
+
+      reference:
+        validatedReference,
+    });
+
+  if (
+    !reservation ||
+    !reservation.id
+  ) {
     throw createServiceError(
       "Unable to reserve wallet funds.",
       "RESERVATION_FAILED",
@@ -703,91 +940,141 @@ async function purchaseData({
     );
   }
 
+  if (
+    reservation.id !==
+    reservationId
+  ) {
+    throw createServiceError(
+      "Wallet reservation identity mismatch.",
+      "RESERVATION_IDENTITY_MISMATCH"
+    );
+  }
+
   const transaction = {
     transactionId,
-    reservationId: reservation.id,
-    uid: normalizedUid,
+    reservationId:
+      reservation.id,
 
-    service: SERVICE_NAME,
-    provider: PROVIDER_NAME,
+    uid:
+      normalizedUid,
 
-    reference: validatedReference,
-    providerReference: null,
+    service:
+      SERVICE_NAME,
 
-    networkId: validatedNetwork,
+    provider:
+      PROVIDER_NAME,
+
+    reference:
+      validatedReference,
+
+    providerReference:
+      null,
+
+    networkId:
+      validatedNetwork,
+
     networkName:
-      livePlan.networkName || null,
+      livePlan.networkName ||
+      null,
 
-    planId: validatedPlanId,
+    planId:
+      validatedPlanId,
+
     planCode:
-      livePlan.planCode || null,
-    planName:
-      livePlan.planName || null,
-    planType:
-      livePlan.planType || null,
-    validity:
-      livePlan.validity || null,
+      livePlan.planCode ||
+      null,
 
-    phoneNumber: validatedPhone,
+    planName:
+      livePlan.planName ||
+      null,
+
+    planType:
+      livePlan.planType ||
+      null,
+
+    validity:
+      livePlan.validity ||
+      null,
+
+    phoneNumber:
+      validatedPhone,
 
     providerPriceKobo,
+
     customerPriceKobo,
 
-    currency: CURRENCY,
+    currency:
+      CURRENCY,
 
-    status: STATUS_PENDING,
-    reconciliationRequired: false,
+    status:
+      STATUS_PENDING,
 
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
+    reconciliationRequired:
+      false,
 
-    completedAt: null,
+    createdAt:
+      new Date().toISOString(),
 
-    providerOutcome: null,
-    providerCustomerReference: null,
+    updatedAt:
+      new Date().toISOString(),
 
-    failureCode: null,
-    failureReason: null,
+    completedAt:
+      null,
+
+    providerOutcome:
+      null,
+
+    providerCustomerReference:
+      null,
+
+    failureCode:
+      null,
+
+    failureReason:
+      null,
   };
 
   try {
-    await createTransactionRecord(transaction);
+    await createTransactionRecord(
+      transaction
+    );
   } catch (error) {
     /*
-     * The reservation already exists at this point.
+     * Never assume the failed create means the reservation
+     * disappeared. The wallet reservation remains authoritative.
      *
-     * We deliberately do NOT release it automatically because a
-     * database write failure does not prove that the reservation
-     * failed. Reconciliation can recover the reservation by its
-     * deterministic ID.
-     *
-     * If the create failed because the document already exists,
-     * retrieve it and continue idempotently.
+     * If the transaction was actually created despite the client
+     * receiving an error, recover it and continue idempotently.
      */
-    let recoveredTransaction = null;
+    let recovered = null;
 
     try {
-      recoveredTransaction =
-        await getTransaction(transactionId);
-    } catch {
-      recoveredTransaction = null;
+      recovered =
+        await recoverExistingTransaction({
+          transactionId,
+          uid:
+            normalizedUid,
+          reference:
+            validatedReference,
+          network:
+            validatedNetwork,
+          phoneNumber:
+            validatedPhone,
+          planId:
+            validatedPlanId,
+        });
+    } catch (recoveryError) {
+      throw recoveryError;
     }
 
-    if (recoveredTransaction) {
-      if (recoveredTransaction.uid !== normalizedUid) {
-        throw createServiceError(
-          "Transaction ownership mismatch.",
-          "DATA_TRANSACTION_OWNERSHIP_MISMATCH"
-        );
-      }
-
+    if (recovered) {
       return createSafeTransactionSnapshot(
-        recoveredTransaction
+        recovered
       );
     }
 
     throw createServiceError(
-      "Unable to create the data transaction record. The reserved funds require reconciliation.",
+      "Unable to create the data transaction record. The reserved wallet funds require reconciliation.",
       "DATA_TRANSACTION_RECORD_CREATE_FAILED",
       {
         retryable: true,
@@ -798,39 +1085,80 @@ async function purchaseData({
   let providerResult;
 
   try {
-    providerResult = await babspay.purchaseData({
-      network: validatedNetwork,
-      phoneNumber: validatedPhone,
-      planId: validatedPlanId,
-      reference: validatedReference,
-    });
+    providerResult =
+      await babspay.purchaseData({
+        network:
+          validatedNetwork,
+
+        phoneNumber:
+          validatedPhone,
+
+        planId:
+          validatedPlanId,
+
+        reference:
+          validatedReference,
+      });
   } catch (error) {
-    await updateTransaction(transactionId, {
-      status: STATUS_UNKNOWN,
-      reconciliationRequired: true,
-      failureCode:
-        error.code || "BABSPAY_REQUEST_ERROR",
-      failureReason:
-        "The provider outcome could not be confirmed.",
-      providerOutcome: "unknown",
-    });
+    const failureCode =
+      error.code ||
+      "BABSPAY_REQUEST_ERROR";
+
+    try {
+      await updateTransaction(
+        transactionId,
+        {
+          status:
+            STATUS_UNKNOWN,
+
+          reconciliationRequired:
+            true,
+
+          providerOutcome:
+            STATUS_UNKNOWN,
+
+          failureCode,
+
+          failureReason:
+            "The provider outcome could not be confirmed.",
+        }
+      );
+    } catch {
+      /*
+       * Do not replace the original provider uncertainty with a
+       * database-update error. The reservation remains locked and
+       * requires reconciliation.
+       */
+    }
 
     return createSafeTransactionSnapshot({
       ...transaction,
-      status: STATUS_UNKNOWN,
-      reconciliationRequired: true,
-      failureCode:
-        error.code || "BABSPAY_REQUEST_ERROR",
+
+      status:
+        STATUS_UNKNOWN,
+
+      reconciliationRequired:
+        true,
+
+      providerOutcome:
+        STATUS_UNKNOWN,
+
+      failureCode,
+
       failureReason:
         "The provider outcome could not be confirmed.",
-      providerOutcome: "unknown",
     });
   }
 
   const providerOutcome =
-    normalizeProviderOutcome(providerResult);
+    normalizeProviderOutcome(
+      providerResult
+    );
 
-  if (providerOutcome.outcome === STATUS_SUCCESSFUL) {
+  if (
+    providerOutcome.outcome ===
+    STATUS_SUCCESSFUL
+  ) {
     const verification =
       verifyProviderSuccess({
         providerResult,
@@ -838,107 +1166,194 @@ async function purchaseData({
       });
 
     if (!verification.verified) {
-      await updateTransaction(transactionId, {
-        status: STATUS_UNKNOWN,
-        reconciliationRequired: true,
-        providerReference:
-          providerOutcome.providerReference || null,
-        providerCustomerReference:
-          providerOutcome.customerReference || null,
-        providerOutcome: STATUS_UNKNOWN,
-        failureCode:
-          "BABSPAY_RESPONSE_VERIFICATION_FAILED",
-        failureReason:
-          verification.reason,
-      });
+      await updateTransaction(
+        transactionId,
+        {
+          status:
+            STATUS_UNKNOWN,
+
+          reconciliationRequired:
+            true,
+
+          providerReference:
+            providerOutcome.providerReference,
+
+          providerCustomerReference:
+            providerOutcome.customerReference,
+
+          providerOutcome:
+            STATUS_UNKNOWN,
+
+          failureCode:
+            "BABSPAY_RESPONSE_VERIFICATION_FAILED",
+
+          failureReason:
+            verification.reason,
+        }
+      );
 
       return createSafeTransactionSnapshot({
         ...transaction,
-        status: STATUS_UNKNOWN,
-        reconciliationRequired: true,
+
+        status:
+          STATUS_UNKNOWN,
+
+        reconciliationRequired:
+          true,
+
         providerReference:
-          providerOutcome.providerReference || null,
+          providerOutcome.providerReference,
+
         providerCustomerReference:
-          providerOutcome.customerReference || null,
-        providerOutcome: STATUS_UNKNOWN,
+          providerOutcome.customerReference,
+
+        providerOutcome:
+          STATUS_UNKNOWN,
+
         failureCode:
           "BABSPAY_RESPONSE_VERIFICATION_FAILED",
+
         failureReason:
           verification.reason,
       });
     }
 
     try {
-      const currentReservation =
-        await getReservation(reservation.id);
+      await ensureReservationOwnership({
+        reservationId:
+          reservation.id,
 
-      if (currentReservation.uid !== normalizedUid) {
-        throw createServiceError(
-          "Reservation ownership mismatch.",
-          "RESERVATION_OWNERSHIP_MISMATCH"
-        );
-      }
+        uid:
+          normalizedUid,
+      });
 
-      const committedReservation =
+      const committed =
         await commitReservation({
-          uid: normalizedUid,
-          reservationId: reservation.id,
+          uid:
+            normalizedUid,
+
+          reservationId:
+            reservation.id,
         });
 
       const completedAt =
-        committedReservation.committedAt ||
+        committed.committedAt ||
         new Date().toISOString();
 
-      await updateTransaction(transactionId, {
-        status: STATUS_SUCCESSFUL,
-        reconciliationRequired: false,
-        providerReference:
-          providerOutcome.providerReference,
-        providerCustomerReference:
-          providerOutcome.customerReference || null,
-        providerOutcome: STATUS_SUCCESSFUL,
-        failureCode: null,
-        failureReason: null,
-        completedAt,
-      });
+      await updateTransaction(
+        transactionId,
+        {
+          status:
+            STATUS_SUCCESSFUL,
+
+          reconciliationRequired:
+            false,
+
+          providerReference:
+            providerOutcome.providerReference,
+
+          providerCustomerReference:
+            providerOutcome.customerReference,
+
+          providerOutcome:
+            STATUS_SUCCESSFUL,
+
+          failureCode:
+            null,
+
+          failureReason:
+            null,
+
+          completedAt,
+        }
+      );
 
       return createSafeTransactionSnapshot({
         ...transaction,
-        status: STATUS_SUCCESSFUL,
-        reconciliationRequired: false,
+
+        status:
+          STATUS_SUCCESSFUL,
+
+        reconciliationRequired:
+          false,
+
         providerReference:
           providerOutcome.providerReference,
+
         providerCustomerReference:
-          providerOutcome.customerReference || null,
-        providerOutcome: STATUS_SUCCESSFUL,
+          providerOutcome.customerReference,
+
+        providerOutcome:
+          STATUS_SUCCESSFUL,
+
         completedAt,
       });
     } catch (error) {
-      await updateTransaction(transactionId, {
-        status: STATUS_UNKNOWN,
-        reconciliationRequired: true,
-        providerReference:
-          providerOutcome.providerReference,
-        providerCustomerReference:
-          providerOutcome.customerReference || null,
-        providerOutcome: STATUS_SUCCESSFUL,
-        failureCode:
-          error.code || "WALLET_COMMIT_FAILED",
-        failureReason:
-          "Provider success was confirmed, but wallet settlement requires reconciliation.",
-      });
+      /*
+       * Provider success is already established.
+       *
+       * We must NEVER release the reservation here merely because
+       * wallet settlement or transaction updating encountered an
+       * error. The reconciliation worker can safely determine
+       * whether the reservation was already committed.
+       */
+      try {
+        await updateTransaction(
+          transactionId,
+          {
+            status:
+              STATUS_UNKNOWN,
+
+            reconciliationRequired:
+              true,
+
+            providerReference:
+              providerOutcome.providerReference,
+
+            providerCustomerReference:
+              providerOutcome.customerReference,
+
+            providerOutcome:
+              STATUS_SUCCESSFUL,
+
+            failureCode:
+              error.code ||
+              "WALLET_COMMIT_FAILED",
+
+            failureReason:
+              "Provider success was confirmed, but wallet settlement requires reconciliation.",
+          }
+        );
+      } catch {
+        /*
+         * The reservation remains authoritative and locked/committed
+         * according to the wallet transaction. Reconciliation can
+         * recover the final transaction state.
+         */
+      }
 
       return createSafeTransactionSnapshot({
         ...transaction,
-        status: STATUS_UNKNOWN,
-        reconciliationRequired: true,
+
+        status:
+          STATUS_UNKNOWN,
+
+        reconciliationRequired:
+          true,
+
         providerReference:
           providerOutcome.providerReference,
+
         providerCustomerReference:
-          providerOutcome.customerReference || null,
-        providerOutcome: STATUS_SUCCESSFUL,
+          providerOutcome.customerReference,
+
+        providerOutcome:
+          STATUS_SUCCESSFUL,
+
         failureCode:
-          error.code || "WALLET_COMMIT_FAILED",
+          error.code ||
+          "WALLET_COMMIT_FAILED",
+
         failureReason:
           "Provider success was confirmed, but wallet settlement requires reconciliation.",
       });
@@ -946,82 +1361,140 @@ async function purchaseData({
   }
 
   if (
-    providerOutcome.outcome === STATUS_FAILED
+    providerOutcome.outcome ===
+    STATUS_FAILED
   ) {
     try {
-      const currentReservation =
-        await getReservation(reservation.id);
+      await ensureReservationOwnership({
+        reservationId:
+          reservation.id,
 
-      if (currentReservation.uid !== normalizedUid) {
-        throw createServiceError(
-          "Reservation ownership mismatch.",
-          "RESERVATION_OWNERSHIP_MISMATCH"
-        );
-      }
+        uid:
+          normalizedUid,
+      });
 
       await releaseReservation({
-        uid: normalizedUid,
-        reservationId: reservation.id,
+        uid:
+          normalizedUid,
+
+        reservationId:
+          reservation.id,
       });
 
       const completedAt =
         new Date().toISOString();
 
-      await updateTransaction(transactionId, {
-        status: STATUS_FAILED,
-        reconciliationRequired: false,
-        providerReference:
-          providerOutcome.providerReference || null,
-        providerCustomerReference:
-          providerOutcome.customerReference || null,
-        providerOutcome: STATUS_FAILED,
-        failureCode: "BABSPAY_TRANSACTION_FAILED",
-        failureReason:
-          "The data provider reported that the transaction failed.",
-        completedAt,
-      });
+      await updateTransaction(
+        transactionId,
+        {
+          status:
+            STATUS_FAILED,
+
+          reconciliationRequired:
+            false,
+
+          providerReference:
+            providerOutcome.providerReference,
+
+          providerCustomerReference:
+            providerOutcome.customerReference,
+
+          providerOutcome:
+            STATUS_FAILED,
+
+          failureCode:
+            "BABSPAY_TRANSACTION_FAILED",
+
+          failureReason:
+            "The data provider reported that the transaction failed.",
+
+          completedAt,
+        }
+      );
 
       return createSafeTransactionSnapshot({
         ...transaction,
-        status: STATUS_FAILED,
-        reconciliationRequired: false,
+
+        status:
+          STATUS_FAILED,
+
+        reconciliationRequired:
+          false,
+
         providerReference:
-          providerOutcome.providerReference || null,
+          providerOutcome.providerReference,
+
         providerCustomerReference:
-          providerOutcome.customerReference || null,
-        providerOutcome: STATUS_FAILED,
+          providerOutcome.customerReference,
+
+        providerOutcome:
+          STATUS_FAILED,
+
         failureCode:
           "BABSPAY_TRANSACTION_FAILED",
+
         failureReason:
           "The data provider reported that the transaction failed.",
+
         completedAt,
       });
     } catch (error) {
-      await updateTransaction(transactionId, {
-        status: STATUS_UNKNOWN,
-        reconciliationRequired: true,
-        providerReference:
-          providerOutcome.providerReference || null,
-        providerCustomerReference:
-          providerOutcome.customerReference || null,
-        providerOutcome: STATUS_FAILED,
-        failureCode:
-          error.code || "WALLET_RELEASE_FAILED",
-        failureReason:
-          "Provider failure was received, but wallet release requires reconciliation.",
-      });
+      try {
+        await updateTransaction(
+          transactionId,
+          {
+            status:
+              STATUS_UNKNOWN,
+
+            reconciliationRequired:
+              true,
+
+            providerReference:
+              providerOutcome.providerReference,
+
+            providerCustomerReference:
+              providerOutcome.customerReference,
+
+            providerOutcome:
+              STATUS_FAILED,
+
+            failureCode:
+              error.code ||
+              "WALLET_RELEASE_FAILED",
+
+            failureReason:
+              "Provider failure was received, but wallet release requires reconciliation.",
+          }
+        );
+      } catch {
+        /*
+         * Preserve the reservation until reconciliation establishes
+         * the final wallet state.
+         */
+      }
 
       return createSafeTransactionSnapshot({
         ...transaction,
-        status: STATUS_UNKNOWN,
-        reconciliationRequired: true,
+
+        status:
+          STATUS_UNKNOWN,
+
+        reconciliationRequired:
+          true,
+
         providerReference:
-          providerOutcome.providerReference || null,
+          providerOutcome.providerReference,
+
         providerCustomerReference:
-          providerOutcome.customerReference || null,
-        providerOutcome: STATUS_FAILED,
+          providerOutcome.customerReference,
+
+        providerOutcome:
+          STATUS_FAILED,
+
         failureCode:
-          error.code || "WALLET_RELEASE_FAILED",
+          error.code ||
+          "WALLET_RELEASE_FAILED",
+
         failureReason:
           "Provider failure was received, but wallet release requires reconciliation.",
       });
@@ -1029,61 +1502,79 @@ async function purchaseData({
   }
 
   /*
-   * Pending and unknown provider responses are deliberately left
-   * reserved. Never release funds merely because the provider did
-   * not immediately return success.
+   * Pending and unknown are never treated as failures.
+   *
+   * The wallet reservation remains locked until reconciliation
+   * obtains a definitive provider outcome.
    */
-  await updateTransaction(transactionId, {
-    status:
-      providerOutcome.outcome === STATUS_PENDING
-        ? STATUS_PENDING
-        : STATUS_UNKNOWN,
-    reconciliationRequired: true,
-    providerReference:
-      providerOutcome.providerReference || null,
-    providerCustomerReference:
-      providerOutcome.customerReference || null,
-    providerOutcome:
-      providerOutcome.outcome,
-    failureCode: null,
-    failureReason: null,
-  });
+  const finalStatus =
+    providerOutcome.outcome ===
+    STATUS_PENDING
+      ? STATUS_PENDING
+      : STATUS_UNKNOWN;
+
+  await updateTransaction(
+    transactionId,
+    {
+      status:
+        finalStatus,
+
+      reconciliationRequired:
+        true,
+
+      providerReference:
+        providerOutcome.providerReference,
+
+      providerCustomerReference:
+        providerOutcome.customerReference,
+
+      providerOutcome:
+        finalStatus,
+
+      failureCode:
+        null,
+
+      failureReason:
+        null,
+    }
+  );
 
   return createSafeTransactionSnapshot({
     ...transaction,
+
     status:
-      providerOutcome.outcome === STATUS_PENDING
-        ? STATUS_PENDING
-        : STATUS_UNKNOWN,
-    reconciliationRequired: true,
+      finalStatus,
+
+    reconciliationRequired:
+      true,
+
     providerReference:
-      providerOutcome.providerReference || null,
+      providerOutcome.providerReference,
+
     providerCustomerReference:
-      providerOutcome.customerReference || null,
+      providerOutcome.customerReference,
+
     providerOutcome:
-      providerOutcome.outcome,
+      finalStatus,
   });
-}
-
-function createReservationIdForData(uid, reference) {
-  const hash = crypto
-    .createHash("sha256")
-    .update(`${uid}:${reference}`)
-    .digest("hex");
-
-  return `NPRES_${hash}`;
 }
 
 async function getPurchaseStatus({
   uid,
   transactionId,
 }) {
-  const normalizedUid = validateUid(uid);
+  const normalizedUid =
+    validateUid(uid);
 
   const transaction =
-    await getTransaction(transactionId);
+    await getTransaction(
+      transactionId
+    );
 
-  if (transaction.uid !== normalizedUid) {
+  if (
+    transaction.uid !==
+    normalizedUid
+  ) {
     throw createServiceError(
       "Transaction ownership mismatch.",
       "DATA_TRANSACTION_OWNERSHIP_MISMATCH"
