@@ -6,6 +6,7 @@ const DEFAULT_TIMEOUT_MS = 15000;
 const PURCHASE_PATH = "/api/data/";
 const BALANCE_PATH = "/api/user/";
 const REQUERY_PATH = "/api/transaction/status";
+const DATA_PLANS_PATH = "/api/data_plans";
 
 const SAFE_REFERENCE_PATTERN = /^[A-Za-z0-9._:-]{1,150}$/;
 const SAFE_PLAN_ID_PATTERN = /^[A-Za-z0-9._:-]{1,100}$/;
@@ -472,6 +473,7 @@ async function purchaseData({
 
   const providerResponse = result.response;
   const status = getPurchaseStatus(providerResponse);
+
   const identity = verifyPurchaseIdentity({
     providerResponse,
     requestReference: normalizedReference,
@@ -576,6 +578,61 @@ async function getWalletBalance() {
     balanceNaira: balance,
     response: providerResponse,
   };
+}
+
+async function getDataPlans({
+  network = null,
+  type = null,
+} = {}) {
+  const params = new URLSearchParams();
+
+  if (network !== null && network !== undefined && network !== "") {
+    params.set("network", normalizeNetwork(network));
+  }
+
+  if (type !== null && type !== undefined && type !== "") {
+    const normalizedType = String(type).trim().toLowerCase();
+
+    if (!/^[a-z0-9_-]{1,50}$/.test(normalizedType)) {
+      throw createProviderError(
+        "Invalid BabsPay data plan type.",
+        "BABSPAY_INVALID_PLAN_TYPE"
+      );
+    }
+
+    params.set("type", normalizedType);
+  }
+
+  const query = params.toString();
+
+  const path = query
+    ? `${DATA_PLANS_PATH}?${query}`
+    : DATA_PLANS_PATH;
+
+  const result = await request({
+    method: "GET",
+    path,
+  });
+
+  const providerResponse = result.response;
+
+  if (
+    !providerResponse ||
+    typeof providerResponse !== "object" ||
+    normalizeStatus(providerResponse.status) !== "success" ||
+    !Array.isArray(providerResponse.data)
+  ) {
+    throw createProviderError(
+      "BabsPay returned an invalid data-plan catalogue.",
+      "BABSPAY_INVALID_DATA_PLANS_RESPONSE",
+      {
+        httpStatus: result.httpStatus,
+        providerResponse,
+      }
+    );
+  }
+
+  return providerResponse.data;
 }
 
 function getRequeryStatus(providerResponse) {
@@ -725,5 +782,6 @@ async function requeryTransaction(reference) {
 module.exports = {
   purchaseData,
   getWalletBalance,
+  getDataPlans,
   requeryTransaction,
 };
