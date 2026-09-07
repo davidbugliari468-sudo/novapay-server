@@ -3,6 +3,8 @@
 // NovaPay backend deployment update
 require("dotenv").config();
 
+const diagnosticRoutes = require("./diagnostics/wallet-debug");
+
 const {
   startReconciliationWorker
 } = require("./data/reconciliation");
@@ -411,6 +413,11 @@ app.use(
   )
 );
 
+
+app.use(
+  "/api/diagnostics",
+  diagnosticRoutes.createDiagnosticRouter(requireAuth)
+);
 
 // =====================================================
 // PROTECTED AUTH TEST ROUTE
