@@ -1653,6 +1653,78 @@ async function requeryAirtime(
 
 
 // =====================================================
+// CHECK AIRTIME STATUS
+// =====================================================
+//
+// This is the interface used by the Airtime reconciliation
+// worker.
+//
+// It uses the existing requeryAirtime() function rather
+// than creating a second requery implementation.
+//
+// The provider request ID is deterministic and must belong
+// to the same NovaPay transaction.
+//
+// =====================================================
+
+async function checkAirtimeStatus({
+    transactionId,
+    providerRequestId = null
+}) {
+
+    const normalizedTransactionId =
+        requireTransactionId(
+            transactionId
+        );
+
+
+    const expectedProviderRequestId =
+        createProviderRequestId(
+            normalizedTransactionId
+        );
+
+
+    /*
+     * If reconciliation supplied a provider request ID,
+     * verify that it matches the deterministic request ID
+     * for this exact NovaPay transaction.
+     */
+
+    if (
+        providerRequestId !==
+            null &&
+        String(
+            providerRequestId
+        ).trim() !==
+            expectedProviderRequestId
+    ) {
+
+        throw new VtuProviderError(
+            "VTU.ng provider request ID does not match the NovaPay transaction.",
+            {
+                kind:
+                    "validation"
+            }
+        );
+
+    }
+
+
+    /*
+     * Use the existing requery implementation.
+     *
+     * No second provider status endpoint is introduced.
+     * No second request ID is generated.
+     */
+
+    return await requeryAirtime(
+        normalizedTransactionId
+    );
+
+}
+
+
+// =====================================================
 // PROVIDER WALLET BALANCE
 // =====================================================
 //
@@ -1737,6 +1809,7 @@ async function getProviderBalance() {
 
 }
 
+
 // =====================================================
 // EXPORTS
 // =====================================================
@@ -1745,26 +1818,9 @@ module.exports = {
 
     purchaseAirtime,
 
-    /*
-     * Existing public function.
-     *
-     * Preserved so any existing code using
-     * requeryAirtime() continues to work.
-     */
     requeryAirtime,
 
-    /*
-     * Reconciliation interface.
-     *
-     * reconciliation.js and worker.js expect
-     * checkAirtimeStatus().
-     *
-     * Both names intentionally point to the SAME
-     * implementation so there is only one VTU.ng
-     * requery path.
-     */
-    checkAirtimeStatus:
-        requeryAirtime,
+    checkAirtimeStatus,
 
     getProviderBalance,
 
