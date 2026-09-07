@@ -1,3 +1,5 @@
+"use strict";
+
 const { db } = require("../firebase-admin");
 
 const WALLETS_COLLECTION = "wallets";
@@ -32,14 +34,37 @@ async function ensureWallet(uid) {
   const walletSnap = await walletRef.get();
 
   if (walletSnap.exists) {
+    const data = walletSnap.data();
+
+    const balanceKobo = normalizeKobo(
+      data.balanceKobo ?? 0,
+      "wallet.balanceKobo"
+    );
+
+    const reservedKobo = normalizeKobo(
+      data.reservedKobo ?? 0,
+      "wallet.reservedKobo"
+    );
+
+    if (reservedKobo > balanceKobo) {
+      throw new Error(
+        "Wallet reserved balance cannot exceed wallet balance."
+      );
+    }
+
     return {
       id: walletSnap.id,
-      ...walletSnap.data(),
+      ...data,
+      balanceKobo,
+      reservedKobo,
+      availableKobo: balanceKobo - reservedKobo,
+      currency: data.currency || "NGN",
     };
   }
 
   const walletData = {
     balanceKobo: 0,
+    reservedKobo: 0,
     currency: "NGN",
     createdAt: new Date(),
     updatedAt: new Date(),
@@ -50,6 +75,7 @@ async function ensureWallet(uid) {
   return {
     id: uid,
     ...walletData,
+    availableKobo: 0,
   };
 }
 
@@ -57,6 +83,15 @@ async function ensureWallet(uid) {
  * Get a user's wallet.
  *
  * If the wallet does not exist, create it with a zero balance.
+ *
+ * IMPORTANT:
+ *
+ * balanceKobo      = total wallet money
+ * reservedKobo     = money temporarily locked by pending transactions
+ * availableKobo    = money that can currently be spent
+ *
+ * availableKobo is calculated server-side.
+ * It is never accepted from the client.
  */
 async function getWallet(uid) {
   if (!uid || typeof uid !== "string") {
@@ -72,13 +107,40 @@ async function getWallet(uid) {
 
   const data = walletSnap.data();
 
+  const balanceKobo = normalizeKobo(
+    data.balanceKobo ?? 0,
+    "wallet.balanceKobo"
+  );
+
+  const reservedKobo = normalizeKobo(
+    data.reservedKobo ?? 0,
+    "wallet.reservedKobo"
+  );
+
+  /*
+   * A wallet can never have more money reserved than
+   * the total wallet balance.
+   *
+   * Do not silently correct this value here.
+   * A corrupted financial state must be visible to the
+   * backend rather than being hidden.
+   */
+  if (reservedKobo > balanceKobo) {
+    throw new Error(
+      "Wallet reserved balance cannot exceed wallet balance."
+    );
+  }
+
+  const availableKobo =
+    balanceKobo -
+    reservedKobo;
+
   return {
     id: walletSnap.id,
     ...data,
-    balanceKobo: normalizeKobo(
-      data.balanceKobo ?? 0,
-      "wallet.balanceKobo"
-    ),
+    balanceKobo,
+    reservedKobo,
+    availableKobo,
     currency: data.currency || "NGN",
   };
 }
@@ -142,6 +204,7 @@ async function creditDeposit({
     }
 
     let balanceBeforeKobo = 0;
+    let reservedBeforeKobo = 0;
 
     if (walletSnap.exists) {
       const walletData = walletSnap.data();
@@ -150,18 +213,34 @@ async function creditDeposit({
         walletData.balanceKobo ?? 0,
         "wallet.balanceKobo"
       );
+
+      reservedBeforeKobo = normalizeKobo(
+        walletData.reservedKobo ?? 0,
+        "wallet.reservedKobo"
+      );
+
+      if (reservedBeforeKobo > balanceBeforeKobo) {
+        throw new Error(
+          "Wallet reserved balance cannot exceed wallet balance."
+        );
+      }
     }
 
-    const balanceAfterKobo = balanceBeforeKobo + amount;
+    const balanceAfterKobo =
+      balanceBeforeKobo +
+      amount;
 
     if (!Number.isSafeInteger(balanceAfterKobo)) {
-      throw new Error("Wallet balance exceeds the supported safe integer range.");
+      throw new Error(
+        "Wallet balance exceeds the supported safe integer range."
+      );
     }
 
     const now = new Date();
 
     const walletData = {
       balanceKobo: balanceAfterKobo,
+      reservedKobo: reservedBeforeKobo,
       currency: walletSnap.exists
         ? walletSnap.data().currency || "NGN"
         : "NGN",
@@ -193,6 +272,10 @@ async function creditDeposit({
     return {
       alreadyProcessed: false,
       balanceKobo: balanceAfterKobo,
+      reservedKobo: reservedBeforeKobo,
+      availableKobo:
+        balanceAfterKobo -
+        reservedBeforeKobo,
       ledgerId: ledgerRef.id,
     };
   });
