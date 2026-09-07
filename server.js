@@ -1,10 +1,18 @@
 "use strict";
 
+// NovaPay backend deployment update
 require("dotenv").config();
 
 const {
   startReconciliationWorker
 } = require("./data/reconciliation");
+
+const {
+  runReconciliationBatch
+} = require("./airtime/worker");
+
+const airtimeProviderClient =
+  require("./airtime/vtu");
 
 const notificationRoutes =
   require("./notifications/routes");
@@ -561,21 +569,6 @@ function createPhoneRegistryKey(
 // =====================================================
 // LEGACY PHONE REPRESENTATIONS
 // =====================================================
-//
-// The old implementation hashed whatever digits were
-// supplied by the user.
-//
-// For a Nigerian number, the old database may therefore
-// contain either:
-//
-//     09164584280
-//
-// or:
-//
-//     2349164584280
-//
-// This function gives us both possible legacy forms.
-// =====================================================
 
 function getLegacyPhoneRepresentations(
   canonicalPhone
@@ -655,10 +648,6 @@ app.post(
       }
 
 
-      /*
-       * Convert the supplied phone into one canonical
-       * representation.
-       */
       const normalizedPhone =
         normalizeRegistrationPhone(
           phone
@@ -683,9 +672,6 @@ app.post(
       }
 
 
-      /*
-       * Canonical registry document.
-       */
       const canonicalPhoneKey =
         createPhoneRegistryKey(
           normalizedPhone
@@ -702,13 +688,6 @@ app.post(
           );
 
 
-      /*
-       * Build the legacy representations.
-       *
-       * This prevents an existing old-style registry
-       * record from being bypassed by changing the
-       * phone-number format.
-       */
       const legacyRepresentations =
         getLegacyPhoneRepresentations(
           normalizedPhone
@@ -724,6 +703,7 @@ app.post(
                 createPhoneRegistryKey(
                   legacyPhone
                 );
+
 
               return {
 
@@ -758,22 +738,12 @@ app.post(
       await db.runTransaction(
         async (transaction) => {
 
-          /*
-           * Read the canonical record first.
-           */
           const canonicalSnapshot =
             await transaction.get(
               canonicalPhoneRef
             );
 
 
-          /*
-           * Read legacy records as well.
-           *
-           * Some of these may point to the same
-           * canonical document, so avoid processing
-           * duplicates below.
-           */
           const legacySnapshots =
             [];
 
@@ -853,10 +823,7 @@ app.post(
 
 
           /*
-           * Check old registry records.
-           *
-           * This is the important backward-compatibility
-           * protection.
+           * Check legacy ownership.
            */
           for (
             const item
@@ -904,8 +871,8 @@ app.post(
 
 
           /*
-           * If the canonical record already belongs to
-           * this user, update the user's profile and finish.
+           * Existing canonical record belongs to
+           * this same user.
            */
           if (
             canonicalSnapshot.exists
@@ -932,21 +899,13 @@ app.post(
             );
 
 
-            /*
-             * We intentionally leave old registry records
-             * untouched. They remain harmless legacy
-             * aliases while the canonical record becomes
-             * the authoritative format for future writes.
-             */
             return;
 
           }
 
 
           /*
-           * No canonical record exists.
-           *
-           * Create the canonical phone registry record.
+           * Create canonical registry record.
            */
           transaction.create(
             canonicalPhoneRef,
@@ -965,7 +924,7 @@ app.post(
 
 
           /*
-           * Save the canonical phone on the user profile.
+           * Save canonical phone to user profile.
            */
           transaction.set(
             userRef,
@@ -1013,11 +972,6 @@ app.post(
         "PHONE_ALREADY_REGISTERED"
       ) {
 
-        /*
-         * Delete the newly-created Firebase account
-         * because the phone number is already owned by
-         * another account.
-         */
         try {
 
           await adminAuth.deleteUser(
@@ -1156,7 +1110,161 @@ app.listen(
     );
 
 
+    // =================================================
+    // DATA RECONCILIATION WORKER
+    // =================================================
+
     startReconciliationWorker();
+
+
+    // =================================================
+    // AIRTIME RECONCILIATION WORKER
+    // =================================================
+    //
+    // Airtime worker uses the existing:
+    //
+    //     airtime/worker.js
+    //     airtime/reconciliation.js
+    //     airtime/vtu.js
+    //     wallet/reservation.js
+    //
+    // It never directly changes wallet balances.
+    //
+    // =================================================
+
+    const airtimeIntervalMs =
+      Number(
+        process.env.AIRTIME_RECONCILIATION_INTERVAL_MS
+      ) || 60000;
+
+
+    const airtimeBatchSize =
+      Number(
+        process.env.AIRTIME_RECONCILIATION_BATCH_SIZE
+      ) || 25;
+
+
+    let airtimeReconciliationRunning =
+      false;
+
+
+    const runAirtimeReconciliation =
+      async () => {
+
+        if (
+          airtimeReconciliationRunning
+        ) {
+
+          console.log(
+            "Airtime reconciliation already running; skipping overlapping run."
+          );
+
+          return;
+
+        }
+
+
+        airtimeReconciliationRunning =
+          true;
+
+
+        try {
+
+          const result =
+            await runReconciliationBatch({
+
+              providerClient:
+                airtimeProviderClient,
+
+              limit:
+                airtimeBatchSize
+
+            });
+
+
+          if (
+            result.scanned > 0
+          ) {
+
+            console.log(
+              "Airtime reconciliation completed:",
+              {
+
+                scanned:
+                  result.scanned,
+
+                processed:
+                  result.processed,
+
+                failed:
+                  result.failed
+
+              }
+            );
+
+          }
+
+        }
+
+        catch (error) {
+
+          console.error(
+            "Airtime reconciliation worker error:",
+            error
+          );
+
+        }
+
+        finally {
+
+          airtimeReconciliationRunning =
+            false;
+
+        }
+
+      };
+
+
+    console.log(
+      "Airtime reconciliation worker started:",
+      {
+
+        intervalMs:
+          airtimeIntervalMs,
+
+        batchSize:
+          airtimeBatchSize
+
+      }
+    );
+
+
+    /*
+     * Run once shortly after startup.
+     *
+     * This means existing pending transactions don't
+     * necessarily have to wait for the first full interval.
+     */
+    setTimeout(
+      () => {
+        runAirtimeReconciliation();
+      },
+      5000
+    );
+
+
+    /*
+     * Continue checking pending/unknown Airtime
+     * transactions automatically.
+     */
+    setInterval(
+      () => {
+
+        runAirtimeReconciliation();
+
+      },
+      airtimeIntervalMs
+    );
 
   }
 );
