@@ -1737,7 +1737,6 @@ async function getProviderBalance() {
 
 }
 
-
 // =====================================================
 // EXPORTS
 // =====================================================
@@ -1746,7 +1745,26 @@ module.exports = {
 
     purchaseAirtime,
 
+    /*
+     * Existing public function.
+     *
+     * Preserved so any existing code using
+     * requeryAirtime() continues to work.
+     */
     requeryAirtime,
+
+    /*
+     * Reconciliation interface.
+     *
+     * reconciliation.js and worker.js expect
+     * checkAirtimeStatus().
+     *
+     * Both names intentionally point to the SAME
+     * implementation so there is only one VTU.ng
+     * requery path.
+     */
+    checkAirtimeStatus:
+        requeryAirtime,
 
     getProviderBalance,
 

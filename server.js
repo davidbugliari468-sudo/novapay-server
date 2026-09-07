@@ -1,58 +1,119 @@
-// NovaPay backend deployment update
+"use strict";
+
 require("dotenv").config();
+
 const {
   startReconciliationWorker
 } = require("./data/reconciliation");
+
 const notificationRoutes =
-    require("./notifications/routes");
+  require("./notifications/routes");
+
 const transactionRoutes =
   require("./transactions/routes.js");
-const crypto = require("crypto");
-const express = require("express");
-const helmet = require("helmet");
-const cors = require("cors");
-const rateLimit = require("express-rate-limit");
-const { requireAuth } = require("./auth");
-const { db, auth: adminAuth } = require("./firebase-admin");
+
+const crypto =
+  require("crypto");
+
+const express =
+  require("express");
+
+const helmet =
+  require("helmet");
+
+const cors =
+  require("cors");
+
+const rateLimit =
+  require("express-rate-limit");
+
+const {
+  requireAuth
+} = require("./auth");
+
+const {
+  db,
+  auth: adminAuth
+} = require("./firebase-admin");
+
 const {
   getWallet
 } = require("./wallet.js/wallet");
-const airtimeRoutes = require("./airtime/routes");
-const addMoneyRoutes = require("./add-money/routes");
-const dataRoutes = require("./data/routes");
+
+const airtimeRoutes =
+  require("./airtime/routes");
+
+const addMoneyRoutes =
+  require("./add-money/routes");
+
+const dataRoutes =
+  require("./data/routes");
 
 const {
   handlePaystackWebhook
 } = require("./add-money/paystack/webhook");
-const app = express();
 
-app.set("trust proxy", 1);
-const PORT = Number(process.env.PORT) || 3000;
-const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || false;
+
+const app =
+  express();
+
+
+app.set(
+  "trust proxy",
+  1
+);
+
+
+const PORT =
+  Number(
+    process.env.PORT
+  ) || 3000;
+
+
+const FRONTEND_ORIGIN =
+  process.env.FRONTEND_ORIGIN ||
+  false;
+
 
 // =====================================================
 // NOVAPAY BACKEND — SECURITY FOUNDATION
 // =====================================================
 
 // Hide Express fingerprint
-app.disable("x-powered-by");
+app.disable(
+  "x-powered-by"
+);
+
 
 // Security headers
 app.use(
   helmet({
-    contentSecurityPolicy: false,
+    contentSecurityPolicy:
+      false,
   })
 );
 
+
 // Request ID for every request
-app.use((req, res, next) => {
-  const requestId = crypto.randomUUID();
+app.use(
+  (req, res, next) => {
 
-  req.requestId = requestId;
-  res.setHeader("X-Request-ID", requestId);
+    const requestId =
+      crypto.randomUUID();
 
-  next();
-});
+    req.requestId =
+      requestId;
+
+    res.setHeader(
+      "X-Request-ID",
+      requestId
+    );
+
+    next();
+
+  }
+);
+
 
 // =====================================================
 // JSON BODY LIMIT
@@ -67,87 +128,168 @@ app.use((req, res, next) => {
 
 app.use(
   express.json({
-    limit: "100kb",
 
-    verify: (req, res, buffer) => {
+    limit:
+      "100kb",
 
-      if (
-        req.originalUrl ===
-        "/api/add-money/paystack/webhook"
-      ) {
+    verify:
+      (req, res, buffer) => {
 
-        req.rawBody =
-          Buffer.from(buffer);
+        if (
+          req.originalUrl ===
+          "/api/add-money/paystack/webhook"
+        ) {
+
+          req.rawBody =
+            Buffer.from(
+              buffer
+            );
+
+        }
 
       }
 
-    }
   })
 );
+
+
 app.post(
   "/api/add-money/paystack/webhook",
   handlePaystackWebhook
 );
 
+
 // URL-encoded body limit
 app.use(
   express.urlencoded({
-    extended: false,
-    limit: "100kb",
+    extended:
+      false,
+
+    limit:
+      "100kb",
   })
 );
+
 
 // CORS
 app.use(
   cors({
-    origin: FRONTEND_ORIGIN,
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-Request-ID"],
+
+    origin:
+      FRONTEND_ORIGIN,
+
+    methods: [
+      "GET",
+      "POST",
+      "PUT",
+      "PATCH",
+      "DELETE"
+    ],
+
+    allowedHeaders: [
+      "Content-Type",
+      "Authorization",
+      "X-Request-ID"
+    ],
+
   })
 );
+
 
 // =====================================================
 // RATE LIMITING
 // =====================================================
 
-const apiLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  limit: 100,
-  standardHeaders: "draft-8",
-  legacyHeaders: false,
-  message: {
-    success: false,
-    error: "Too many requests. Please try again later.",
-  },
-});
+const apiLimiter =
+  rateLimit({
 
-app.use("/api", apiLimiter);
+    windowMs:
+      15 * 60 * 1000,
+
+    limit:
+      100,
+
+    standardHeaders:
+      "draft-8",
+
+    legacyHeaders:
+      false,
+
+    message: {
+
+      success:
+        false,
+
+      error:
+        "Too many requests. Please try again later.",
+
+    },
+
+  });
+
+
+app.use(
+  "/api",
+  apiLimiter
+);
+
 
 // =====================================================
 // HEALTH CHECK
 // =====================================================
 
-app.get("/health", (req, res) => {
-  res.status(200).json({
-    success: true,
-    service: "NovaPay Backend",
-    status: "online",
-    requestId: req.requestId,
-  });
-});
+app.get(
+  "/health",
+  (req, res) => {
+
+    res.status(200).json({
+
+      success:
+        true,
+
+      service:
+        "NovaPay Backend",
+
+      status:
+        "online",
+
+      requestId:
+        req.requestId,
+
+    });
+
+  }
+);
+
 
 // =====================================================
 // API BASE ROUTE
 // =====================================================
 
-app.get("/api", (req, res) => {
-  res.status(200).json({
-    success: true,
-    service: "NovaPay API",
-    status: "online",
-    requestId: req.requestId,
-  });
-}); 
+app.get(
+  "/api",
+  (req, res) => {
+
+    res.status(200).json({
+
+      success:
+        true,
+
+      service:
+        "NovaPay API",
+
+      status:
+        "online",
+
+      requestId:
+        req.requestId,
+
+    });
+
+  }
+);
+
+
 // =====================================================
 // WALLET
 // =====================================================
@@ -169,12 +311,17 @@ app.get(
       const uid =
         req.user.uid;
 
+
       const wallet =
-        await getWallet(uid);
+        await getWallet(
+          uid
+        );
+
 
       return res.status(200).json({
 
-        success: true,
+        success:
+          true,
 
         wallet: {
 
@@ -192,16 +339,20 @@ app.get(
 
       });
 
-    } catch (error) {
+    }
+
+    catch (error) {
 
       console.error(
         "NovaPay wallet retrieval error:",
         error
       );
 
+
       return res.status(500).json({
 
-        success: false,
+        success:
+          false,
 
         error:
           "Unable to retrieve wallet balance.",
@@ -216,6 +367,7 @@ app.get(
   }
 );
 
+
 // =====================================================
 // ADD MONEY
 // =====================================================
@@ -225,21 +377,30 @@ app.use(
   addMoneyRoutes
 );
 
+
 app.use(
   "/api/transactions",
   transactionRoutes
 );
+
+
 app.use(
-    "/api/notifications",
-    notificationRoutes
+  "/api/notifications",
+  notificationRoutes
 );
+
+
 app.use(
   "/api/airtime",
   airtimeRoutes
 );
+
+
 app.use(
   "/api/data",
-  dataRoutes.createDataRouter(requireAuth)
+  dataRoutes.createDataRouter(
+    requireAuth
+  )
 );
 
 
@@ -247,173 +408,755 @@ app.use(
 // PROTECTED AUTH TEST ROUTE
 // =====================================================
 
-app.get("/api/protected", requireAuth, (req, res) => {
-  res.status(200).json({
-    success: true,
-    message: "Authenticated",
-    user: req.user,
-    requestId: req.requestId,
-  });
-});// =====================================================
+app.get(
+  "/api/protected",
+  requireAuth,
+  (req, res) => {
+
+    res.status(200).json({
+
+      success:
+        true,
+
+      message:
+        "Authenticated",
+
+      user:
+        req.user,
+
+      requestId:
+        req.requestId,
+
+    });
+
+  }
+);
+
+
+// =====================================================
+// REGISTRATION — NIGERIAN PHONE NORMALIZATION
+// =====================================================
+//
+// Canonical format:
+//
+//     2349164584280
+//
+// Therefore:
+//
+//     09164584280
+//     2349164584280
+//     +2349164584280
+//
+// all resolve to the same canonical phone.
+//
+// The registry also checks legacy hashes created by the
+// previous implementation so existing registrations
+// cannot be bypassed simply by changing the phone format.
+// =====================================================
+
+function normalizeRegistrationPhone(
+  phone
+) {
+
+  const digits =
+    String(
+      phone || ""
+    )
+      .replace(
+        /\D/g,
+        ""
+      );
+
+
+  if (!digits) {
+
+    return null;
+
+  }
+
+
+  /*
+   * Nigerian domestic mobile format:
+   *
+   * 0XXXXXXXXXX
+   *
+   * 11 digits total.
+   */
+  if (
+    digits.length ===
+      11 &&
+    digits.startsWith("0")
+  ) {
+
+    return (
+      "234" +
+      digits.slice(1)
+    );
+
+  }
+
+
+  /*
+   * Nigerian international format without
+   * the plus sign:
+   *
+   * 234XXXXXXXXXX
+   *
+   * 13 digits total.
+   */
+  if (
+    digits.length ===
+      13 &&
+    digits.startsWith("234")
+  ) {
+
+    return digits;
+
+  }
+
+
+  /*
+   * Preserve the existing broad validation behavior
+   * for other phone formats instead of unexpectedly
+   * breaking unrelated registrations.
+   */
+  if (
+    digits.length >= 7 &&
+    digits.length <= 15
+  ) {
+
+    return digits;
+
+  }
+
+
+  return null;
+
+}
+
+
+// =====================================================
+// PHONE REGISTRY KEY
+// =====================================================
+
+function createPhoneRegistryKey(
+  normalizedPhone
+) {
+
+  return crypto
+    .createHash(
+      "sha256"
+    )
+    .update(
+      normalizedPhone,
+      "utf8"
+    )
+    .digest(
+      "hex"
+    );
+
+}
+
+
+// =====================================================
+// LEGACY PHONE REPRESENTATIONS
+// =====================================================
+//
+// The old implementation hashed whatever digits were
+// supplied by the user.
+//
+// For a Nigerian number, the old database may therefore
+// contain either:
+//
+//     09164584280
+//
+// or:
+//
+//     2349164584280
+//
+// This function gives us both possible legacy forms.
+// =====================================================
+
+function getLegacyPhoneRepresentations(
+  canonicalPhone
+) {
+
+  const representations =
+    new Set();
+
+
+  representations.add(
+    canonicalPhone
+  );
+
+
+  if (
+    canonicalPhone.length ===
+      13 &&
+    canonicalPhone.startsWith("234")
+  ) {
+
+    const localPhone =
+      "0" +
+      canonicalPhone.slice(3);
+
+
+    representations.add(
+      localPhone
+    );
+
+  }
+
+
+  return Array.from(
+    representations
+  );
+
+}
+
+
+// =====================================================
 // REGISTRATION — SECURE PHONE CLAIM
 // =====================================================
 
-app.post("/api/registration/claim-phone", requireAuth, async (req, res) => {
-  try {
-    const uid = req.user.uid;
-    const phone = String(req.body.phone || "").trim();
+app.post(
+  "/api/registration/claim-phone",
+  requireAuth,
+  async (req, res) => {
 
-    if (!phone) {
-      return res.status(400).json({
-        success: false,
-        error: "Phone number is required.",
-        requestId: req.requestId,
+    try {
+
+      const uid =
+        req.user.uid;
+
+
+      const phone =
+        String(
+          req.body.phone ||
+          ""
+        ).trim();
+
+
+      if (!phone) {
+
+        return res.status(400).json({
+
+          success:
+            false,
+
+          error:
+            "Phone number is required.",
+
+          requestId:
+            req.requestId,
+
+        });
+
+      }
+
+
+      /*
+       * Convert the supplied phone into one canonical
+       * representation.
+       */
+      const normalizedPhone =
+        normalizeRegistrationPhone(
+          phone
+        );
+
+
+      if (!normalizedPhone) {
+
+        return res.status(400).json({
+
+          success:
+            false,
+
+          error:
+            "Invalid phone number.",
+
+          requestId:
+            req.requestId,
+
+        });
+
+      }
+
+
+      /*
+       * Canonical registry document.
+       */
+      const canonicalPhoneKey =
+        createPhoneRegistryKey(
+          normalizedPhone
+        );
+
+
+      const canonicalPhoneRef =
+        db
+          .collection(
+            "phoneRegistry"
+          )
+          .doc(
+            canonicalPhoneKey
+          );
+
+
+      /*
+       * Build the legacy representations.
+       *
+       * This prevents an existing old-style registry
+       * record from being bypassed by changing the
+       * phone-number format.
+       */
+      const legacyRepresentations =
+        getLegacyPhoneRepresentations(
+          normalizedPhone
+        );
+
+
+      const legacyPhoneRefs =
+        legacyRepresentations
+          .map(
+            (legacyPhone) => {
+
+              const key =
+                createPhoneRegistryKey(
+                  legacyPhone
+                );
+
+              return {
+
+                phone:
+                  legacyPhone,
+
+                ref:
+                  db
+                    .collection(
+                      "phoneRegistry"
+                    )
+                    .doc(
+                      key
+                    )
+
+              };
+
+            }
+          );
+
+
+      const userRef =
+        db
+          .collection(
+            "users"
+          )
+          .doc(
+            uid
+          );
+
+
+      await db.runTransaction(
+        async (transaction) => {
+
+          /*
+           * Read the canonical record first.
+           */
+          const canonicalSnapshot =
+            await transaction.get(
+              canonicalPhoneRef
+            );
+
+
+          /*
+           * Read legacy records as well.
+           *
+           * Some of these may point to the same
+           * canonical document, so avoid processing
+           * duplicates below.
+           */
+          const legacySnapshots =
+            [];
+
+
+          for (
+            const item
+            of legacyPhoneRefs
+          ) {
+
+            if (
+              item.ref.path ===
+              canonicalPhoneRef.path
+            ) {
+
+              continue;
+
+            }
+
+
+            const snapshot =
+              await transaction.get(
+                item.ref
+              );
+
+
+            legacySnapshots.push({
+
+              phone:
+                item.phone,
+
+              ref:
+                item.ref,
+
+              snapshot
+
+            });
+
+          }
+
+
+          /*
+           * Check canonical ownership.
+           */
+          if (
+            canonicalSnapshot.exists
+          ) {
+
+            const data =
+              canonicalSnapshot.data() ||
+              {};
+
+            const existingUid =
+              String(
+                data.uid ||
+                ""
+              ).trim();
+
+
+            if (
+              existingUid &&
+              existingUid !== uid
+            ) {
+
+              const error =
+                new Error(
+                  "PHONE_ALREADY_REGISTERED"
+                );
+
+              error.code =
+                "PHONE_ALREADY_REGISTERED";
+
+              throw error;
+
+            }
+
+          }
+
+
+          /*
+           * Check old registry records.
+           *
+           * This is the important backward-compatibility
+           * protection.
+           */
+          for (
+            const item
+            of legacySnapshots
+          ) {
+
+            if (
+              !item.snapshot.exists
+            ) {
+
+              continue;
+
+            }
+
+
+            const data =
+              item.snapshot.data() ||
+              {};
+
+            const existingUid =
+              String(
+                data.uid ||
+                ""
+              ).trim();
+
+
+            if (
+              existingUid &&
+              existingUid !== uid
+            ) {
+
+              const error =
+                new Error(
+                  "PHONE_ALREADY_REGISTERED"
+                );
+
+              error.code =
+                "PHONE_ALREADY_REGISTERED";
+
+              throw error;
+
+            }
+
+          }
+
+
+          /*
+           * If the canonical record already belongs to
+           * this user, update the user's profile and finish.
+           */
+          if (
+            canonicalSnapshot.exists
+          ) {
+
+            transaction.set(
+              userRef,
+              {
+
+                phone:
+                  normalizedPhone,
+
+                phoneVerified:
+                  false,
+
+                updatedAt:
+                  new Date(),
+
+              },
+              {
+                merge:
+                  true
+              }
+            );
+
+
+            /*
+             * We intentionally leave old registry records
+             * untouched. They remain harmless legacy
+             * aliases while the canonical record becomes
+             * the authoritative format for future writes.
+             */
+            return;
+
+          }
+
+
+          /*
+           * No canonical record exists.
+           *
+           * Create the canonical phone registry record.
+           */
+          transaction.create(
+            canonicalPhoneRef,
+            {
+
+              uid,
+
+              phone:
+                normalizedPhone,
+
+              createdAt:
+                new Date(),
+
+            }
+          );
+
+
+          /*
+           * Save the canonical phone on the user profile.
+           */
+          transaction.set(
+            userRef,
+            {
+
+              phone:
+                normalizedPhone,
+
+              phoneVerified:
+                false,
+
+              updatedAt:
+                new Date(),
+
+            },
+            {
+              merge:
+                true
+            }
+          );
+
+        }
+      );
+
+
+      return res.status(200).json({
+
+        success:
+          true,
+
+        message:
+          "Phone number registered successfully.",
+
+        requestId:
+          req.requestId,
+
       });
+
     }
 
-    // Normalize phone number.
-    // Keep digits only so formatting differences don't create duplicates.
-    const normalizedPhone = phone.replace(/\D/g, "");
+    catch (error) {
 
-    if (normalizedPhone.length < 7 || normalizedPhone.length > 15) {
-      return res.status(400).json({
-        success: false,
-        error: "Invalid phone number.",
-        requestId: req.requestId,
-      });
-    }
+      if (
+        error.code ===
+        "PHONE_ALREADY_REGISTERED"
+      ) {
 
-    // Never use the raw phone number as a Firestore document ID.
-    const phoneKey = crypto
-      .createHash("sha256")
-      .update(normalizedPhone)
-      .digest("hex");
+        /*
+         * Delete the newly-created Firebase account
+         * because the phone number is already owned by
+         * another account.
+         */
+        try {
 
-    const phoneRef = db.collection("phoneRegistry").doc(phoneKey);
-    const userRef = db.collection("users").doc(uid);
+          await adminAuth.deleteUser(
+            req.user.uid
+          );
 
-    await db.runTransaction(async (transaction) => {
-      const phoneSnapshot = await transaction.get(phoneRef);
-
-      // Phone already belongs to another account.
-      if (phoneSnapshot.exists) {
-        const existingUid = phoneSnapshot.data().uid;
-
-        if (existingUid !== uid) {
-          const error = new Error("PHONE_ALREADY_REGISTERED");
-          error.code = "PHONE_ALREADY_REGISTERED";
-          throw error;
         }
 
-        // Same user is retrying registration.
-        transaction.set(
-          userRef,
-          {
-            phone: normalizedPhone,
-            phoneVerified: false,
-            updatedAt: new Date(),
-          },
-          { merge: true }
-        );
+        catch (deleteError) {
 
-        return;
+          console.error(
+            "Failed to remove duplicate registration:",
+            deleteError
+          );
+
+        }
+
+
+        return res.status(409).json({
+
+          success:
+            false,
+
+          error:
+            "This phone number is already registered.",
+
+          requestId:
+            req.requestId,
+
+        });
+
       }
 
-      // Claim the phone number.
-      transaction.create(phoneRef, {
-        uid,
-        createdAt: new Date(),
-      });
 
-      // Save the normalized phone on the user's profile.
-      transaction.set(
-        userRef,
-        {
-          phone: normalizedPhone,
-          phoneVerified: false,
-          updatedAt: new Date(),
-        },
-        { merge: true }
+      console.error(
+        "Phone registration error:",
+        error
       );
-    });
 
-    return res.status(200).json({
-      success: true,
-      message: "Phone number registered successfully.",
-      requestId: req.requestId,
-    });
 
-  } catch (error) {
+      return res.status(500).json({
 
-    if (error.code === "PHONE_ALREADY_REGISTERED") {
+        success:
+          false,
 
-      // Delete the newly-created Firebase account because
-      // the phone number is already owned by another account.
-      try {
-        await adminAuth.deleteUser(req.user.uid);
-      } catch (deleteError) {
-        console.error(
-          "Failed to remove duplicate registration:",
-          deleteError
-        );
-      }
+        error:
+          "Unable to complete registration.",
 
-      return res.status(409).json({
-        success: false,
-        error: "This phone number is already registered.",
-        requestId: req.requestId,
+        requestId:
+          req.requestId,
+
       });
+
     }
 
-    console.error(
-      "Phone registration error:",
-      error
-    );
-
-    return res.status(500).json({
-      success: false,
-      error: "Unable to complete registration.",
-      requestId: req.requestId,
-    });
   }
-});
+);
+
 
 // =====================================================
 // 404 HANDLER
 // =====================================================
 
-app.use((req, res) => {
-  res.status(404).json({
-    success: false,
-    error: "Route not found",
-    requestId: req.requestId,
-  });
-});
+app.use(
+  (req, res) => {
+
+    res.status(404).json({
+
+      success:
+        false,
+
+      error:
+        "Route not found",
+
+      requestId:
+        req.requestId,
+
+    });
+
+  }
+);
+
 
 // =====================================================
 // CENTRAL ERROR HANDLER
 // =====================================================
 
-app.use((err, req, res, next) => {
-  console.error("Backend error:", err);
+app.use(
+  (err, req, res, next) => {
 
-  if (res.headersSent) {
-    return next(err);
+    console.error(
+      "Backend error:",
+      err
+    );
+
+
+    if (
+      res.headersSent
+    ) {
+
+      return next(
+        err
+      );
+
+    }
+
+
+    res.status(500).json({
+
+      success:
+        false,
+
+      error:
+        "Internal server error",
+
+      requestId:
+        req.requestId,
+
+    });
+
   }
+);
 
-  res.status(500).json({
-    success: false,
-    error: "Internal server error",
-    requestId: req.requestId,
-  });
-});
 
 // =====================================================
 // SERVER START
 // =====================================================
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`NovaPay backend running on port ${PORT}`);
+app.listen(
+  PORT,
+  "0.0.0.0",
+  () => {
 
-  startReconciliationWorker();
-});
+    console.log(
+      `NovaPay backend running on port ${PORT}`
+    );
+
+
+    startReconciliationWorker();
+
+  }
+);
