@@ -36,18 +36,6 @@ const crypto = require("crypto");
 // failure
 // unknown
 //
-// IMPORTANT:
-//
-// UNKNOWN means:
-//
-// "We do not have enough evidence to conclude that the
-// provider failed."
-//
-// Therefore the service MUST NOT release a wallet
-// reservation merely because this adapter encountered a
-// timeout, network error, malformed response, or other
-// ambiguous provider condition.
-//
 // =====================================================
 
 
@@ -103,15 +91,6 @@ const VTU_REQUEST_TIMEOUT_MS =
 
 // =====================================================
 // TOKEN CACHE
-// =====================================================
-//
-// The token stays server-side.
-//
-// It is never returned to callers.
-//
-// A small expiration safety window prevents starting a
-// financial provider request with a nearly expired token.
-//
 // =====================================================
 
 let cachedToken =
@@ -256,26 +235,6 @@ function requireTransactionId(
 // =====================================================
 // PROVIDER REQUEST ID
 // =====================================================
-//
-// VTU.ng request_id is the idempotency/reconciliation
-// identifier.
-//
-// We derive it deterministically from the NovaPay
-// transaction ID.
-//
-// Same NovaPay transaction:
-//
-//     transactionId
-//          ↓
-//     same request_id
-//
-// This is essential if the first request times out and we
-// later need to requery the provider.
-//
-// Maximum output length:
-// 48 characters.
-//
-// =====================================================
 
 function createProviderRequestId(
     transactionId
@@ -400,13 +359,6 @@ async function fetchWithTimeout(
 
 // =====================================================
 // RESPONSE BODY PARSER
-// =====================================================
-//
-// Provider responses should normally be JSON.
-//
-// An invalid response is UNKNOWN, not automatically
-// FAILURE.
-//
 // =====================================================
 
 async function parseJsonResponse(
@@ -626,12 +578,6 @@ async function getAccessToken({
         data.token.trim();
 
 
-    /*
-     * VTU.ng token lifetime is approximately seven days.
-     *
-     * Cache slightly below that period.
-     */
-
     cachedTokenExpiresAt =
         now +
         (
@@ -726,12 +672,9 @@ async function authenticatedRequest(
 
 
     /*
-     * A 401/403 can indicate an expired/invalid cached
-     * token.
+     * Refresh an expired/invalid token once.
      *
-     * Refresh once and retry the SAME provider operation.
-     *
-     * The request_id does not change.
+     * The provider request ID remains exactly the same.
      */
 
     if (
@@ -806,12 +749,6 @@ async function authenticatedRequest(
             VtuProviderError
         ) {
 
-            /*
-             * Preserve the HTTP status so the service can
-             * log/handle it internally without exposing it
-             * to the frontend.
-             */
-
             error.httpStatus =
                 response.status;
 
@@ -851,27 +788,17 @@ async function authenticatedRequest(
 // PROVIDER STATUS NORMALIZATION
 // =====================================================
 //
-// Only these states are authoritative:
+// CONFIRMED SUCCESS:
 //
-// completed-api → success
+// completed-api
+//
+// CONFIRMED FAILURE:
 //
 // failed
 // refunded
-// cancelled → failure
+// cancelled
 //
-// Everything else → unknown
-//
-// This is intentional.
-//
-// Processing is NOT failure.
-//
-// Queued is NOT failure.
-//
-// Initiated is NOT failure.
-//
-// Pending is NOT failure.
-//
-// On-hold is NOT failure.
+// Everything else remains UNKNOWN.
 //
 // =====================================================
 
@@ -918,20 +845,162 @@ function normalizeProviderStatus(
 
 
 // =====================================================
-// MONEY CONVERSION
+// PROVIDER FAILURE CODE NORMALIZATION
 // =====================================================
 //
-// Provider monetary values are represented in NGN.
+// Some VTU.ng failures are communicated through a
+// provider error code rather than a status such as
+// "failed".
 //
-// We convert safely to integer kobo.
+// These are definite failures because the provider has
+// explicitly rejected the Airtime operation.
 //
-// Examples:
+// IMPORTANT:
 //
-// 100
-// "100"
-// "100.00"
-// "97.50"
+// Only codes that represent a definite rejection/failure
+// are listed here.
 //
+// Ambiguous errors are NOT included.
+//
+// =====================================================
+
+function normalizeProviderCode(
+    code
+) {
+
+    const normalized =
+        String(
+            code ||
+            ""
+        )
+            .trim()
+            .toLowerCase();
+
+
+    if (
+        normalized ===
+            "insufficient_funds" ||
+        normalized ===
+            "insufficient-funds" ||
+        normalized ===
+            "insufficient balance" ||
+        normalized ===
+            "insufficient_balance" ||
+        normalized ===
+            "order_failed" ||
+        normalized ===
+            "order-failed" ||
+        normalized ===
+            "product_unavailable" ||
+        normalized ===
+            "product-unavailable"
+    ) {
+
+        return "failure";
+
+    }
+
+
+    return "unknown";
+
+}
+
+
+// =====================================================
+// PROVIDER FAILURE MESSAGE NORMALIZATION
+// =====================================================
+//
+// We use the provider message as supporting evidence.
+//
+// We do NOT classify every arbitrary message as failure.
+// Only explicit failure phrases are accepted.
+//
+// =====================================================
+
+function normalizeProviderMessageOutcome(
+    message
+) {
+
+    const normalized =
+        String(
+            message ||
+            ""
+        )
+            .trim()
+            .toLowerCase();
+
+
+    if (!normalized) {
+
+        return "unknown";
+
+    }
+
+
+    const definiteFailurePatterns = [
+
+        "insufficient wallet balance",
+
+        "insufficient wallet funds",
+
+        "insufficient funds",
+
+        "insufficient balance",
+
+        "wallet balance is insufficient",
+
+        "order failed",
+
+        "order has failed",
+
+        "airtime order failed",
+
+        "product unavailable",
+
+        "product is unavailable",
+
+        "transaction failed",
+
+        "transaction has failed",
+
+        "request failed",
+
+        "request has failed",
+
+        "cancelled",
+
+        "canceled",
+
+        "refunded"
+
+    ];
+
+
+    for (
+        const pattern
+        of definiteFailurePatterns
+    ) {
+
+        if (
+            normalized.includes(
+                pattern
+            )
+        ) {
+
+            return "failure";
+
+        }
+
+    }
+
+
+    return "unknown";
+
+}
+
+
+// =====================================================
+// MONEY CONVERSION
 // =====================================================
 
 function nairaToKobo(
@@ -1091,20 +1160,6 @@ function extractProviderReference(
 // =====================================================
 // PROVIDER COST EXTRACTION
 // =====================================================
-//
-// VTU.ng may return amount_charged.
-//
-// This is provider cost, NOT the customer's wallet
-// amount.
-//
-// Example:
-//
-// customer amount = ₦100
-// provider cost   = ₦97.50
-//
-// NovaPay can later calculate its gain.
-//
-// =====================================================
 
 function extractProviderCostKobo(
     data
@@ -1144,6 +1199,18 @@ function extractProviderCostKobo(
 // =====================================================
 // NORMALIZE PROVIDER RESPONSE
 // =====================================================
+//
+// Decision priority:
+//
+// 1. Explicit provider status
+// 2. Explicit provider failure code
+// 3. Explicit definite failure message
+// 4. Otherwise unknown
+//
+// This prevents an ordinary HTTP error or ambiguous
+// provider response from accidentally becoming a refund.
+//
+// =====================================================
 
 function normalizeProviderResponse(
     data,
@@ -1166,12 +1233,6 @@ function normalizeProviderResponse(
         )
             .trim()
             .toLowerCase();
-
-
-    const outcome =
-        normalizeProviderStatus(
-            providerStatus
-        );
 
 
     const providerReference =
@@ -1206,9 +1267,168 @@ function normalizeProviderResponse(
         null;
 
 
+    /*
+     * -----------------------------------------------------
+     * 1. EXPLICIT PROVIDER STATUS
+     * -----------------------------------------------------
+     */
+
+    const statusOutcome =
+        normalizeProviderStatus(
+            providerStatus
+        );
+
+
+    if (
+        statusOutcome ===
+        "success"
+    ) {
+
+        return {
+
+            outcome:
+                "success",
+
+            providerStatus,
+
+            providerReference,
+
+            providerCostKobo,
+
+            providerCode,
+
+            message,
+
+            httpStatus
+
+        };
+
+    }
+
+
+    if (
+        statusOutcome ===
+        "failure"
+    ) {
+
+        return {
+
+            outcome:
+                "failure",
+
+            providerStatus,
+
+            providerReference,
+
+            providerCostKobo,
+
+            providerCode,
+
+            message,
+
+            httpStatus
+
+        };
+
+    }
+
+
+    /*
+     * -----------------------------------------------------
+     * 2. EXPLICIT PROVIDER ERROR CODE
+     * -----------------------------------------------------
+     */
+
+    const codeOutcome =
+        normalizeProviderCode(
+            providerCode
+        );
+
+
+    if (
+        codeOutcome ===
+        "failure"
+    ) {
+
+        return {
+
+            outcome:
+                "failure",
+
+            providerStatus:
+                providerStatus ||
+                null,
+
+            providerReference,
+
+            providerCostKobo,
+
+            providerCode,
+
+            message,
+
+            httpStatus
+
+        };
+
+    }
+
+
+    /*
+     * -----------------------------------------------------
+     * 3. DEFINITE FAILURE MESSAGE
+     * -----------------------------------------------------
+     */
+
+    const messageOutcome =
+        normalizeProviderMessageOutcome(
+            message
+        );
+
+
+    if (
+        messageOutcome ===
+        "failure"
+    ) {
+
+        return {
+
+            outcome:
+                "failure",
+
+            providerStatus:
+                providerStatus ||
+                null,
+
+            providerReference,
+
+            providerCostKobo,
+
+            providerCode,
+
+            message,
+
+            httpStatus
+
+        };
+
+    }
+
+
+    /*
+     * -----------------------------------------------------
+     * 4. UNKNOWN
+     * -----------------------------------------------------
+     *
+     * HTTP errors, processing states, queued states,
+     * malformed business responses, and other ambiguous
+     * provider conditions remain UNKNOWN.
+     */
+
     return {
 
-        outcome,
+        outcome:
+            "unknown",
 
         providerStatus:
             providerStatus ||
@@ -1337,13 +1557,6 @@ function validatePurchaseInput({
 // =====================================================
 // PURCHASE AIRTIME
 // =====================================================
-//
-// This function does NOT reserve or debit NovaPay money.
-//
-// The service must have already created the transaction
-// and reserved the user's funds before calling it.
-//
-// =====================================================
 
 async function purchaseAirtime({
     transactionId,
@@ -1414,11 +1627,10 @@ async function purchaseAirtime({
     catch (error) {
 
         /*
-         * NEVER turn an uncertain provider operation into
-         * a confirmed failure.
-         *
-         * The service must keep the reservation pending
-         * and reconcile later.
+         * Network failures, timeouts, malformed responses,
+         * authentication failures, and other thrown provider
+         * errors are still UNKNOWN unless a definite provider
+         * failure was explicitly supplied by the provider.
          */
 
         if (
@@ -1545,14 +1757,6 @@ async function purchaseAirtime({
 // =====================================================
 // REQUERY AIRTIME
 // =====================================================
-//
-// Requery uses the EXACT SAME deterministic request ID
-// generated from the original NovaPay transaction ID.
-//
-// This is what allows an uncertain transaction to be
-// reconciled without creating a second provider order.
-//
-// =====================================================
 
 async function requeryAirtime(
     transactionId
@@ -1656,14 +1860,10 @@ async function requeryAirtime(
 // CHECK AIRTIME STATUS
 // =====================================================
 //
-// This is the interface used by the Airtime reconciliation
-// worker.
+// Interface used by the Airtime reconciliation worker.
 //
-// It uses the existing requeryAirtime() function rather
-// than creating a second requery implementation.
-//
-// The provider request ID is deterministic and must belong
-// to the same NovaPay transaction.
+// It verifies the provider request ID and delegates to
+// the existing deterministic requery implementation.
 //
 // =====================================================
 
@@ -1684,12 +1884,6 @@ async function checkAirtimeStatus({
         );
 
 
-    /*
-     * If reconciliation supplied a provider request ID,
-     * verify that it matches the deterministic request ID
-     * for this exact NovaPay transaction.
-     */
-
     if (
         providerRequestId !==
             null &&
@@ -1709,13 +1903,6 @@ async function checkAirtimeStatus({
 
     }
 
-
-    /*
-     * Use the existing requery implementation.
-     *
-     * No second provider status endpoint is introduced.
-     * No second request ID is generated.
-     */
 
     return await requeryAirtime(
         normalizedTransactionId
