@@ -37,26 +37,6 @@ const REQUEST_TIMEOUT_MS = Math.max(
   Number(process.env.VTU_TIMEOUT_MS || 15000)
 );
 
-/*
- * Our application uses stable lowercase provider IDs.
- *
- * VTU.ng's betting API expects the provider service_id
- * in the provider's canonical form.
- *
- * Keep this conversion inside the provider adapter so:
- *
- * Frontend/internal:
- *   bet9ja
- *
- * Database:
- *   bet9ja
- *
- * VTU.ng:
- *   Bet9ja
- *
- * This prevents provider-specific casing rules from
- * leaking into the rest of NovaPay.
- */
 const VTU_BETTING_SERVICE_IDS = Object.freeze({
   "1xbet": "1xBet",
   "bangbet": "BangBet",
@@ -89,7 +69,9 @@ function requireTransactionId(transactionId) {
   ) {
     throw new VtuProviderError(
       "Invalid betting transaction ID",
-      "validation"
+      {
+        kind: "validation",
+      }
     );
   }
 
@@ -97,8 +79,7 @@ function requireTransactionId(transactionId) {
 }
 
 function validateServiceId(serviceId) {
-  const normalized =
-    normalizeBettingServiceId(serviceId);
+  const normalized = normalizeBettingServiceId(serviceId);
 
   if (
     !normalized ||
@@ -106,7 +87,9 @@ function validateServiceId(serviceId) {
   ) {
     throw new VtuProviderError(
       "Unsupported betting service",
-      "validation"
+      {
+        kind: "validation",
+      }
     );
   }
 
@@ -114,8 +97,7 @@ function validateServiceId(serviceId) {
 }
 
 function getVtuBettingServiceId(serviceId) {
-  const normalized =
-    validateServiceId(serviceId);
+  const normalized = validateServiceId(serviceId);
 
   const providerServiceId =
     VTU_BETTING_SERVICE_IDS[normalized];
@@ -123,7 +105,9 @@ function getVtuBettingServiceId(serviceId) {
   if (!providerServiceId) {
     throw new VtuProviderError(
       "Unsupported betting service",
-      "validation"
+      {
+        kind: "validation",
+      }
     );
   }
 
@@ -137,7 +121,9 @@ function validateCustomerId(customerId) {
   if (!isValidBettingCustomerId(normalized)) {
     throw new VtuProviderError(
       "Invalid betting customer ID",
-      "validation"
+      {
+        kind: "validation",
+      }
     );
   }
 
@@ -145,17 +131,16 @@ function validateCustomerId(customerId) {
 }
 
 function validateAmountKobo(amountKobo) {
-  const numericAmount =
-    Number(amountKobo);
+  const numericAmount = Number(amountKobo);
 
   if (
-    !isValidBettingAmountKobo(
-      numericAmount
-    )
+    !isValidBettingAmountKobo(numericAmount)
   ) {
     throw new VtuProviderError(
       "Invalid betting amount",
-      "validation"
+      {
+        kind: "validation",
+      }
     );
   }
 
@@ -169,10 +154,7 @@ function createProviderRequestId(transactionId) {
   const digest =
     crypto
       .createHash("sha256")
-      .update(
-        normalizedTransactionId,
-        "utf8"
-      )
+      .update(normalizedTransactionId, "utf8")
       .digest("hex");
 
   const requestId =
@@ -185,7 +167,9 @@ function createProviderRequestId(transactionId) {
   ) {
     throw new VtuProviderError(
       "Unable to create a valid betting provider request ID",
-      "validation"
+      {
+        kind: "validation",
+      }
     );
   }
 
@@ -233,18 +217,19 @@ async function fetchWithTimeout(
     ) {
       throw new VtuProviderError(
         "VTU.ng request timed out",
-        "unknown",
         {
-          cause: error,
+          kind: "timeout",
         }
       );
     }
 
     throw new VtuProviderError(
       "Unable to reach VTU.ng",
-      "unknown",
       {
-        cause: error,
+        kind: "network",
+        rawMessage: String(
+          error?.message || ""
+        ).slice(0, 300),
       }
     );
   } finally {
@@ -252,9 +237,7 @@ async function fetchWithTimeout(
   }
 }
 
-async function parseJsonResponse(
-  response
-) {
+async function parseJsonResponse(response) {
   const text =
     await response.text();
 
@@ -267,10 +250,12 @@ async function parseJsonResponse(
   } catch (error) {
     throw new VtuProviderError(
       "VTU.ng returned an invalid response",
-      "unknown",
       {
-        cause: error,
+        kind: "unknown",
         httpStatus: response.status,
+        rawMessage: String(
+          error?.message || ""
+        ).slice(0, 300),
       }
     );
   }
@@ -303,9 +288,7 @@ function extractPayload(response) {
   return response;
 }
 
-function extractProviderReference(
-  response
-) {
+function extractProviderReference(response) {
   const payload =
     extractPayload(response);
 
@@ -327,9 +310,7 @@ function extractProviderReference(
   );
 }
 
-function extractProviderStatus(
-  response
-) {
+function extractProviderStatus(response) {
   const payload =
     extractPayload(response);
 
@@ -342,9 +323,7 @@ function extractProviderStatus(
   );
 }
 
-function extractProviderCode(
-  response
-) {
+function extractProviderCode(response) {
   const payload =
     extractPayload(response);
 
@@ -359,9 +338,7 @@ function extractProviderCode(
   );
 }
 
-function extractProviderMessage(
-  response
-) {
+function extractProviderMessage(response) {
   const payload =
     extractPayload(response);
 
@@ -378,9 +355,7 @@ function extractProviderMessage(
   );
 }
 
-function extractCustomerId(
-  response
-) {
+function extractCustomerId(response) {
   const payload =
     extractPayload(response);
 
@@ -396,9 +371,7 @@ function extractCustomerId(
   );
 }
 
-function extractCustomerName(
-  response
-) {
+function extractCustomerName(response) {
   const payload =
     extractPayload(response);
 
@@ -413,9 +386,7 @@ function extractCustomerName(
   );
 }
 
-function extractCustomerBalance(
-  response
-) {
+function extractCustomerBalance(response) {
   const payload =
     extractPayload(response);
 
@@ -475,26 +446,7 @@ function extractAmount(response) {
     : null;
 }
 
-/*
- * SECURITY:
- *
- * Never log the complete VTU response.
- *
- * Provider responses can contain customer names,
- * email addresses, phone numbers, account information,
- * balances, references, or other sensitive information.
- *
- * This diagnostic intentionally records only:
- * - object shape
- * - field names
- * - safe status/code/message information
- * - whether expected customer fields exist
- *
- * It does NOT log the raw provider response.
- */
-function buildSafeResponseDiagnostic(
-  response
-) {
+function buildSafeResponseDiagnostic(response) {
   const topLevel =
     response &&
     typeof response === "object" &&
@@ -534,19 +486,23 @@ function buildSafeResponseDiagnostic(
       extractProviderMessage(response),
 
     hasCustomerId:
-      Boolean(extractCustomerId(response)),
+      Boolean(
+        extractCustomerId(response)
+      ),
 
     hasCustomerName:
-      Boolean(extractCustomerName(response)),
+      Boolean(
+        extractCustomerName(response)
+      ),
 
     hasProviderReference:
-      Boolean(extractProviderReference(response)),
+      Boolean(
+        extractProviderReference(response)
+      ),
   };
 }
 
-function normalizePurchaseResponse(
-  response
-) {
+function normalizePurchaseResponse(response) {
   const providerStatus =
     extractProviderStatus(response);
 
@@ -633,8 +589,70 @@ async function authenticatedRequest(
     retryOnUnauthorized = true,
   } = {}
 ) {
-  let token =
-    await getAccessToken();
+  /*
+   * TEMPORARY DIAGNOSTIC:
+   *
+   * We deliberately do not log the access token.
+   *
+   * This tells us whether the shared VTU.ng authentication
+   * layer succeeds or fails before the betting request.
+   */
+  console.log(
+    "[VTU BETTING AUTH START]",
+    {
+      path,
+      method,
+    }
+  );
+
+  let token;
+
+  try {
+    token =
+      await getAccessToken();
+  } catch (error) {
+    console.error(
+      "[VTU BETTING AUTH ERROR]",
+      {
+        path,
+        method,
+        kind:
+          error?.kind ||
+          error?.name ||
+          "unknown",
+        type:
+          error?.constructor?.name ||
+          "",
+        httpStatus:
+          error?.httpStatus ??
+          null,
+        providerCode:
+          error?.providerCode ||
+          "",
+        providerStatus:
+          error?.providerStatus ||
+          "",
+        message:
+          error?.message ||
+          "Unable to obtain VTU.ng access token",
+      }
+    );
+
+    throw error;
+  }
+
+  console.log(
+    "[VTU BETTING AUTH SUCCESS]",
+    {
+      path,
+      method,
+      tokenReceived:
+        Boolean(
+          typeof token === "string" &&
+          token.trim()
+        ),
+    }
+  );
 
   const makeRequest =
     async (accessToken) => {
@@ -647,9 +665,7 @@ async function authenticatedRequest(
       };
 
       if (body !== undefined) {
-        headers[
-          "Content-Type"
-        ] =
+        headers["Content-Type"] =
           "application/json";
       }
 
@@ -676,6 +692,16 @@ async function authenticatedRequest(
       response.status === 403
     )
   ) {
+    console.log(
+      "[VTU BETTING AUTH REFRESH]",
+      {
+        path,
+        method,
+        httpStatus:
+          response.status,
+      }
+    );
+
     clearAccessToken();
 
     token =
@@ -715,16 +741,18 @@ async function authenticatedRequest(
       ) {
         throw new VtuProviderError(
           message,
-          "provider_rejection",
           {
+            kind:
+              "provider_rejection",
+
             httpStatus:
               response.status,
 
             providerCode:
               code,
 
-            response:
-              parsed,
+            rawMessage:
+              message,
           }
         );
       }
@@ -732,16 +760,17 @@ async function authenticatedRequest(
 
     throw new VtuProviderError(
       message,
-      "unknown",
       {
+        kind: "unknown",
+
         httpStatus:
           response.status,
 
         providerCode:
           code,
 
-        response:
-          parsed,
+        rawMessage:
+          message,
       }
     );
   }
@@ -763,15 +792,6 @@ async function verifyBettingCustomer({
       serviceId
     );
 
-  /*
-   * IMPORTANT:
-   *
-   * normalizedServiceId remains our internal
-   * lowercase ID.
-   *
-   * Only the provider request uses the
-   * VTU.ng canonical service ID.
-   */
   const providerServiceId =
     getVtuBettingServiceId(
       normalizedServiceId
@@ -856,16 +876,6 @@ async function verifyBettingCustomer({
     };
   }
 
-  /*
-   * The HTTP request succeeded, but the response did not
-   * satisfy our expected VTU.ng verification contract.
-   *
-   * Do NOT treat this as successful verification.
-   *
-   * Log only sanitized structural information so we can
-   * identify the provider's actual response shape without
-   * exposing customer PII or credentials.
-   */
   const diagnostic =
     buildSafeResponseDiagnostic(
       response
@@ -895,12 +905,13 @@ async function verifyBettingCustomer({
     throw new VtuProviderError(
       message ||
         "VTU.ng rejected the betting customer verification",
-      "provider_rejection",
       {
+        kind:
+          "provider_rejection",
+
         providerCode,
+
         providerStatus,
-        response,
-        diagnostic,
       }
     );
   }
@@ -908,12 +919,12 @@ async function verifyBettingCustomer({
   throw new VtuProviderError(
     message ||
       "Unable to determine the betting customer verification result",
-    "unknown",
     {
+      kind: "unknown",
+
       providerCode,
+
       providerStatus,
-      response,
-      diagnostic,
     }
   );
 }
@@ -1068,7 +1079,9 @@ async function checkBettingStatus({
   ) {
     throw new VtuProviderError(
       "Invalid betting provider request ID",
-      "validation"
+      {
+        kind: "validation",
+      }
     );
   }
 
