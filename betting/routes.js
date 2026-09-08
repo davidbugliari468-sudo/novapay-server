@@ -117,6 +117,50 @@ function getErrorStatus(error) {
   return 500;
 }
 
+/*
+ * Temporary safe diagnostic information.
+ *
+ * This deliberately does NOT expose:
+ * - access tokens
+ * - Firebase tokens
+ * - API keys
+ * - PINs
+ * - authorization headers
+ * - wallet balances
+ * - reservation IDs
+ *
+ * It only exposes information useful for identifying
+ * where the request failed.
+ */
+function getSafeDiagnostic(error) {
+  return {
+    kind:
+      typeof error?.kind === "string"
+        ? error.kind
+        : "",
+
+    type:
+      typeof error?.type === "string"
+        ? error.type
+        : "",
+
+    httpStatus:
+      Number.isInteger(error?.httpStatus)
+        ? error.httpStatus
+        : null,
+
+    providerCode:
+      typeof error?.providerCode === "string"
+        ? error.providerCode
+        : "",
+
+    providerStatus:
+      typeof error?.providerStatus === "string"
+        ? error.providerStatus
+        : "",
+  };
+}
+
 function sendTransactionResponse(res, transaction) {
   if (!transaction) {
     return res.status(404).json({
@@ -300,13 +344,17 @@ router.post(
           result.message || "",
       });
     } catch (error) {
+      const diagnostic =
+        getSafeDiagnostic(error);
+
       console.error(
-        "[Betting Verify Error]",
+        "[BETTING VERIFY ERROR]",
         {
           uid,
-          message: error?.message || "Unknown error",
-          kind: error?.kind || "",
-          httpStatus: error?.httpStatus || null,
+          message:
+            error?.message ||
+            "Unknown error",
+          ...diagnostic,
         }
       );
 
@@ -314,7 +362,9 @@ router.post(
         getErrorStatus(error)
       ).json({
         success: false,
-        error: getSafeErrorMessage(error),
+        error:
+          getSafeErrorMessage(error),
+        diagnostic,
       });
     }
   }
@@ -395,13 +445,17 @@ router.post(
         transaction
       );
     } catch (error) {
+      const diagnostic =
+        getSafeDiagnostic(error);
+
       console.error(
-        "[Betting Fund Error]",
+        "[BETTING FUND ERROR]",
         {
           uid,
-          message: error?.message || "Unknown error",
-          kind: error?.kind || "",
-          httpStatus: error?.httpStatus || null,
+          message:
+            error?.message ||
+            "Unknown error",
+          ...diagnostic,
         }
       );
 
@@ -409,7 +463,9 @@ router.post(
         getErrorStatus(error)
       ).json({
         success: false,
-        error: getSafeErrorMessage(error),
+        error:
+          getSafeErrorMessage(error),
+        diagnostic,
       });
     }
   }
@@ -474,7 +530,9 @@ router.get(
         "[Betting Transaction Error]",
         {
           uid,
-          message: error?.message || "Unknown error",
+          message:
+            error?.message ||
+            "Unknown error",
         }
       );
 
