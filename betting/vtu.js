@@ -1,4 +1,4 @@
-"use strict";
+// betting/vtu.js
 
 const crypto = require("crypto");
 
@@ -10,200 +10,145 @@ const {
 
 const {
   BETTING_SERVICES,
-  BETTING_PROVIDER_LIMITS,
-  isSupportedBettingServiceId,
-  normalizeBettingServiceId,
-  isValidBettingCustomerId,
-  normalizeBettingCustomerId,
-  isValidBettingAmountKobo,
-  bettingKoboToNaira,
-  normalizeBettingProviderStatus,
-  isBettingProviderSuccessStatus,
-  isBettingProviderFailureStatus,
-  normalizeBettingProviderCode,
+  BETTING_LIMITS,
+  BETTING_SUCCESS_STATUSES,
+  BETTING_FAILURE_STATUSES,
   isBettingDefiniteFailureCode,
   isBettingDefiniteFailureMessage,
-  isValidBettingProviderRequestId,
 } = require("./constants");
+
+const {
+  validateProvider,
+  validateCustomerId,
+  validateAmountKobo,
+  validateTransactionId,
+} = require("./validation");
 
 const VTU_BASE_URL = (
   process.env.VTU_BASE_URL || "https://vtu.ng/wp-json"
 ).replace(/\/+$/, "");
 
-const VTU_API_BASE_URL = `${VTU_BASE_URL}/api/v2`;
+const VTU_API_URL = `${VTU_BASE_URL}/api/v2`;
 
-const REQUEST_TIMEOUT_MS = Math.max(
+const VTU_TIMEOUT_MS = Math.max(
   5000,
   Number(process.env.VTU_TIMEOUT_MS || 15000)
 );
 
 const VTU_BETTING_SERVICE_IDS = Object.freeze({
   "1xbet": "1xBet",
-  "bangbet": "BangBet",
-  "bet9ja": "Bet9ja",
-  "betking": "BetKing",
-  "betland": "BetLand",
-  "betlion": "BetLion",
-  "betway": "BetWay",
-  "cloudbet": "CloudBet",
-  "livescorebet": "LiveScoreBet",
-  "merrybet": "MerryBet",
-  "naijabet": "NaijaBet",
-  "nairabet": "NairaBet",
-  "sportybet": "SportyBet",
-  "supabet": "SupaBet",
+  bangbet: "BangBet",
+  bet9ja: "Bet9ja",
+  betking: "BetKing",
+  betland: "BetLand",
+  betlion: "BetLion",
+  betway: "BetWay",
+  cloudbet: "CloudBet",
+  livescorebet: "LiveScoreBet",
+  merrybet: "MerryBet",
+  naijabet: "NaijaBet",
+  nairabet: "NairaBet",
+  sportybet: "SportyBet",
+  supabet: "SupaBet",
 });
 
-function normalizeString(value) {
-  return typeof value === "string" ? value.trim() : "";
+function normalizeProvider(provider) {
+  return String(provider || "").trim().toLowerCase();
 }
 
-function requireTransactionId(transactionId) {
-  const normalized = normalizeString(transactionId);
+function getVtuBettingServiceId(provider) {
+  const normalized = normalizeProvider(provider);
+  return VTU_BETTING_SERVICE_IDS[normalized] || null;
+}
 
-  if (
-    normalized.length <
-      BETTING_PROVIDER_LIMITS.transactionIdMinLength ||
-    normalized.length >
-      BETTING_PROVIDER_LIMITS.transactionIdMaxLength
-  ) {
-    throw new VtuProviderError(
-      "Invalid betting transaction ID",
-      {
-        kind: "validation",
-      }
-    );
+function validateBettingProvider(provider) {
+  const normalized = validateProvider(provider);
+
+  if (!BETTING_SERVICES.includes(normalized)) {
+    throw new VtuProviderError("Unsupported betting provider.", {
+      kind: "validation",
+    });
+  }
+
+  if (!getVtuBettingServiceId(normalized)) {
+    throw new VtuProviderError("Unsupported betting provider.", {
+      kind: "validation",
+    });
   }
 
   return normalized;
 }
 
-function validateServiceId(serviceId) {
-  const normalized = normalizeBettingServiceId(serviceId);
+function validateBettingCustomer(customerId) {
+  const normalized = validateCustomerId(customerId);
 
-  if (
-    !normalized ||
-    !isSupportedBettingServiceId(normalized)
-  ) {
-    throw new VtuProviderError(
-      "Unsupported betting service",
-      {
-        kind: "validation",
-      }
-    );
+  if (!normalized) {
+    throw new VtuProviderError("A valid betting customer ID is required.", {
+      kind: "validation",
+    });
   }
 
   return normalized;
 }
 
-function getVtuBettingServiceId(serviceId) {
-  const normalized = validateServiceId(serviceId);
+function validateBettingAmount(amountKobo) {
+  const amount = validateAmountKobo(amountKobo);
 
-  const providerServiceId =
-    VTU_BETTING_SERVICE_IDS[normalized];
+  if (!Number.isInteger(amount)) {
+    throw new VtuProviderError("A valid betting amount is required.", {
+      kind: "validation",
+    });
+  }
 
-  if (!providerServiceId) {
+  if (amount < BETTING_LIMITS.MIN_AMOUNT_KOBO) {
+    throw new VtuProviderError("The betting amount is below the minimum.", {
+      kind: "validation",
+    });
+  }
+
+  if (amount > BETTING_LIMITS.MAX_AMOUNT_KOBO) {
+    throw new VtuProviderError("The betting amount is above the maximum.", {
+      kind: "validation",
+    });
+  }
+
+  return amount;
+}
+
+function buildBettingRequestId(transactionId) {
+  const normalizedTransactionId = validateTransactionId(transactionId);
+
+  if (!normalizedTransactionId) {
     throw new VtuProviderError(
-      "Unsupported betting service",
+      "A valid transaction ID is required for betting.",
       {
         kind: "validation",
       }
     );
   }
 
-  return providerServiceId;
-}
+  const digest = crypto
+    .createHash("sha256")
+    .update(normalizedTransactionId)
+    .digest("hex");
 
-function validateCustomerId(customerId) {
-  const normalized =
-    normalizeBettingCustomerId(customerId);
+  const requestId = `NPBET${digest.slice(0, 45)}`;
 
-  if (!isValidBettingCustomerId(normalized)) {
-    throw new VtuProviderError(
-      "Invalid betting customer ID",
-      {
-        kind: "validation",
-      }
-    );
-  }
-
-  return normalized;
-}
-
-function validateAmountKobo(amountKobo) {
-  const numericAmount = Number(amountKobo);
-
-  if (
-    !isValidBettingAmountKobo(numericAmount)
-  ) {
-    throw new VtuProviderError(
-      "Invalid betting amount",
-      {
-        kind: "validation",
-      }
-    );
-  }
-
-  return numericAmount;
-}
-
-function createProviderRequestId(transactionId) {
-  const normalizedTransactionId =
-    requireTransactionId(transactionId);
-
-  const digest =
-    crypto
-      .createHash("sha256")
-      .update(normalizedTransactionId, "utf8")
-      .digest("hex");
-
-  const requestId =
-    `NPBET${digest.slice(0, 45)}`;
-
-  if (
-    !isValidBettingProviderRequestId(
-      requestId
-    )
-  ) {
-    throw new VtuProviderError(
-      "Unable to create a valid betting provider request ID",
-      {
-        kind: "validation",
-      }
-    );
+  if (requestId.length > BETTING_LIMITS.PROVIDER_REQUEST_ID_MAX_LENGTH) {
+    throw new VtuProviderError("The betting request ID is invalid.", {
+      kind: "validation",
+    });
   }
 
   return requestId;
 }
 
-function createAbortController(timeoutMs) {
-  const controller =
-    new AbortController();
+async function fetchWithTimeout(url, options = {}) {
+  const controller = new AbortController();
 
-  const timeout =
-    setTimeout(() => {
-      controller.abort();
-    }, timeoutMs);
-
-  return {
-    controller,
-
-    clear: () =>
-      clearTimeout(timeout),
-  };
-}
-
-async function fetchWithTimeout(
-  url,
-  options = {}
-) {
-  const {
-    controller,
-    clear,
-  } =
-    createAbortController(
-      REQUEST_TIMEOUT_MS
-    );
+  const timeout = setTimeout(() => {
+    controller.abort();
+  }, VTU_TIMEOUT_MS);
 
   try {
     return await fetch(url, {
@@ -211,519 +156,358 @@ async function fetchWithTimeout(
       signal: controller.signal,
     });
   } catch (error) {
-    if (
-      error &&
-      error.name === "AbortError"
-    ) {
-      throw new VtuProviderError(
-        "VTU.ng request timed out",
-        {
-          kind: "timeout",
-        }
-      );
+    if (error && error.name === "AbortError") {
+      throw new VtuProviderError("VTU.ng request timed out.", {
+        kind: "timeout",
+      });
     }
 
-    throw new VtuProviderError(
-      "Unable to reach VTU.ng",
-      {
-        kind: "network",
-        rawMessage: String(
-          error?.message || ""
-        ).slice(0, 300),
-      }
-    );
+    throw new VtuProviderError("Unable to reach VTU.ng.", {
+      kind: "network",
+      rawMessage: error && error.message ? error.message : null,
+    });
   } finally {
-    clear();
+    clearTimeout(timeout);
   }
 }
 
 async function parseJsonResponse(response) {
-  const text =
-    await response.text();
+  const text = await response.text();
 
   if (!text) {
-    return {};
+    throw new VtuProviderError("VTU.ng returned an empty response.", {
+      kind: "unknown",
+      httpStatus: response.status,
+    });
   }
 
   try {
     return JSON.parse(text);
   } catch (error) {
-    throw new VtuProviderError(
-      "VTU.ng returned an invalid response",
-      {
-        kind: "unknown",
-        httpStatus: response.status,
-        rawMessage: String(
-          error?.message || ""
-        ).slice(0, 300),
-      }
-    );
+    throw new VtuProviderError("VTU.ng returned an invalid response.", {
+      kind: "unknown",
+      httpStatus: response.status,
+    });
   }
 }
 
-function extractPayload(response) {
-  if (
-    !response ||
-    typeof response !== "object"
-  ) {
+function extractPayload(data) {
+  if (!data || typeof data !== "object") {
     return {};
   }
 
   if (
-    response.data &&
-    typeof response.data === "object" &&
-    !Array.isArray(response.data)
+    data.data &&
+    typeof data.data === "object" &&
+    !Array.isArray(data.data)
   ) {
-    return response.data;
+    return data.data;
   }
 
-  if (
-    response.result &&
-    typeof response.result === "object" &&
-    !Array.isArray(response.result)
-  ) {
-    return response.result;
-  }
-
-  return response;
+  return data;
 }
 
-function extractProviderReference(response) {
-  const payload =
-    extractPayload(response);
+function extractProviderReference(data) {
+  const payload = extractPayload(data);
 
-  return normalizeString(
+  return (
     payload.reference ||
-      payload.provider_reference ||
-      payload.providerReference ||
-      payload.transaction_id ||
-      payload.transactionId ||
-      payload.order_id ||
-      payload.orderId ||
-      payload.request_id ||
-      payload.requestId ||
-      response.reference ||
-      response.provider_reference ||
-      response.transaction_id ||
-      response.order_id ||
-      ""
+    payload.transaction_id ||
+    payload.transactionId ||
+    payload.request_id ||
+    payload.requestId ||
+    payload.order_id ||
+    payload.orderId ||
+    payload.ref ||
+    data?.reference ||
+    data?.transaction_id ||
+    data?.transactionId ||
+    data?.request_id ||
+    data?.requestId ||
+    data?.order_id ||
+    data?.orderId ||
+    null
   );
 }
 
-function extractProviderStatus(response) {
-  const payload =
-    extractPayload(response);
+function extractProviderStatus(data) {
+  const payload = extractPayload(data);
 
-  return normalizeBettingProviderStatus(
+  return String(
     payload.status ||
       payload.transaction_status ||
       payload.transactionStatus ||
-      response.status ||
+      data?.status ||
+      data?.transaction_status ||
+      data?.transactionStatus ||
       ""
-  );
+  )
+    .trim()
+    .toLowerCase();
 }
 
-function extractProviderCode(response) {
-  const payload =
-    extractPayload(response);
+function extractProviderCode(data) {
+  const payload = extractPayload(data);
 
-  return normalizeBettingProviderCode(
-    payload.code ||
-      payload.error_code ||
-      payload.errorCode ||
-      response.code ||
-      response.error_code ||
-      response.errorCode ||
+  return String(
+    data?.code ||
+      data?.status_code ||
+      data?.statusCode ||
+      payload.code ||
+      payload.status_code ||
+      payload.statusCode ||
       ""
-  );
+  )
+    .trim()
+    .toLowerCase();
 }
 
-function extractProviderMessage(response) {
-  const payload =
-    extractPayload(response);
+function extractProviderMessage(data) {
+  const payload = extractPayload(data);
 
-  return normalizeString(
-    payload.message ||
-      payload.msg ||
-      payload.description ||
+  return String(
+    data?.message ||
+      data?.error ||
+      data?.msg ||
+      payload.message ||
       payload.error ||
-      response.message ||
-      response.msg ||
-      response.description ||
-      response.error ||
+      payload.msg ||
       ""
-  );
+  ).trim();
 }
 
-function extractCustomerId(response) {
-  const payload =
-    extractPayload(response);
+function extractCustomerId(data) {
+  const payload = extractPayload(data);
 
-  return normalizeBettingCustomerId(
+  return String(
     payload.customer_id ||
       payload.customerId ||
-      payload.account_id ||
-      payload.accountId ||
-      payload.customer ||
-      response.customer_id ||
-      response.customerId ||
+      payload.account_number ||
+      payload.accountNumber ||
+      data?.customer_id ||
+      data?.customerId ||
       ""
-  );
+  ).trim();
 }
 
-function extractCustomerName(response) {
-  const payload =
-    extractPayload(response);
+function extractCustomerName(data) {
+  const payload = extractPayload(data);
 
-  return normalizeString(
+  return String(
     payload.customer_name ||
       payload.customerName ||
       payload.name ||
-      response.customer_name ||
-      response.customerName ||
-      response.name ||
+      data?.customer_name ||
+      data?.customerName ||
+      data?.name ||
       ""
-  );
+  ).trim();
 }
 
-function extractCustomerBalance(response) {
-  const payload =
-    extractPayload(response);
+function extractCustomerBalance(data) {
+  const payload = extractPayload(data);
 
-  const rawBalance =
+  const value =
     payload.balance ??
     payload.customer_balance ??
     payload.customerBalance ??
-    response.balance ??
-    response.customer_balance ??
-    response.customerBalance;
+    data?.balance ??
+    data?.customer_balance ??
+    data?.customerBalance ??
+    null;
 
-  if (
-    rawBalance === undefined ||
-    rawBalance === null ||
-    rawBalance === ""
-  ) {
+  if (value === null || value === undefined || value === "") {
     return null;
   }
 
-  const numericBalance =
-    Number(rawBalance);
+  const numeric = Number(value);
 
-  return Number.isFinite(
-    numericBalance
-  )
-    ? numericBalance
-    : null;
+  return Number.isFinite(numeric) ? numeric : null;
 }
 
-function extractAmount(response) {
-  const payload =
-    extractPayload(response);
+function extractAmount(data) {
+  const payload = extractPayload(data);
 
-  const rawAmount =
+  const value =
     payload.amount ??
     payload.amount_paid ??
     payload.amountPaid ??
-    response.amount ??
-    response.amount_paid ??
-    response.amountPaid;
+    data?.amount ??
+    data?.amount_paid ??
+    data?.amountPaid ??
+    null;
 
-  if (
-    rawAmount === undefined ||
-    rawAmount === null ||
-    rawAmount === ""
-  ) {
+  if (value === null || value === undefined || value === "") {
     return null;
   }
 
-  const numericAmount =
-    Number(rawAmount);
+  const numeric = Number(value);
 
-  return Number.isFinite(
-    numericAmount
-  )
-    ? numericAmount
-    : null;
+  return Number.isFinite(numeric) ? numeric : null;
 }
 
-function buildSafeResponseDiagnostic(response) {
-  const topLevel =
-    response &&
-    typeof response === "object" &&
-    !Array.isArray(response)
-      ? response
-      : {};
+function getObjectKeys(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return [];
+  }
 
+  return Object.keys(value).slice(0, 30);
+}
+
+function buildSafeResponseDiagnostic(data) {
   const payload =
-    extractPayload(topLevel);
-
-  const payloadObject =
-    payload &&
-    typeof payload === "object" &&
-    !Array.isArray(payload)
-      ? payload
-      : {};
+    data &&
+    typeof data === "object" &&
+    data.data &&
+    typeof data.data === "object" &&
+    !Array.isArray(data.data)
+      ? data.data
+      : null;
 
   return {
-    responseType:
-      Array.isArray(response)
-        ? "array"
-        : typeof response,
-
-    topLevelKeys:
-      Object.keys(topLevel).sort(),
-
-    payloadKeys:
-      Object.keys(payloadObject).sort(),
-
-    providerCode:
-      extractProviderCode(response),
-
-    providerStatus:
-      extractProviderStatus(response),
-
-    providerMessage:
-      extractProviderMessage(response),
-
-    hasCustomerId:
-      Boolean(
-        extractCustomerId(response)
-      ),
-
-    hasCustomerName:
-      Boolean(
-        extractCustomerName(response)
-      ),
-
-    hasProviderReference:
-      Boolean(
-        extractProviderReference(response)
-      ),
+    topLevelKeys: getObjectKeys(data),
+    payloadKeys: getObjectKeys(payload),
+    providerCode: extractProviderCode(data),
+    providerStatus: extractProviderStatus(data),
+    providerMessage: extractProviderMessage(data),
+    hasReference: Boolean(extractProviderReference(data)),
+    hasCustomerId: Boolean(extractCustomerId(data)),
+    hasCustomerName: Boolean(extractCustomerName(data)),
+    hasBalance: extractCustomerBalance(data) !== null,
+    hasAmount: extractAmount(data) !== null,
   };
 }
 
-function normalizePurchaseResponse(response) {
-  const providerStatus =
-    extractProviderStatus(response);
+function logProviderErrorResponse(path, response, data) {
+  const diagnostic = buildSafeResponseDiagnostic(data);
 
-  const providerCode =
-    extractProviderCode(response);
+  console.error("[VTU BETTING PROVIDER ERROR]", {
+    path,
+    httpStatus: response.status,
+    ...diagnostic,
+  });
+}
 
-  const message =
-    extractProviderMessage(response);
-
-  const providerReference =
-    extractProviderReference(response);
+function normalizePurchaseResponse(data) {
+  const code = extractProviderCode(data);
+  const status = extractProviderStatus(data);
+  const message = extractProviderMessage(data);
+  const reference = extractProviderReference(data);
 
   if (
-    isBettingProviderSuccessStatus(
-      providerStatus
-    )
+    BETTING_SUCCESS_STATUSES.includes(status) ||
+    code === "success" ||
+    code === "successful"
   ) {
     return {
       outcome: "success",
-      providerReference,
-      providerStatus,
-      providerCode,
-      message,
-      amount:
-        extractAmount(response),
-      raw: response,
+      providerReference: reference,
+      providerStatus: status,
+      providerCode: code,
+      providerMessage: message,
+      raw: data,
     };
   }
 
   if (
-    isBettingProviderFailureStatus(
-      providerStatus
-    )
+    BETTING_FAILURE_STATUSES.includes(status) ||
+    isBettingDefiniteFailureCode(code) ||
+    isBettingDefiniteFailureMessage(message)
   ) {
     return {
       outcome: "failure",
-      providerReference,
-      providerStatus,
-      providerCode,
-      message,
-      amount:
-        extractAmount(response),
-      raw: response,
-    };
-  }
-
-  if (
-    isBettingDefiniteFailureCode(
-      providerCode
-    ) ||
-    isBettingDefiniteFailureMessage(
-      message
-    )
-  ) {
-    return {
-      outcome: "failure",
-      providerReference,
-      providerStatus,
-      providerCode,
-      message,
-      amount:
-        extractAmount(response),
-      raw: response,
+      providerReference: reference,
+      providerStatus: status,
+      providerCode: code,
+      providerMessage: message,
+      raw: data,
     };
   }
 
   return {
     outcome: "unknown",
-    providerReference,
-    providerStatus,
-    providerCode,
-    message,
-    amount:
-      extractAmount(response),
-    raw: response,
+    providerReference: reference,
+    providerStatus: status,
+    providerCode: code,
+    providerMessage: message,
+    raw: data,
   };
 }
 
 async function authenticatedRequest(
   path,
   {
-    method = "GET",
-    body,
-    retryOnUnauthorized = true,
+    method = "POST",
+    body = null,
+    retryAuthentication = true,
   } = {}
 ) {
-  /*
-   * TEMPORARY DIAGNOSTIC:
-   *
-   * We deliberately do not log the access token.
-   *
-   * This tells us whether the shared VTU.ng authentication
-   * layer succeeds or fails before the betting request.
-   */
-  console.log(
-    "[VTU BETTING AUTH START]",
-    {
-      path,
-      method,
-    }
-  );
-
   let token;
 
+  console.log("[VTU BETTING AUTH START]", {
+    path,
+    method,
+  });
+
   try {
-    token =
-      await getAccessToken();
+    token = await getAccessToken();
   } catch (error) {
-    console.error(
-      "[VTU BETTING AUTH ERROR]",
-      {
-        path,
-        method,
-        kind:
-          error?.kind ||
-          error?.name ||
-          "unknown",
-        type:
-          error?.constructor?.name ||
-          "",
-        httpStatus:
-          error?.httpStatus ??
-          null,
-        providerCode:
-          error?.providerCode ||
-          "",
-        providerStatus:
-          error?.providerStatus ||
-          "",
-        message:
-          error?.message ||
-          "Unable to obtain VTU.ng access token",
-      }
-    );
+    console.error("[VTU BETTING AUTH ERROR]", {
+      kind: error?.kind || "unknown",
+      type: error?.name || "",
+      httpStatus: error?.httpStatus || null,
+      providerCode: error?.providerCode || null,
+      providerStatus: error?.providerStatus || null,
+      message: error?.message || "Unknown authentication error",
+    });
 
     throw error;
   }
 
-  console.log(
-    "[VTU BETTING AUTH SUCCESS]",
-    {
-      path,
-      method,
-      tokenReceived:
-        Boolean(
-          typeof token === "string" &&
-          token.trim()
-        ),
-    }
-  );
+  console.log("[VTU BETTING AUTH SUCCESS]", {
+    path,
+    method,
+    tokenReceived: Boolean(token),
+  });
 
-  const makeRequest =
-    async (accessToken) => {
-      const headers = {
-        Authorization:
-          `Bearer ${accessToken}`,
-
-        Accept:
-          "application/json",
-      };
-
-      if (body !== undefined) {
-        headers["Content-Type"] =
-          "application/json";
-      }
-
-      return fetchWithTimeout(
-        `${VTU_API_BASE_URL}${path}`,
-        {
-          method,
-          headers,
-          body:
-            body === undefined
-              ? undefined
-              : JSON.stringify(body),
-        }
-      );
-    };
-
-  let response =
-    await makeRequest(token);
+  const response = await fetchWithTimeout(`${VTU_API_URL}${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: body === null ? undefined : JSON.stringify(body),
+  });
 
   if (
-    retryOnUnauthorized &&
-    (
-      response.status === 401 ||
-      response.status === 403
-    )
+    (response.status === 401 || response.status === 403) &&
+    retryAuthentication
   ) {
-    console.log(
-      "[VTU BETTING AUTH REFRESH]",
-      {
-        path,
-        method,
-        httpStatus:
-          response.status,
-      }
-    );
+    console.warn("[VTU BETTING AUTH REFRESH]", {
+      path,
+      method,
+      httpStatus: response.status,
+    });
 
     clearAccessToken();
 
-    token =
-      await getAccessToken();
-
-    response =
-      await makeRequest(token);
+    return authenticatedRequest(path, {
+      method,
+      body,
+      retryAuthentication: false,
+    });
   }
 
-  const parsed =
-    await parseJsonResponse(
-      response
-    );
+  const parsed = await parseJsonResponse(response);
 
   if (!response.ok) {
-    const code =
-      extractProviderCode(parsed);
+    logProviderErrorResponse(path, response, parsed);
 
+    const code = extractProviderCode(parsed);
+    const status = extractProviderStatus(parsed);
     const message =
-      extractProviderMessage(
-        parsed
-      ) ||
+      extractProviderMessage(parsed) ||
       `VTU.ng returned HTTP ${response.status}`;
 
     if (
@@ -732,379 +516,186 @@ async function authenticatedRequest(
       response.status === 409
     ) {
       if (
-        isBettingDefiniteFailureCode(
-          code
-        ) ||
-        isBettingDefiniteFailureMessage(
-          message
-        )
+        isBettingDefiniteFailureCode(code) ||
+        isBettingDefiniteFailureMessage(message)
       ) {
-        throw new VtuProviderError(
-          message,
-          {
-            kind:
-              "provider_rejection",
-
-            httpStatus:
-              response.status,
-
-            providerCode:
-              code,
-
-            rawMessage:
-              message,
-          }
-        );
+        throw new VtuProviderError(message, {
+          kind: "provider_rejection",
+          httpStatus: response.status,
+          providerCode: code,
+          providerStatus: status,
+          rawMessage: message,
+        });
       }
     }
 
-    throw new VtuProviderError(
-      message,
-      {
-        kind: "unknown",
-
-        httpStatus:
-          response.status,
-
-        providerCode:
-          code,
-
-        rawMessage:
-          message,
-      }
-    );
-  }
-
-  return parsed;
-}
-
-async function verifyBettingCustomer({
-  customerId,
-  serviceId,
-}) {
-  const normalizedCustomerId =
-    validateCustomerId(
-      customerId
-    );
-
-  const normalizedServiceId =
-    validateServiceId(
-      serviceId
-    );
-
-  const providerServiceId =
-    getVtuBettingServiceId(
-      normalizedServiceId
-    );
-
-  const response =
-    await authenticatedRequest(
-      "/verify-customer",
-      {
-        method: "POST",
-
-        body: {
-          customer_id:
-            normalizedCustomerId,
-
-          service_id:
-            providerServiceId,
-        },
-      }
-    );
-
-  const providerCode =
-    extractProviderCode(
-      response
-    );
-
-  const providerStatus =
-    extractProviderStatus(
-      response
-    );
-
-  const message =
-    extractProviderMessage(
-      response
-    );
-
-  const returnedCustomerId =
-    extractCustomerId(
-      response
-    );
-
-  const explicitSuccess =
-    providerCode === "success" &&
-    Boolean(returnedCustomerId);
-
-  if (explicitSuccess) {
-    return {
-      outcome: "success",
-
-      customerId:
-        returnedCustomerId,
-
-      requestedCustomerId:
-        normalizedCustomerId,
-
-      serviceId:
-        normalizedServiceId,
-
-      customerName:
-        extractCustomerName(
-          response
-        ),
-
-      balance:
-        extractCustomerBalance(
-          response
-        ),
-
-      providerReference:
-        extractProviderReference(
-          response
-        ),
-
-      providerStatus,
-
-      providerCode,
-
-      message,
-
-      raw:
-        response,
-    };
-  }
-
-  const diagnostic =
-    buildSafeResponseDiagnostic(
-      response
-    );
-
-  console.error(
-    "[VTU BETTING VERIFY RESPONSE]",
-    {
-      serviceId:
-        normalizedServiceId,
-
-      providerServiceId,
-
-      diagnostic,
-    }
-  );
-
-  if (
-    providerCode === "failure" ||
-    isBettingDefiniteFailureCode(
-      providerCode
-    ) ||
-    isBettingDefiniteFailureMessage(
-      message
-    )
-  ) {
-    throw new VtuProviderError(
-      message ||
-        "VTU.ng rejected the betting customer verification",
-      {
-        kind:
-          "provider_rejection",
-
-        providerCode,
-
-        providerStatus,
-      }
-    );
-  }
-
-  throw new VtuProviderError(
-    message ||
-      "Unable to determine the betting customer verification result",
-    {
+    throw new VtuProviderError(message, {
       kind: "unknown",
-
-      providerCode,
-
-      providerStatus,
-    }
-  );
-}
-
-async function fundBettingAccount({
-  transactionId,
-  customerId,
-  serviceId,
-  amountKobo,
-}) {
-  const normalizedTransactionId =
-    requireTransactionId(
-      transactionId
-    );
-
-  const normalizedCustomerId =
-    validateCustomerId(
-      customerId
-    );
-
-  const normalizedServiceId =
-    validateServiceId(
-      serviceId
-    );
-
-  const normalizedAmountKobo =
-    validateAmountKobo(
-      amountKobo
-    );
-
-  const providerServiceId =
-    getVtuBettingServiceId(
-      normalizedServiceId
-    );
-
-  const providerRequestId =
-    createProviderRequestId(
-      normalizedTransactionId
-    );
-
-  const amountNaira =
-    bettingKoboToNaira(
-      normalizedAmountKobo
-    );
-
-  const response =
-    await authenticatedRequest(
-      "/betting",
-      {
-        method: "POST",
-
-        body: {
-          request_id:
-            providerRequestId,
-
-          customer_id:
-            normalizedCustomerId,
-
-          service_id:
-            providerServiceId,
-
-          amount:
-            amountNaira,
-        },
-      }
-    );
-
-  const normalized =
-    normalizePurchaseResponse(
-      response
-    );
+      httpStatus: response.status,
+      providerCode: code,
+      providerStatus: status,
+      rawMessage: message,
+    });
+  }
 
   return {
-    ...normalized,
-
-    providerRequestId,
-
-    customerId:
-      normalizedCustomerId,
-
-    serviceId:
-      normalizedServiceId,
-
-    amountKobo:
-      normalizedAmountKobo,
-
-    amountNaira,
+    response,
+    data: parsed,
   };
 }
 
-async function requeryBetting(
-  transactionId
-) {
-  const normalizedTransactionId =
-    requireTransactionId(
-      transactionId
-    );
+async function verifyBettingCustomer({
+  provider,
+  customerId,
+}) {
+  const normalizedProvider = validateBettingProvider(provider);
+  const normalizedCustomerId = validateBettingCustomer(customerId);
+  const serviceId = getVtuBettingServiceId(normalizedProvider);
 
-  const providerRequestId =
-    createProviderRequestId(
-      normalizedTransactionId
-    );
+  const { data } = await authenticatedRequest("/verify-customer", {
+    method: "POST",
+    body: {
+      customer_id: normalizedCustomerId,
+      service_id: serviceId,
+    },
+  });
 
-  const response =
-    await authenticatedRequest(
-      "/requery",
+  const code = extractProviderCode(data);
+  const returnedCustomerId = extractCustomerId(data);
+
+  if (code !== "success" || !returnedCustomerId) {
+    const diagnostic = buildSafeResponseDiagnostic(data);
+
+    console.error("[VTU BETTING VERIFY RESPONSE]", diagnostic);
+
+    const message =
+      extractProviderMessage(data) ||
+      "VTU.ng did not confirm the betting customer.";
+
+    if (
+      isBettingDefiniteFailureCode(code) ||
+      isBettingDefiniteFailureMessage(message)
+    ) {
+      throw new VtuProviderError(message, {
+        kind: "provider_rejection",
+        providerCode: code,
+        providerStatus: extractProviderStatus(data),
+        rawMessage: message,
+      });
+    }
+
+    throw new VtuProviderError(
+      "VTU.ng returned an unexpected betting verification response.",
       {
-        method: "POST",
-
-        body: {
-          request_id:
-            providerRequestId,
-        },
+        kind: "unknown",
+        providerCode: code,
+        providerStatus: extractProviderStatus(data),
+        rawMessage: message,
       }
     );
-
-  const normalized =
-    normalizePurchaseResponse(
-      response
-    );
+  }
 
   return {
-    ...normalized,
+    provider: normalizedProvider,
+    serviceId,
+    customerId: returnedCustomerId,
+    customerName: extractCustomerName(data),
+    balance: extractCustomerBalance(data),
+    providerCode: code,
+    providerStatus: extractProviderStatus(data),
+    providerReference: extractProviderReference(data),
+    message:
+      extractProviderMessage(data) ||
+      "Betting customer verified successfully.",
+  };
+}
 
-    providerRequestId,
+async function fundBettingAccount({
+  provider,
+  customerId,
+  amountKobo,
+  transactionId,
+}) {
+  const normalizedProvider = validateBettingProvider(provider);
+  const normalizedCustomerId = validateBettingCustomer(customerId);
+  const normalizedAmountKobo = validateBettingAmount(amountKobo);
+
+  const serviceId = getVtuBettingServiceId(normalizedProvider);
+  const requestId = buildBettingRequestId(transactionId);
+
+  const amountNaira = Math.floor(normalizedAmountKobo / 100);
+
+  const { data } = await authenticatedRequest("/betting", {
+    method: "POST",
+    body: {
+      request_id: requestId,
+      customer_id: normalizedCustomerId,
+      service_id: serviceId,
+      amount: amountNaira,
+    },
+  });
+
+  return {
+    ...normalizePurchaseResponse(data),
+    provider: normalizedProvider,
+    serviceId,
+    customerId: normalizedCustomerId,
+    amountKobo: normalizedAmountKobo,
+    requestId,
+  };
+}
+
+async function requeryBetting({
+  provider,
+  customerId,
+  transactionId,
+}) {
+  const normalizedProvider = validateBettingProvider(provider);
+  const normalizedCustomerId = validateBettingCustomer(customerId);
+  const requestId = buildBettingRequestId(transactionId);
+
+  const { data } = await authenticatedRequest("/requery", {
+    method: "POST",
+    body: {
+      request_id: requestId,
+      customer_id: normalizedCustomerId,
+      service_id: getVtuBettingServiceId(normalizedProvider),
+    },
+  });
+
+  return {
+    ...normalizePurchaseResponse(data),
+    provider: normalizedProvider,
+    serviceId: getVtuBettingServiceId(normalizedProvider),
+    customerId: normalizedCustomerId,
+    requestId,
   };
 }
 
 async function checkBettingStatus({
+  provider,
+  customerId,
   transactionId,
-  providerRequestId,
 }) {
-  const normalizedTransactionId =
-    requireTransactionId(
-      transactionId
-    );
+  const result = await requeryBetting({
+    provider,
+    customerId,
+    transactionId,
+  });
 
-  const expectedRequestId =
-    createProviderRequestId(
-      normalizedTransactionId
-    );
-
-  const suppliedRequestId =
-    normalizeString(
-      providerRequestId
-    );
-
-  if (
-    !suppliedRequestId ||
-    suppliedRequestId !==
-      expectedRequestId
-  ) {
-    throw new VtuProviderError(
-      "Invalid betting provider request ID",
-      {
-        kind: "validation",
-      }
-    );
-  }
-
-  return requeryBetting(
-    normalizedTransactionId
-  );
+  return result;
 }
 
 module.exports = {
-  BETTING_SERVICES,
-
-  getBettingRequestId:
-    createProviderRequestId,
-
+  VTU_BETTING_SERVICE_IDS,
+  validateBettingProvider,
+  validateBettingCustomer,
+  validateBettingAmount,
+  buildBettingRequestId,
   verifyBettingCustomer,
-
   fundBettingAccount,
-
   requeryBetting,
-
   checkBettingStatus,
-
   normalizePurchaseResponse,
-
   VtuProviderError,
 };
