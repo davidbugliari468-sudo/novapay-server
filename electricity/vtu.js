@@ -713,10 +713,6 @@ function normalizeProviderCode(code) {
 
       "missing_fields",
 
-      "duplicate_request_id",
-      "duplicate_request",
-      "duplicate_order",
-
       "order_failed",
       "order-failed",
 
@@ -761,9 +757,6 @@ function normalizeProviderMessageOutcome(
     "invalid service",
     "invalid service id",
     "invalid variation",
-
-    "duplicate request",
-    "duplicate order",
 
     "product unavailable",
 
@@ -938,6 +931,9 @@ function normalizeProviderResponse(
    * - network failure
    * - malformed provider response
    * - 5xx
+   * - duplicate_request_id
+   * - duplicate_request
+   * - duplicate_order
    * - processing-api
    * - queued-api
    * - initiated-api

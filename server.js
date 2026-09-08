@@ -28,6 +28,20 @@ const {
 const electricityRoutes =
   require("./electricity/routes");
 
+
+// =====================================================
+// TV ROUTES + RECONCILIATION
+// =====================================================
+
+const tvRoutes =
+  require("./tv/routes");
+
+const {
+  reconcilePendingTransactions:
+    runTvReconciliation
+} = require("./tv/reconciliation");
+
+
 const notificationRoutes =
   require("./notifications/routes");
 
@@ -425,10 +439,32 @@ app.use(
   )
 );
 
+
 app.use(
   "/api/electricity",
   electricityRoutes
 );
+
+
+// =====================================================
+// TV
+// =====================================================
+//
+// TV routes:
+//
+//     POST /api/tv/verify
+//     POST /api/tv/purchase
+//     GET  /api/tv/transaction/:transactionId
+//
+// TV purchase reconciliation is handled separately
+// below by the TV reconciliation worker.
+// =====================================================
+
+app.use(
+  "/api/tv",
+  tvRoutes
+);
+
 
 // =====================================================
 // PROTECTED AUTH TEST ROUTE
@@ -1289,8 +1325,6 @@ app.listen(
     // ELECTRICITY RECONCILIATION WORKER
     // =================================================
     //
-    // This is the only new worker being added.
-    //
     // It only reconciles existing UNKNOWN electricity
     // transactions.
     //
@@ -1433,6 +1467,149 @@ app.listen(
 
       },
       electricityIntervalMs
+    );
+
+
+    // =================================================
+    // TV RECONCILIATION WORKER
+    // =================================================
+    //
+    // TV reconciliation only checks existing pending /
+    // unknown TV transactions.
+    //
+    // It NEVER creates a new TV purchase.
+    //
+    // Provider outcome:
+    //
+    //     SUCCESS  -> commit reservation
+    //     FAILED   -> release reservation
+    //     UNKNOWN  -> keep reservation locked
+    //
+    // =================================================
+
+    const tvIntervalMs =
+      Number(
+        process.env.TV_RECONCILIATION_INTERVAL_MS
+      ) || 60000;
+
+
+    const tvBatchSize =
+      Number(
+        process.env.TV_RECONCILIATION_BATCH_SIZE
+      ) || 25;
+
+
+    let tvReconciliationRunning =
+      false;
+
+
+    const runTvReconciliationWorker =
+      async () => {
+
+        if (
+          tvReconciliationRunning
+        ) {
+
+          console.log(
+            "TV reconciliation already running; skipping overlapping run."
+          );
+
+          return;
+
+        }
+
+
+        tvReconciliationRunning =
+          true;
+
+
+        try {
+
+          const result =
+            await runTvReconciliation(
+              tvBatchSize
+            );
+
+
+          if (
+            result &&
+            result.processed > 0
+          ) {
+
+            console.log(
+              "TV reconciliation completed:",
+              {
+
+                processed:
+                  result.processed,
+
+                results:
+                  result.results
+
+              }
+            );
+
+          }
+
+        }
+
+        catch (error) {
+
+          console.error(
+            "TV reconciliation worker error:",
+            error
+          );
+
+        }
+
+        finally {
+
+          tvReconciliationRunning =
+            false;
+
+        }
+
+      };
+
+
+    console.log(
+      "TV reconciliation worker started:",
+      {
+
+        intervalMs:
+          tvIntervalMs,
+
+        batchSize:
+          tvBatchSize
+
+      }
+    );
+
+
+    /*
+     * Give the server a few seconds to finish starting
+     * before the first TV reconciliation scan.
+     */
+    setTimeout(
+      () => {
+        runTvReconciliationWorker();
+      },
+      5000
+    );
+
+
+    /*
+     * Continue checking pending / unknown TV
+     * transactions according to their reconciliation
+     * schedule.
+     */
+    setInterval(
+      () => {
+
+        runTvReconciliationWorker();
+
+      },
+      tvIntervalMs
     );
 
   }
