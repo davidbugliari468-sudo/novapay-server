@@ -42,6 +42,18 @@ const {
 } = require("./tv/reconciliation");
 
 
+// =====================================================
+// BETTING ROUTES + RECONCILIATION WORKER
+// =====================================================
+
+const bettingRoutes =
+  require("./betting/routes");
+
+const {
+  startBettingReconciliationWorker
+} = require("./betting/worker");
+
+
 const notificationRoutes =
   require("./notifications/routes");
 
@@ -463,6 +475,29 @@ app.use(
 app.use(
   "/api/tv",
   tvRoutes
+);
+
+
+// =====================================================
+// BETTING
+// =====================================================
+//
+// Betting routes:
+//
+//     POST /api/betting/verify
+//     POST /api/betting/fund
+//     GET  /api/betting/transaction/:transactionId
+//
+// Betting reconciliation is handled separately by:
+//
+//     betting/worker.js
+//     betting/reconciliation.js
+//
+// =====================================================
+
+app.use(
+  "/api/betting",
+  bettingRoutes
 );
 
 
@@ -1440,6 +1475,7 @@ app.listen(
           electricityBatchSize
 
       }
+
     );
 
 
@@ -1611,6 +1647,29 @@ app.listen(
       },
       tvIntervalMs
     );
+
+
+    // =================================================
+    // BETTING RECONCILIATION WORKER
+    // =================================================
+    //
+    // Betting reconciliation is handled by the
+    // dedicated betting worker.
+    //
+    // It only checks existing pending / unknown
+    // betting transactions.
+    //
+    // It NEVER creates another betting funding request.
+    //
+    // Provider outcome:
+    //
+    //     SUCCESS  -> commit reservation
+    //     FAILED   -> release reservation
+    //     UNKNOWN  -> keep reservation locked
+    //
+    // =================================================
+
+    startBettingReconciliationWorker();
 
   }
 );
