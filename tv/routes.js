@@ -4,339 +4,600 @@ const express = require("express");
 
 const router = express.Router();
 
-const tvService = require("./service");
-const vtu = require("./vtu");
-const { validateTvRequest } = require("./validation");
+const {
+  validateTvRequest,
+} = require("./validation");
 
-function resolveAuthMiddleware() {
-  const authModule = require("../auth");
+const tvService =
+  require("./service");
 
-  if (typeof authModule === "function") {
-    return authModule;
+const vtu =
+  require("./vtu");
+
+/* ==========================================
+   AUTHENTICATION
+========================================== */
+
+const authModule =
+  require("../auth");
+
+const authCandidates = [
+  "authenticate",
+  "authenticateUser",
+  "requireAuth",
+  "requireAuthentication",
+  "verifyToken",
+  "verifyFirebaseToken",
+  "authMiddleware",
+  "auth",
+];
+
+let authenticate = null;
+
+for (const name of authCandidates) {
+
+  if (
+    typeof authModule?.[name] ===
+    "function"
+  ) {
+
+    authenticate =
+      authModule[name];
+
+    break;
+
   }
 
-  const candidates = [
-    "authenticate",
-    "authenticateUser",
-    "requireAuth",
-    "requireAuthentication",
-    "verifyToken",
-    "verifyFirebaseToken",
-    "authMiddleware",
-    "auth",
-  ];
-
-  for (const name of candidates) {
-    if (typeof authModule[name] === "function") {
-      return authModule[name];
-    }
-  }
-
-  throw new Error("Authentication middleware is unavailable");
 }
 
-const authenticate = resolveAuthMiddleware();
+if (
+  !authenticate &&
+  typeof authModule === "function"
+) {
+
+  authenticate =
+    authModule;
+
+}
+
+if (typeof authenticate !== "function") {
+
+  throw new Error(
+    "TV routes could not resolve authentication middleware."
+  );
+
+}
+
+/* ==========================================
+   USER ID
+========================================== */
 
 function getUid(req) {
-  return (
-    req.user?.uid ||
-    req.auth?.uid ||
-    req.firebaseUser?.uid ||
-    req.user?.localId ||
-    null
-  );
+
+  const uid =
+    req?.user?.uid ||
+    req?.auth?.uid ||
+    req?.firebaseUser?.uid ||
+    req?.user?.localId;
+
+  if (!uid) {
+
+    const error =
+      new Error(
+        "Authentication required."
+      );
+
+    error.code =
+      "AUTHENTICATION_REQUIRED";
+
+    throw error;
+
+  }
+
+  return String(uid).trim();
+
 }
+
+/* ==========================================
+   SAFE ERROR MESSAGE
+========================================== */
 
 function getSafeErrorMessage(error) {
-  const message =
-    error && typeof error.message === "string"
-      ? error.message
-      : "";
+
+  const code =
+    String(error?.code || "")
+      .trim()
+      .toUpperCase();
+
+  /*
+   * Authentication errors
+   */
+
+  if (
+    code ===
+      "AUTHENTICATION_REQUIRED" ||
+    code ===
+      "UNAUTHENTICATED" ||
+    code ===
+      "UNAUTHORIZED"
+  ) {
+
+    return "Authentication required.";
+
+  }
+
+  /*
+   * Customer validation / verification
+   */
+
+  if (
+    code ===
+      "INVALID_CUSTOMER_ID" ||
+    code ===
+      "INVALID_TV_CUSTOMER_ID"
+  ) {
+
+    return "Invalid smartcard number.";
+
+  }
+
+  if (
+    code ===
+      "INVALID_SERVICE" ||
+    code ===
+      "INVALID_SERVICE_ID"
+  ) {
+
+    return "Invalid TV provider.";
+
+  }
+
+  if (
+    code ===
+      "INVALID_VARIATION" ||
+    code ===
+      "INVALID_VARIATION_ID"
+  ) {
+
+    return "Invalid TV package.";
+
+  }
+
+  /*
+   * Provider explicitly rejected verification.
+   */
+
+  if (
+    code ===
+      "PROVIDER_REJECTION" ||
+    code ===
+      "PROVIDER_REJECTED"
+  ) {
+
+    return (
+      error?.message ||
+      "The TV provider could not verify this customer."
+    );
+
+  }
+
+  /*
+   * Provider reported an invalid customer.
+   */
+
+  if (
+    code ===
+      "INVALID_CUSTOMER" ||
+    code ===
+      "INVALID_CUSTOMER_ID_PROVIDER"
+  ) {
+
+    return "The smartcard number could not be verified.";
+
+  }
+
+  /*
+   * Known wallet errors.
+   */
+
+  if (
+    code ===
+      "INSUFFICIENT_WALLET_BALANCE"
+  ) {
+
+    return "Insufficient wallet balance.";
+
+  }
+
+  /*
+   * Unknown provider/network conditions must remain
+   * generic. Never expose raw provider responses.
+   */
+
+  if (
+    code ===
+      "UNKNOWN" ||
+    code ===
+      "PROVIDER_UNKNOWN" ||
+    code ===
+      "VTU_UNKNOWN" ||
+    code ===
+      "NETWORK_ERROR" ||
+    code ===
+      "TIMEOUT"
+  ) {
+
+    return (
+      "Unable to verify the TV customer right now. Please try again."
+    );
+
+  }
+
+  /*
+   * Safe application-level validation errors.
+   */
 
   const safeMessages = new Set([
-    "Authenticated user is required",
-    "Unsupported TV provider",
-    "Invalid customer or smartcard number",
-    "Invalid TV variation",
-    "Invalid TV purchase amount",
-    "TV service ID is required",
-    "TV verification provider is unavailable",
-    "TV purchase provider is unavailable",
-    "Invalid transaction ID",
-    "Transaction not found",
-    "You are not authorized to access this transaction",
-    "Transaction ID already exists with different details",
+    "Invalid TV provider.",
+    "Invalid smartcard number.",
+    "Invalid TV package.",
+    "Invalid amount.",
+    "Invalid subscription type.",
+    "Invalid TV request.",
+    "TV customer verification failed.",
+    "The TV provider could not verify this customer.",
+    "The smartcard number could not be verified.",
+    "Insufficient wallet balance.",
   ]);
 
+  const message =
+    String(error?.message || "").trim();
+
   if (safeMessages.has(message)) {
+
     return message;
+
   }
 
-  return "Unable to process TV request";
+  /*
+   * Never return raw provider errors, stack traces,
+   * Firestore errors, or internal implementation details.
+   */
+
+  return "Unable to process TV request.";
+
 }
 
+/* ==========================================
+   ERROR STATUS
+========================================== */
+
 function getErrorStatus(error) {
-  const message =
-    error && typeof error.message === "string"
-      ? error.message
-      : "";
+
+  const code =
+    String(error?.code || "")
+      .trim()
+      .toUpperCase();
 
   if (
-    message === "Authenticated user is required" ||
-    message.includes("Invalid") ||
-    message === "Unsupported TV provider" ||
-    message.includes("required")
+    code ===
+      "AUTHENTICATION_REQUIRED" ||
+    code ===
+      "UNAUTHENTICATED" ||
+    code ===
+      "UNAUTHORIZED"
   ) {
+
+    return 401;
+
+  }
+
+  if (
+    code.startsWith("INVALID_") ||
+    code ===
+      "UNSUPPORTED_TV_SERVICE"
+  ) {
+
     return 400;
+
   }
 
   if (
-    message.includes("not authorized") ||
-    message.includes("Unauthorized")
+    code ===
+      "PROVIDER_REJECTION" ||
+    code ===
+      "PROVIDER_REJECTED" ||
+    code ===
+      "INVALID_CUSTOMER" ||
+    code ===
+      "INVALID_CUSTOMER_ID_PROVIDER"
   ) {
-    return 403;
+
+    return 400;
+
   }
 
-  if (message === "Transaction not found") {
-    return 404;
+  if (
+    code ===
+      "INSUFFICIENT_WALLET_BALANCE"
+  ) {
+
+    return 400;
+
   }
 
   return 500;
+
 }
 
-/**
- * POST /api/tv/verify
- *
- * Verifies a customer's TV smartcard/account number.
- *
- * IMPORTANT:
- * - Authentication is required.
- * - Verification does not touch the wallet.
- * - The provider is called through tv/service.js.
- * - The route never calls VTU directly.
- */
-router.post("/verify", authenticate, async (req, res) => {
-  try {
-    const uid = getUid(req);
+/* ==========================================
+   VERIFY TV CUSTOMER
+========================================== */
 
-    if (!uid) {
-      return res.status(401).json({
-        success: false,
-        message: "Authentication required",
-      });
-    }
-
-    const provider =
-      typeof req.body?.provider === "string"
-        ? req.body.provider.trim().toLowerCase()
-        : "";
-
-    const smartcardNumber =
-      typeof req.body?.smartcardNumber === "string"
-        ? req.body.smartcardNumber.trim()
-        : "";
-
-    if (!provider || !smartcardNumber) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "Provider and smartcard number are required",
-      });
-    }
-
-    const result = await tvService.verifyTvCustomer({
-      uid,
-      provider,
-      customerId: smartcardNumber,
-      providerClient: vtu,
-    });
-
-    if (result.outcome === "success") {
-      return res.status(200).json({
-        success: true,
-        verified: true,
-        provider: result.provider,
-        customerId: result.customerId,
-        providerReference:
-          result.providerReference || "",
-        customer: result.customer || null,
-        message:
-          result.message ||
-          "Customer verified successfully",
-      });
-    }
-
-    if (result.outcome === "failure") {
-      return res.status(400).json({
-        success: false,
-        verified: false,
-        provider: result.provider,
-        customerId: result.customerId,
-        message:
-          result.message ||
-          "Customer verification failed",
-      });
-    }
-
-    /*
-     * Unknown verification is deliberately not treated as
-     * "customer does not exist".
-     *
-     * A timeout/network failure can mean the provider simply
-     * did not answer us.
-     */
-    return res.status(202).json({
-      success: false,
-      verified: false,
-      pending: true,
-      provider: result.provider,
-      customerId: result.customerId,
-      message:
-        result.message ||
-        "Customer verification could not be confirmed",
-    });
-  } catch (error) {
-    console.error("TV verification error:", {
-      uid: getUid(req) || null,
-      message: error?.message || "unknown error",
-    });
-
-    return res.status(getErrorStatus(error)).json({
-      success: false,
-      message: getSafeErrorMessage(error),
-    });
-  }
-});
-
-/**
- * POST /api/tv/purchase
- *
- * Creates and processes a TV subscription purchase.
- */
 router.post(
-  "/purchase",
+  "/verify",
   authenticate,
   async (req, res) => {
+
     try {
-      const uid = getUid(req);
 
-      if (!uid) {
-        return res.status(401).json({
-          success: false,
-          message: "Authentication required",
-        });
-      }
+      const uid =
+        getUid(req);
 
-      const validation = validateTvRequest(req.body);
+      const provider =
+        String(
+          req.body?.provider || ""
+        )
+          .trim()
+          .toLowerCase();
 
-      if (!validation.valid) {
+      const smartcardNumber =
+        String(
+          req.body?.smartcardNumber || ""
+        ).trim();
+
+      if (!provider) {
+
         return res.status(400).json({
           success: false,
-          message:
-            validation.message ||
-            "Invalid TV purchase request",
+          error: "Invalid TV provider.",
         });
+
       }
 
-      const result = await tvService.purchaseTv({
-        uid,
+      if (!smartcardNumber) {
 
-        transactionId:
-          req.body.transactionId || undefined,
+        return res.status(400).json({
+          success: false,
+          error: "Invalid smartcard number.",
+        });
 
-        provider: req.body.provider,
+      }
 
-        customerId:
-          req.body.smartcardNumber ||
-          req.body.customerId,
+      const result =
+        await tvService.verifyTvCustomer({
+          uid,
+          provider,
+          customerId:
+            smartcardNumber,
+          providerClient:
+            vtu,
+        });
 
-        serviceId: req.body.serviceId,
+      if (
+        result?.status ===
+        "success"
+      ) {
 
-        variationId: req.body.variationId,
-
-        subscriptionType:
-          req.body.subscriptionType || "change",
-
-        amountKobo: req.body.amountKobo,
-
-        providerClient: vtu,
-      });
-
-      if (result.status === "successful") {
         return res.status(200).json({
           success: true,
-          status: "successful",
-          transactionId: result.transactionId,
-          providerReference:
-            result.providerReference || "",
-          gainKobo: result.gainKobo || 0,
-          message: "TV purchase successful",
+          data:
+            result.data ||
+            result,
         });
+
       }
 
-      if (result.status === "failed") {
+      if (
+        result?.status ===
+        "failure"
+      ) {
+
         return res.status(400).json({
           success: false,
-          status: "failed",
-          transactionId: result.transactionId,
-          message:
+          error:
             result.message ||
-            "TV purchase failed",
+            "The smartcard number could not be verified.",
         });
+
       }
 
       return res.status(202).json({
         success: false,
-        status: "pending",
-        transactionId: result.transactionId,
-        reconciliationRequired:
-          result.reconciliationRequired === true,
-        message:
-          "TV purchase is pending confirmation",
-      });
-    } catch (error) {
-      console.error("TV purchase error:", {
-        uid: getUid(req) || null,
-        message: error?.message || "unknown error",
+        pending: true,
+        error:
+          "Unable to verify the TV customer right now. Please try again.",
       });
 
-      return res.status(getErrorStatus(error)).json({
-        success: false,
-        message: getSafeErrorMessage(error),
-      });
+    } catch (error) {
+
+      console.error(
+        "TV customer verification error:",
+        {
+          code:
+            error?.code || null,
+          message:
+            error?.message || null,
+        }
+      );
+
+      return res
+        .status(
+          getErrorStatus(error)
+        )
+        .json({
+          success: false,
+          error:
+            getSafeErrorMessage(error),
+        });
+
     }
+
   }
 );
 
-/**
- * GET /api/tv/transaction/:transactionId
- *
- * Returns only the authenticated user's TV transaction.
- */
+/* ==========================================
+   PURCHASE TV
+========================================== */
+
+router.post(
+  "/purchase",
+  authenticate,
+  async (req, res) => {
+
+    try {
+
+      const uid =
+        getUid(req);
+
+      const validation =
+        validateTvRequest(
+          req.body
+        );
+
+      if (
+        !validation ||
+        validation.valid !== true
+      ) {
+
+        return res.status(400).json({
+          success: false,
+          error:
+            validation?.error ||
+            "Invalid TV request.",
+        });
+
+      }
+
+      const result =
+        await tvService.purchaseTv({
+          uid,
+
+          provider:
+            validation.data.provider,
+
+          customerId:
+            validation.data.customerId,
+
+          serviceId:
+            validation.data.serviceId,
+
+          variationId:
+            validation.data.variationId,
+
+          amountKobo:
+            validation.data.amountKobo,
+
+          subscriptionType:
+            validation.data.subscriptionType,
+
+          providerClient:
+            vtu,
+        });
+
+      if (
+        result?.status ===
+        "successful"
+      ) {
+
+        return res.status(200).json({
+          success: true,
+          data:
+            result.data ||
+            result,
+        });
+
+      }
+
+      if (
+        result?.status ===
+        "failed"
+      ) {
+
+        return res.status(400).json({
+          success: false,
+          error:
+            result.message ||
+            "TV subscription purchase failed.",
+        });
+
+      }
+
+      return res.status(202).json({
+        success: false,
+        pending: true,
+        error:
+          "TV subscription is still being processed.",
+        data:
+          result.data ||
+          result,
+      });
+
+    } catch (error) {
+
+      console.error(
+        "TV purchase error:",
+        {
+          code:
+            error?.code || null,
+          message:
+            error?.message || null,
+        }
+      );
+
+      return res
+        .status(
+          getErrorStatus(error)
+        )
+        .json({
+          success: false,
+          error:
+            getSafeErrorMessage(error),
+        });
+
+    }
+
+  }
+);
+
+/* ==========================================
+   GET TV TRANSACTION
+========================================== */
+
 router.get(
   "/transaction/:transactionId",
   authenticate,
   async (req, res) => {
-    try {
-      const uid = getUid(req);
 
-      if (!uid) {
-        return res.status(401).json({
-          success: false,
-          message: "Authentication required",
-        });
-      }
+    try {
+
+      const uid =
+        getUid(req);
 
       const transactionId =
-        typeof req.params.transactionId === "string"
-          ? req.params.transactionId.trim()
-          : "";
+        String(
+          req.params?.transactionId ||
+          ""
+        ).trim();
 
       if (!transactionId) {
+
         return res.status(400).json({
           success: false,
-          message: "Invalid transaction ID",
+          error:
+            "Invalid transaction ID.",
         });
+
       }
 
       const transaction =
@@ -345,68 +606,125 @@ router.get(
         );
 
       if (!transaction) {
+
         return res.status(404).json({
           success: false,
-          message: "Transaction not found",
+          error:
+            "TV transaction not found.",
         });
+
       }
 
-      if (transaction.uid !== uid) {
-        return res.status(403).json({
+      if (
+        String(transaction.uid) !==
+        uid
+      ) {
+
+        return res.status(404).json({
           success: false,
-          message:
-            "You are not authorized to access this transaction",
+          error:
+            "TV transaction not found.",
         });
+
       }
 
-      /*
-       * Do not expose internal wallet reservation data,
-       * reconciliation internals, or provider internals.
-       */
       return res.status(200).json({
         success: true,
-        transaction: {
-          id: transaction.id,
-          provider: transaction.provider,
-          customerId: transaction.customerId,
-          serviceId: transaction.serviceId,
-          variationId: transaction.variationId,
+
+        data: {
+          id:
+            transaction.id,
+
+          uid:
+            transaction.uid,
+
+          service:
+            transaction.service,
+
+          provider:
+            transaction.provider,
+
+          customerId:
+            transaction.customerId,
+
+          serviceId:
+            transaction.serviceId,
+
+          variationId:
+            transaction.variationId,
+
           subscriptionType:
             transaction.subscriptionType,
-          amountKobo: transaction.amountKobo,
-          currency: transaction.currency,
-          status: transaction.status,
+
+          amountKobo:
+            transaction.amountKobo,
+
+          currency:
+            transaction.currency,
+
+          status:
+            transaction.status,
+
           providerReference:
-            transaction.providerReference || "",
+            transaction.providerReference ||
+            null,
+
+          providerRequestId:
+            transaction.providerRequestId ||
+            null,
+
           providerStatus:
-            transaction.providerStatus || "",
+            transaction.providerStatus ||
+            null,
+
           providerCode:
-            transaction.providerCode || "",
-          costKobo:
-            transaction.costKobo || 0,
-          gainKobo:
-            transaction.gainKobo || 0,
-          rewardPoints:
-            transaction.rewardPoints || 0,
+            transaction.providerCode ||
+            null,
+
           failureReason:
-            transaction.failureReason || "",
+            transaction.failureReason ||
+            "",
+
           reconciliationRequired:
-            transaction.reconciliationRequired === true,
-          createdAt: transaction.createdAt || null,
-          updatedAt: transaction.updatedAt || null,
+            Boolean(
+              transaction.reconciliationRequired
+            ),
+
+          createdAt:
+            transaction.createdAt ||
+            null,
+
+          updatedAt:
+            transaction.updatedAt ||
+            null,
         },
-      });
-    } catch (error) {
-      console.error("TV transaction lookup error:", {
-        uid: getUid(req) || null,
-        message: error?.message || "unknown error",
+
       });
 
-      return res.status(getErrorStatus(error)).json({
-        success: false,
-        message: getSafeErrorMessage(error),
-      });
+    } catch (error) {
+
+      console.error(
+        "TV transaction lookup error:",
+        {
+          code:
+            error?.code || null,
+          message:
+            error?.message || null,
+        }
+      );
+
+      return res
+        .status(
+          getErrorStatus(error)
+        )
+        .json({
+          success: false,
+          error:
+            getSafeErrorMessage(error),
+        });
+
     }
+
   }
 );
 
