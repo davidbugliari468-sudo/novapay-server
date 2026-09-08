@@ -1,249 +1,703 @@
 "use strict";
 
-/**
- * Electricity service constants.
+/*
+ * =====================================================
+ * NOVAPAY — ELECTRICITY CONSTANTS
+ * =====================================================
  *
- * This file contains only fixed application/provider values.
- * It does not perform wallet operations, provider requests,
- * transaction updates, or authentication.
+ * The frontend uses short company identifiers such as:
+ *
+ *   ikedc
+ *   ekedc
+ *   aedc
+ *   ibedc
+ *   phed
+ *   eedc
+ *   bedc
+ *   jed
+ *
+ * VTU.ng uses its own service IDs.
+ *
+ * The frontend identifiers MUST NOT be sent directly
+ * to VTU.ng.
+ *
+ * This module provides the authoritative backend mapping.
+ * =====================================================
  */
+
+
+// =====================================================
+// ELECTRICITY TRANSACTION STATUS
+// =====================================================
 
 const ELECTRICITY_STATUS = Object.freeze({
-  PENDING: "PENDING",
-  SUCCESS: "SUCCESS",
-  FAILED: "FAILED",
-  UNKNOWN: "UNKNOWN",
-  MANUAL_REVIEW: "MANUAL_REVIEW",
+
+    PENDING:
+        "pending",
+
+    SUCCESS:
+        "successful",
+
+    FAILED:
+        "failed",
+
+    UNKNOWN:
+        "unknown",
+
+    MANUAL_REVIEW:
+        "manual_review"
+
 });
+
+
+// =====================================================
+// RECONCILIATION STATUS
+// =====================================================
 
 const RECONCILIATION_STATUS = Object.freeze({
-  NOT_REQUIRED: "NOT_REQUIRED",
-  REQUIRED: "REQUIRED",
-  IN_PROGRESS: "IN_PROGRESS",
-  WAITING: "WAITING",
-  RESOLVED: "RESOLVED",
-  ESCALATED: "ESCALATED",
+
+    NOT_REQUIRED:
+        "not_required",
+
+    REQUIRED:
+        "required",
+
+    IN_PROGRESS:
+        "in_progress",
+
+    WAITING:
+        "waiting",
+
+    RESOLVED:
+        "resolved",
+
+    ESCALATED:
+        "escalated"
+
 });
+
+
+// =====================================================
+// METER TYPES
+// =====================================================
 
 const METER_TYPES = Object.freeze({
-  PREPAID: "prepaid",
-  POSTPAID: "postpaid",
+
+    PREPAID:
+        "prepaid",
+
+    POSTPAID:
+        "postpaid"
+
 });
 
-/**
- * Supported VTU.ng electricity service IDs.
- *
- * The frontend must never be trusted to invent arbitrary provider IDs.
- * Electricity routes will validate against this allow-list on the backend.
- */
+
+// =====================================================
+// FRONTEND COMPANY IDENTIFIERS
+// =====================================================
+//
+// These are the values currently used by the
+// Electricity frontend.
+//
+// Do not change these to VTU values.
+// =====================================================
+
+const ELECTRICITY_COMPANIES = Object.freeze({
+
+    IKEDC:
+        "ikedc",
+
+    EKEDC:
+        "ekedc",
+
+    AEDC:
+        "aedc",
+
+    IBEDC:
+        "ibedc",
+
+    PHED:
+        "phed",
+
+    EEDC:
+        "eedc",
+
+    BEDC:
+        "bedc",
+
+    JED:
+        "jed"
+
+});
+
+
+// =====================================================
+// FRONTEND → VTU.ng SERVICE ID
+// =====================================================
+//
+// This is the important backend translation layer.
+//
+// Frontend:
+//     ikedc
+//
+// Backend → VTU:
+//     ikeja-electric
+// =====================================================
+
 const ELECTRICITY_SERVICE_IDS = Object.freeze({
-  IKEDC: "ikeja-electric",
-  EKEDC: "eko-electric",
-  AEDC: "abuja-electric",
-  IBEDC: "ibadan-electric",
-  PHED: "portharcourt-electric",
-  EEDC: "enugu-electric",
-  BEDC: "benin-electric",
-  JED: "jos-electric",
 
-  // Supported by VTU.ng even if not currently displayed
-  // on the existing frontend.
-  KEDCO: "kano-electric",
-  KAEDCO: "kaduna-electric",
-  YEDC: "yola-electric",
-  ABA: "aba-electric",
+    ikedc:
+        "ikeja-electric",
+
+    ekedc:
+        "eko-electric",
+
+    aedc:
+        "abuja-electric",
+
+    ibedc:
+        "ibadan-electric",
+
+    phed:
+        "portharcourt-electric",
+
+    eedc:
+        "enugu-electric",
+
+    bedc:
+        "benin-electric",
+
+    jed:
+        "jos-electric"
+
 });
 
-const SUPPORTED_ELECTRICITY_SERVICE_IDS = Object.freeze(
-  new Set(Object.values(ELECTRICITY_SERVICE_IDS))
-);
 
-const SUPPORTED_METER_TYPES = Object.freeze(
-  new Set(Object.values(METER_TYPES))
-);
+// =====================================================
+// ADDITIONAL VTU SERVICES
+// =====================================================
+//
+// These are supported by the provider but are not
+// currently represented by buttons in the supplied
+// frontend.
+// =====================================================
 
-/**
- * VTU.ng electricity provider statuses.
- *
- * Only COMPLETED_API represents provider success.
- * FAILED, REFUNDED and CANCELLED represent definite non-success.
- * Processing/pending/queued/initiated/on-hold remain unresolved.
- */
-const PROVIDER_ELECTRICITY_STATUS = Object.freeze({
-  SUCCESS: "completed-api",
+const ADDITIONAL_VTU_SERVICE_IDS = Object.freeze({
 
-  PROCESSING: "processing-api",
-  QUEUED: "queued-api",
-  INITIATED: "initiated-api",
-  PENDING: "pending",
-  ON_HOLD: "on-hold",
+    kedco:
+        "kano-electric",
 
-  FAILED: "failed",
-  REFUNDED: "refunded",
-  CANCELLED: "cancelled",
+    kaedco:
+        "kaduna-electric",
+
+    yedc:
+        "yola-electric",
+
+    aba:
+        "aba-electric"
+
 });
 
-/**
- * Financial outcome classification.
- *
- * This is intentionally separate from provider status so that
- * ambiguous provider/network states cannot accidentally release
- * customer funds.
- */
-const PROVIDER_OUTCOME = Object.freeze({
-  SUCCESS: "SUCCESS",
-  FAILURE: "FAILURE",
-  UNKNOWN: "UNKNOWN",
+
+// =====================================================
+// ALL PROVIDER SERVICE IDS
+// =====================================================
+
+const SUPPORTED_VTU_SERVICE_IDS =
+    Object.freeze(
+        new Set([
+            ...Object.values(
+                ELECTRICITY_SERVICE_IDS
+            ),
+
+            ...Object.values(
+                ADDITIONAL_VTU_SERVICE_IDS
+            )
+        ])
+    );
+
+
+// =====================================================
+// ALL FRONTEND COMPANY IDS
+// =====================================================
+
+const SUPPORTED_ELECTRICITY_COMPANIES =
+    Object.freeze(
+        new Set([
+            ...Object.keys(
+                ELECTRICITY_SERVICE_IDS
+            ),
+
+            ...Object.keys(
+                ADDITIONAL_VTU_SERVICE_IDS
+            )
+        ])
+    );
+
+
+// =====================================================
+// PROVIDER STATUSES
+// =====================================================
+
+const PROVIDER_STATUSES = Object.freeze({
+
+    SUCCESS:
+        "completed-api",
+
+    PROCESSING:
+        "processing-api",
+
+    QUEUED:
+        "queued-api",
+
+    INITIATED:
+        "initiated-api",
+
+    PENDING:
+        "pending",
+
+    ON_HOLD:
+        "on-hold",
+
+    FAILED:
+        "failed",
+
+    REFUNDED:
+        "refunded",
+
+    CANCELLED:
+        "cancelled"
+
 });
 
-/**
- * Reason codes used internally for reconciliation and auditing.
- */
+
+// =====================================================
+// PROVIDER OUTCOMES
+// =====================================================
+
+const PROVIDER_OUTCOMES = Object.freeze({
+
+    SUCCESS:
+        "success",
+
+    FAILURE:
+        "failure",
+
+    UNKNOWN:
+        "unknown"
+
+});
+
+
+// =====================================================
+// REASON CODES
+// =====================================================
+
 const ELECTRICITY_REASON_CODES = Object.freeze({
-  PROVIDER_SUCCESS: "PROVIDER_SUCCESS",
-  PROVIDER_FAILED: "PROVIDER_FAILED",
-  PROVIDER_REFUNDED: "PROVIDER_REFUNDED",
-  PROVIDER_CANCELLED: "PROVIDER_CANCELLED",
 
-  PROVIDER_PROCESSING: "PROVIDER_PROCESSING",
-  PROVIDER_PENDING: "PROVIDER_PENDING",
-  PROVIDER_QUEUED: "PROVIDER_QUEUED",
-  PROVIDER_INITIATED: "PROVIDER_INITIATED",
-  PROVIDER_ON_HOLD: "PROVIDER_ON_HOLD",
+    INSUFFICIENT_FUNDS:
+        "insufficient_funds",
 
-  PROVIDER_TIMEOUT: "PROVIDER_TIMEOUT",
-  PROVIDER_NETWORK_ERROR: "PROVIDER_NETWORK_ERROR",
-  PROVIDER_UNKNOWN_RESPONSE: "PROVIDER_UNKNOWN_RESPONSE",
+    BELOW_MINIMUM_AMOUNT:
+        "below_minimum_amount",
 
-  DUPLICATE_REQUEST: "DUPLICATE_REQUEST",
-  VALIDATION_ERROR: "VALIDATION_ERROR",
-  AUTHORIZATION_ERROR: "AUTHORIZATION_ERROR",
+    BELOW_CUSTOMER_ARREARS:
+        "below_customer_arrears",
+
+    INVALID_SERVICE:
+        "invalid_service",
+
+    INVALID_SERVICE_ID:
+        "invalid_service_id",
+
+    INVALID_VARIATION_ID:
+        "invalid_variation_id",
+
+    MISSING_FIELDS:
+        "missing_fields",
+
+    DUPLICATE_REQUEST:
+        "duplicate_request",
+
+    DUPLICATE_REQUEST_ID:
+        "duplicate_request_id",
+
+    DUPLICATE_ORDER:
+        "duplicate_order",
+
+    ORDER_FAILED:
+        "order_failed",
+
+    PRODUCT_UNAVAILABLE:
+        "product_unavailable",
+
+    ORDER_NOT_FOUND:
+        "order_not_found",
+
+    WALLET_BUSY:
+        "wallet_busy",
+
+    RATE_LIMIT_EXCEEDED:
+        "rate_limit_exceeded"
+
 });
 
-/**
- * Reconciliation policy.
- *
- * These values control how often an unresolved electricity transaction
- * may be checked. They do NOT authorize automatic financial release.
- */
+
+// =====================================================
+// RECONCILIATION CONFIGURATION
+// =====================================================
+
 const RECONCILIATION_CONFIG = Object.freeze({
-  DEFAULT_BATCH_SIZE: 25,
-  MAX_BATCH_SIZE: 100,
 
-  MAX_AUTOMATIC_ATTEMPTS: 12,
+    BACKOFF_MINUTES:
+        Object.freeze([
+            1,
+            5,
+            15,
+            30,
+            60
+        ]),
 
-  INITIAL_DELAY_MS: 30 * 1000,
-  MAX_DELAY_MS: 30 * 60 * 1000,
+    MAX_ATTEMPTS:
+        5
 
-  /**
-   * After this point the transaction can be escalated for manual review.
-   * Escalation does NOT release the customer's reserved funds.
-   */
-  MAX_RECONCILIATION_AGE_MS: 24 * 60 * 60 * 1000,
 });
 
-/**
- * Basic electricity amount limits.
- *
- * The provider currently documents a maximum purchase amount of
- * ₦100,000. The minimum amount can depend on the verified customer,
- * so the final minimum must come from the provider verification result.
- */
+
+// =====================================================
+// AMOUNT LIMITS
+// =====================================================
+
 const ELECTRICITY_LIMITS = Object.freeze({
-  MAX_AMOUNT_NAIRA: 100000,
-  MAX_AMOUNT_KOBO: 100000 * 100,
+
+    MAX_AMOUNT_NAIRA:
+        100000,
+
+    MAX_AMOUNT_KOBO:
+        10000000
+
 });
 
-/**
- * Maximum lengths used for backend validation.
- *
- * These are deliberately conservative application-level limits.
- */
+
+// =====================================================
+// INPUT LIMITS
+// =====================================================
+
 const ELECTRICITY_INPUT_LIMITS = Object.freeze({
-  METER_NUMBER_MIN_LENGTH: 4,
-  METER_NUMBER_MAX_LENGTH: 32,
 
-  SERVICE_ID_MAX_LENGTH: 64,
+    MAX_CUSTOMER_ID_LENGTH:
+        50,
 
-  REQUEST_ID_MAX_LENGTH: 50,
+    MAX_SERVICE_ID_LENGTH:
+        50,
 
-  CUSTOMER_NAME_MAX_LENGTH: 200,
-  ADDRESS_MAX_LENGTH: 500,
+    MAX_METER_TYPE_LENGTH:
+        20
+
 });
 
-function isSupportedElectricityServiceId(serviceId) {
-  return (
-    typeof serviceId === "string" &&
-    SUPPORTED_ELECTRICITY_SERVICE_IDS.has(serviceId)
-  );
+
+// =====================================================
+// SERVICE ID NORMALIZATION
+// =====================================================
+//
+// Converts the frontend identifier to the provider
+// identifier.
+//
+// Examples:
+//
+//   ikedc → ikeja-electric
+//   phed  → portharcourt-electric
+//   jed   → jos-electric
+//
+// If a provider service ID is already supplied,
+// it is accepted as an internal/provider value.
+// =====================================================
+
+function normalizeElectricityServiceId(
+    serviceId
+) {
+
+    const normalized =
+        String(
+            serviceId ?? ""
+        )
+            .trim()
+            .toLowerCase();
+
+
+    if (!normalized) {
+
+        return null;
+
+    }
+
+
+    if (
+        Object.prototype.hasOwnProperty.call(
+            ELECTRICITY_SERVICE_IDS,
+            normalized
+        )
+    ) {
+
+        return ELECTRICITY_SERVICE_IDS[
+            normalized
+        ];
+
+    }
+
+
+    if (
+        Object.prototype.hasOwnProperty.call(
+            ADDITIONAL_VTU_SERVICE_IDS,
+            normalized
+        )
+    ) {
+
+        return ADDITIONAL_VTU_SERVICE_IDS[
+            normalized
+        ];
+
+    }
+
+
+    if (
+        SUPPORTED_VTU_SERVICE_IDS.has(
+            normalized
+        )
+    ) {
+
+        return normalized;
+
+    }
+
+
+    return null;
+
 }
 
-function isSupportedMeterType(meterType) {
-  return (
-    typeof meterType === "string" &&
-    SUPPORTED_METER_TYPES.has(meterType)
-  );
+
+// =====================================================
+// FRONTEND COMPANY VALIDATION
+// =====================================================
+
+function isSupportedElectricityCompany(
+    company
+) {
+
+    const normalized =
+        String(
+            company ?? ""
+        )
+            .trim()
+            .toLowerCase();
+
+
+    return SUPPORTED_ELECTRICITY_COMPANIES.has(
+        normalized
+    );
+
 }
 
-function isDefiniteProviderFailureStatus(status) {
-  return (
-    status === PROVIDER_ELECTRICITY_STATUS.FAILED ||
-    status === PROVIDER_ELECTRICITY_STATUS.REFUNDED ||
-    status === PROVIDER_ELECTRICITY_STATUS.CANCELLED
-  );
+
+// =====================================================
+// SERVICE ID VALIDATION
+// =====================================================
+
+function isSupportedElectricityServiceId(
+    serviceId
+) {
+
+    return Boolean(
+        normalizeElectricityServiceId(
+            serviceId
+        )
+    );
+
 }
 
-function isProviderSuccessStatus(status) {
-  return status === PROVIDER_ELECTRICITY_STATUS.SUCCESS;
+
+// =====================================================
+// METER TYPE VALIDATION
+// =====================================================
+
+function isSupportedMeterType(
+    meterType
+) {
+
+    const normalized =
+        String(
+            meterType ?? ""
+        )
+            .trim()
+            .toLowerCase();
+
+
+    return (
+        normalized ===
+            METER_TYPES.PREPAID ||
+        normalized ===
+            METER_TYPES.POSTPAID
+    );
+
 }
 
-function isProviderPendingStatus(status) {
-  return (
-    status === PROVIDER_ELECTRICITY_STATUS.PROCESSING ||
-    status === PROVIDER_ELECTRICITY_STATUS.QUEUED ||
-    status === PROVIDER_ELECTRICITY_STATUS.INITIATED ||
-    status === PROVIDER_ELECTRICITY_STATUS.PENDING ||
-    status === PROVIDER_ELECTRICITY_STATUS.ON_HOLD
-  );
+
+// =====================================================
+// PROVIDER STATUS CLASSIFICATION
+// =====================================================
+
+function isDefiniteProviderFailureStatus(
+    status
+) {
+
+    const normalized =
+        String(
+            status ?? ""
+        )
+            .trim()
+            .toLowerCase();
+
+
+    return (
+        normalized ===
+            PROVIDER_STATUSES.FAILED ||
+        normalized ===
+            PROVIDER_STATUSES.REFUNDED ||
+        normalized ===
+            PROVIDER_STATUSES.CANCELLED
+    );
+
 }
 
-function classifyProviderStatus(status) {
-  if (isProviderSuccessStatus(status)) {
-    return PROVIDER_OUTCOME.SUCCESS;
-  }
 
-  if (isDefiniteProviderFailureStatus(status)) {
-    return PROVIDER_OUTCOME.FAILURE;
-  }
+function isProviderSuccessStatus(
+    status
+) {
 
-  if (isProviderPendingStatus(status)) {
-    return PROVIDER_OUTCOME.UNKNOWN;
-  }
+    return (
+        String(
+            status ?? ""
+        )
+            .trim()
+            .toLowerCase() ===
+        PROVIDER_STATUSES.SUCCESS
+    );
 
-  return PROVIDER_OUTCOME.UNKNOWN;
 }
+
+
+function isProviderPendingStatus(
+    status
+) {
+
+    const normalized =
+        String(
+            status ?? ""
+        )
+            .trim()
+            .toLowerCase();
+
+
+    return (
+        normalized ===
+            PROVIDER_STATUSES.PROCESSING ||
+        normalized ===
+            PROVIDER_STATUSES.QUEUED ||
+        normalized ===
+            PROVIDER_STATUSES.INITIATED ||
+        normalized ===
+            PROVIDER_STATUSES.PENDING ||
+        normalized ===
+            PROVIDER_STATUSES.ON_HOLD
+    );
+
+}
+
+
+// =====================================================
+// GENERAL PROVIDER STATUS CLASSIFIER
+// =====================================================
+
+function classifyProviderStatus(
+    status
+) {
+
+    if (
+        isProviderSuccessStatus(
+            status
+        )
+    ) {
+
+        return PROVIDER_OUTCOMES.SUCCESS;
+
+    }
+
+
+    if (
+        isDefiniteProviderFailureStatus(
+            status
+        )
+    ) {
+
+        return PROVIDER_OUTCOMES.FAILURE;
+
+    }
+
+
+    return PROVIDER_OUTCOMES.UNKNOWN;
+
+}
+
+
+// =====================================================
+// EXPORTS
+// =====================================================
 
 module.exports = {
-  ELECTRICITY_STATUS,
-  RECONCILIATION_STATUS,
-  METER_TYPES,
 
-  ELECTRICITY_SERVICE_IDS,
-  SUPPORTED_ELECTRICITY_SERVICE_IDS,
-  SUPPORTED_METER_TYPES,
+    ELECTRICITY_STATUS,
 
-  PROVIDER_ELECTRICITY_STATUS,
-  PROVIDER_OUTCOME,
+    RECONCILIATION_STATUS,
 
-  ELECTRICITY_REASON_CODES,
-  RECONCILIATION_CONFIG,
-  ELECTRICITY_LIMITS,
-  ELECTRICITY_INPUT_LIMITS,
+    METER_TYPES,
 
-  isSupportedElectricityServiceId,
-  isSupportedMeterType,
-  isDefiniteProviderFailureStatus,
-  isProviderSuccessStatus,
-  isProviderPendingStatus,
-  classifyProviderStatus,
+    ELECTRICITY_COMPANIES,
+
+    ELECTRICITY_SERVICE_IDS,
+
+    ADDITIONAL_VTU_SERVICE_IDS,
+
+    SUPPORTED_VTU_SERVICE_IDS,
+
+    SUPPORTED_ELECTRICITY_COMPANIES,
+
+    PROVIDER_STATUSES,
+
+    PROVIDER_OUTCOMES,
+
+    ELECTRICITY_REASON_CODES,
+
+    RECONCILIATION_CONFIG,
+
+    ELECTRICITY_LIMITS,
+
+    ELECTRICITY_INPUT_LIMITS,
+
+    normalizeElectricityServiceId,
+
+    isSupportedElectricityCompany,
+
+    isSupportedElectricityServiceId,
+
+    isSupportedMeterType,
+
+    isDefiniteProviderFailureStatus,
+
+    isProviderSuccessStatus,
+
+    isProviderPendingStatus,
+
+    classifyProviderStatus
+
 };
