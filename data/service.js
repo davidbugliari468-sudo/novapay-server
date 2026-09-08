@@ -593,10 +593,46 @@ async function updateTransaction(
   transactionId,
   updates
 ) {
+  /*
+   * IMPORTANT FINANCIAL RULE:
+   *
+   * If the transaction is being changed to FAILED and
+   * it has a reservation, release that reservation.
+   *
+   * UNKNOWN and PENDING transactions are deliberately
+   * left reserved because their provider outcome may be
+   * ambiguous and must be reconciled later.
+   *
+   * releaseReservation() is atomic and idempotent, so this
+   * remains safe when another confirmed-failure path has
+   * already released the same reservation.
+   */
+
+  if (
+    updates &&
+    updates.status === STATUS_FAILED
+  ) {
+    const transaction =
+      await getTransaction(
+        transactionId
+      );
+
+    if (transaction.reservationId) {
+      await releaseReservation({
+        uid:
+          transaction.uid,
+
+        reservationId:
+          transaction.reservationId,
+      });
+    }
+  }
+
   await transactionRef(
     transactionId
   ).update({
     ...updates,
+
     updatedAt:
       new Date().toISOString(),
   });
