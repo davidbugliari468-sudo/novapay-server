@@ -9,6 +9,7 @@ const {
 const {
   ELECTRICITY_LIMITS,
   ELECTRICITY_INPUT_LIMITS,
+  normalizeElectricityServiceId,
   isSupportedElectricityServiceId,
   isSupportedMeterType,
 } = require("./constants");
@@ -37,17 +38,13 @@ const VTU_REQUEST_TIMEOUT_MS =
     ? configuredTimeout
     : 15000;
 
-function normalizeString(
-  value
-) {
+function normalizeString(value) {
   return String(
     value ?? ""
   ).trim();
 }
 
-function requireTransactionId(
-  transactionId
-) {
+function requireTransactionId(transactionId) {
   const value =
     normalizeString(
       transactionId
@@ -74,9 +71,7 @@ function requireTransactionId(
   return value;
 }
 
-function validateServiceId(
-  serviceId
-) {
+function validateServiceId(serviceId) {
   const value =
     normalizeString(
       serviceId
@@ -97,12 +92,23 @@ function validateServiceId(
     );
   }
 
-  return value;
+  /*
+   * The frontend can send:
+   *
+   *   ikedc
+   *   ekedc
+   *   phed
+   *   etc.
+   *
+   * NovaPay converts those identifiers to the
+   * official VTU.ng service IDs at the provider boundary.
+   */
+  return normalizeElectricityServiceId(
+    value
+  );
 }
 
-function validateMeterType(
-  meterType
-) {
+function validateMeterType(meterType) {
   const value =
     normalizeString(
       meterType
@@ -126,9 +132,7 @@ function validateMeterType(
   return value;
 }
 
-function validateCustomerId(
-  customerId
-) {
+function validateCustomerId(customerId) {
   const value =
     normalizeString(
       customerId
@@ -161,8 +165,7 @@ function validateCustomerId(
 
   /*
    * Meter/account identifiers can differ by provider,
-   * so we deliberately do not force a numeric-only rule here.
-   * The provider remains authoritative during verification.
+   * so we deliberately do not force a numeric-only rule.
    */
   if (
     !/^[A-Za-z0-9._:/-]+$/.test(
@@ -180,9 +183,7 @@ function validateCustomerId(
   return value;
 }
 
-function validateAmountKobo(
-  amountKobo
-) {
+function validateAmountKobo(amountKobo) {
   const value =
     Number(
       amountKobo
@@ -204,8 +205,7 @@ function validateAmountKobo(
 
   if (
     value >
-    ELECTRICITY_LIMITS
-      .MAX_AMOUNT_KOBO
+    ELECTRICITY_LIMITS.MAX_AMOUNT_KOBO
   ) {
     throw new VtuProviderError(
       "Electricity purchase amount exceeds the maximum allowed amount.",
@@ -216,8 +216,8 @@ function validateAmountKobo(
   }
 
   /*
-   * NovaPay wallet amounts are stored in kobo.
-   * VTU.ng electricity accepts whole NGN amounts.
+   * NovaPay stores money in kobo.
+   * VTU.ng electricity accepts whole NGN.
    */
   if (
     value % 100 !== 0
@@ -233,24 +233,20 @@ function validateAmountKobo(
   return value;
 }
 
-function createProviderRequestId(
-  transactionId
-) {
+function createProviderRequestId(transactionId) {
   const normalized =
     requireTransactionId(
       transactionId
     );
 
-  /*
-   * VTU.ng allows request_id up to 50 characters.
-   *
-   * The transaction ID is hashed so the provider request
-   * identifier is deterministic, short, and safe to reuse
-   * during reconciliation without creating a new purchase.
-   */
   const crypto =
     require("crypto");
 
+  /*
+   * VTU.ng request_id maximum = 50 characters.
+   *
+   * NPE + 47 hexadecimal characters = 50 characters.
+   */
   return (
     "NPE" +
     crypto
@@ -382,39 +378,36 @@ async function authenticatedRequest(
 
   let response;
 
-  try {
-    response =
-      await fetchWithTimeout(
-        `${VTU_API_URL}/${path}`,
-        {
-          method,
+  response =
+    await fetchWithTimeout(
+      `${VTU_API_URL}/${path}`,
+      {
+        method,
 
-          headers: {
-            Authorization:
-              `Bearer ${token}`,
+        headers: {
+          Authorization:
+            `Bearer ${token}`,
 
-            "Content-Type":
-              "application/json",
+          "Content-Type":
+            "application/json",
 
-            Accept:
-              "application/json",
-          },
+          Accept:
+            "application/json",
+        },
 
-          body:
-            body === null
-              ? undefined
-              : JSON.stringify(
-                  body
-                ),
-        }
-      );
-  } catch (error) {
-    throw error;
-  }
+        body:
+          body === null
+            ? undefined
+            : JSON.stringify(
+                body
+              ),
+      }
+    );
 
   /*
-   * Reuse the current Airtime VTU authentication
-   * implementation. We never create a separate token cache.
+   * Reuse the Airtime VTU authentication
+   * implementation so we do not maintain a
+   * second independent token cache.
    */
   if (
     (
@@ -494,9 +487,7 @@ async function authenticatedRequest(
   };
 }
 
-function extractPayload(
-  data
-) {
+function extractPayload(data) {
   if (
     data?.data &&
     typeof data.data ===
@@ -508,9 +499,7 @@ function extractPayload(
   return data || {};
 }
 
-function extractProviderReference(
-  data
-) {
+function extractProviderReference(data) {
   const payload =
     extractPayload(
       data
@@ -548,9 +537,7 @@ function extractProviderReference(
   return null;
 }
 
-function extractProviderStatus(
-  data
-) {
+function extractProviderStatus(data) {
   const payload =
     extractPayload(
       data
@@ -565,9 +552,7 @@ function extractProviderStatus(
   return status || null;
 }
 
-function extractProviderCode(
-  data
-) {
+function extractProviderCode(data) {
   const payload =
     extractPayload(
       data
@@ -580,9 +565,7 @@ function extractProviderCode(
   );
 }
 
-function extractProviderMessage(
-  data
-) {
+function extractProviderMessage(data) {
   const payload =
     extractPayload(
       data
@@ -603,9 +586,7 @@ function extractProviderMessage(
   );
 }
 
-function extractToken(
-  data
-) {
+function extractToken(data) {
   const payload =
     extractPayload(
       data
@@ -633,9 +614,7 @@ function extractToken(
   return null;
 }
 
-function extractUnits(
-  data
-) {
+function extractUnits(data) {
   const payload =
     extractPayload(
       data
@@ -673,9 +652,7 @@ function extractUnits(
   return null;
 }
 
-function normalizeProviderStatus(
-  status
-) {
+function normalizeProviderStatus(status) {
   const normalized =
     normalizeString(
       status
@@ -711,20 +688,12 @@ function normalizeProviderStatus(
   return "unknown";
 }
 
-function normalizeProviderCode(
-  code
-) {
+function normalizeProviderCode(code) {
   const normalized =
     normalizeString(
       code
     ).toLowerCase();
 
-  /*
-   * These represent explicit provider rejection/failure.
-   *
-   * We deliberately do NOT classify generic HTTP errors
-   * or arbitrary "failed" messages here.
-   */
   const definiteFailureCodes =
     new Set([
       "insufficient_funds",
@@ -844,7 +813,8 @@ function normalizeProviderResponse(
     );
 
   /*
-   * Provider status always has priority.
+   * Provider status has priority for PURCHASE
+   * responses.
    */
   const statusOutcome =
     normalizeProviderStatus(
@@ -896,7 +866,7 @@ function normalizeProviderResponse(
   }
 
   /*
-   * Explicit provider code.
+   * Explicit provider failure code.
    */
   const codeOutcome =
     normalizeProviderCode(
@@ -962,10 +932,17 @@ function normalizeProviderResponse(
   /*
    * Everything else remains UNKNOWN.
    *
-   * This is critical:
+   * This includes:
    *
-   * timeout/network/5xx/malformed/processing/queued/
-   * pending/on-hold must never release the reservation.
+   * - timeout
+   * - network failure
+   * - malformed provider response
+   * - 5xx
+   * - processing-api
+   * - queued-api
+   * - initiated-api
+   * - pending
+   * - on-hold
    */
   return {
     outcome: "unknown",
@@ -985,6 +962,56 @@ function normalizeProviderResponse(
       ),
     httpStatus,
   };
+}
+
+/*
+ * VTU.ng's verify-customer response is different
+ * from a purchase response.
+ *
+ * A successful verification looks like:
+ *
+ * {
+ *   "code": "success",
+ *   "message": "Customer Details Retrieved",
+ *   "data": {
+ *      "customer_id": "...",
+ *      "customer_name": "...",
+ *      ...
+ *   }
+ * }
+ *
+ * There is no requirement for:
+ *
+ *   data.status === "completed-api"
+ *
+ * Therefore verification must NOT use the purchase
+ * status classifier as its success condition.
+ */
+function isSuccessfulVerificationResponse(
+  data
+) {
+  const payload =
+    extractPayload(
+      data
+    );
+
+  const code =
+    normalizeString(
+      data?.code
+    ).toLowerCase();
+
+  const customerId =
+    normalizeString(
+      payload?.customer_id
+    );
+
+  return (
+    code ===
+      "success" &&
+    Boolean(
+      customerId
+    )
+  );
 }
 
 function validateVerificationInput({
@@ -1059,130 +1086,190 @@ async function verifyElectricityCustomer({
     );
   }
 
-  const normalized =
-    normalizeProviderResponse(
-      result.data,
-      result.response.status
-    );
-
   /*
-   * Verification is different from a purchase.
+   * IMPORTANT:
    *
-   * We require an actual provider response before accepting
-   * customer details. An ambiguous verification response is
-   * never treated as successful verification.
+   * Verify-customer uses code=success rather than
+   * purchase-style status=completed-api.
    */
   if (
-    normalized.outcome ===
-    "failure"
+    isSuccessfulVerificationResponse(
+      result.data
+    )
   ) {
-    throw new VtuProviderError(
-      normalized.message ||
-        "VTU.ng rejected the electricity customer verification.",
-      {
-        kind: "provider_rejection",
-        httpStatus:
-          normalized.httpStatus,
-        providerCode:
-          normalized.providerCode,
-        providerStatus:
-          normalized.providerStatus,
-        providerReference:
-          normalized.providerReference,
-        rawMessage:
-          normalized.message,
-      }
-    );
+    const payload =
+      extractPayload(
+        result.data
+      );
+
+    return {
+      outcome: "success",
+
+      customerId:
+        input.customerId,
+
+      /*
+       * Return the provider service ID because that
+       * is what VTU actually accepted.
+       */
+      serviceId:
+        input.serviceId,
+
+      meterType:
+        input.meterType,
+
+      customerName:
+        normalizeString(
+          payload?.customer_name
+        ) || null,
+
+      address:
+        normalizeString(
+          payload?.customer_address ||
+            payload?.address
+        ) || null,
+
+      meterNumber:
+        normalizeString(
+          payload?.meter_number ||
+            payload?.meter ||
+            input.customerId
+        ) || null,
+
+      accountNumber:
+        normalizeString(
+          payload?.account_number ||
+            payload?.account
+        ) || null,
+
+      arrears:
+        payload?.customer_arrears ??
+        payload?.arrears ??
+        payload?.outstanding ??
+        null,
+
+      minPurchaseAmount:
+        payload?.min_purchase_amount ??
+        null,
+
+      maxPurchaseAmount:
+        payload?.max_purchase_amount ??
+        null,
+
+      providerReference:
+        extractProviderReference(
+          result.data
+        ),
+
+      providerStatus:
+        extractProviderStatus(
+          result.data
+        ),
+
+      providerCode:
+        extractProviderCode(
+          result.data
+        ),
+
+      message:
+        extractProviderMessage(
+          result.data
+        ),
+    };
   }
 
-  if (
-    normalized.outcome ===
-    "unknown"
-  ) {
-    throw new VtuProviderError(
-      "Electricity customer verification could not be confirmed.",
-      {
-        kind: "unknown",
-        httpStatus:
-          normalized.httpStatus,
-        providerCode:
-          normalized.providerCode,
-        providerStatus:
-          normalized.providerStatus,
-        providerReference:
-          normalized.providerReference,
-        rawMessage:
-          normalized.message,
-      }
-    );
-  }
-
-  const payload =
-    extractPayload(
+  /*
+   * If VTU explicitly reports a failure, this is a
+   * definite verification failure.
+   */
+  const providerCode =
+    extractProviderCode(
       result.data
     );
 
-  return {
-    outcome:
-      "success",
+  const providerMessage =
+    extractProviderMessage(
+      result.data
+    );
 
-    customerId:
-      input.customerId,
+  const codeOutcome =
+    normalizeProviderCode(
+      providerCode
+    );
 
-    serviceId:
-      input.serviceId,
+  const messageOutcome =
+    normalizeProviderMessageOutcome(
+      providerMessage
+    );
 
-    meterType:
-      input.meterType,
+  if (
+    codeOutcome ===
+      "failure" ||
+    messageOutcome ===
+      "failure" ||
+    normalizeString(
+      providerCode
+    ).toLowerCase() ===
+      "failure"
+  ) {
+    throw new VtuProviderError(
+      providerMessage ||
+        "VTU.ng rejected the electricity customer verification.",
+      {
+        kind:
+          "provider_rejection",
 
-    customerName:
-      normalizeString(
-        payload?.customer_name
-      ) || null,
+        httpStatus:
+          result.response.status,
 
-    address:
-      normalizeString(
-        payload?.address
-      ) || null,
+        providerCode:
+          providerCode,
 
-    meterNumber:
-      normalizeString(
-        payload?.meter_number ||
-          payload?.meter ||
-          input.customerId
-      ) || null,
+        providerStatus:
+          extractProviderStatus(
+            result.data
+          ),
 
-    accountNumber:
-      normalizeString(
-        payload?.account_number ||
-          payload?.account
-      ) || null,
+        providerReference:
+          extractProviderReference(
+            result.data
+          ),
 
-    arrears:
-      payload?.arrears ??
-      payload?.outstanding ??
-      null,
+        rawMessage:
+          providerMessage,
+      }
+    );
+  }
 
-    minPurchaseAmount:
-      payload?.min_purchase_amount ??
-      null,
+  /*
+   * Anything that is not an explicit successful
+   * verification or definite rejection remains
+   * unresolved.
+   */
+  throw new VtuProviderError(
+    "Electricity customer verification could not be confirmed.",
+    {
+      kind: "unknown",
 
-    maxPurchaseAmount:
-      payload?.max_purchase_amount ??
-      null,
+      httpStatus:
+        result.response.status,
 
-    providerReference:
-      normalized.providerReference,
+      providerCode,
 
-    providerStatus:
-      normalized.providerStatus,
+      providerStatus:
+        extractProviderStatus(
+          result.data
+        ),
 
-    providerCode:
-      normalized.providerCode,
+      providerReference:
+        extractProviderReference(
+          result.data
+        ),
 
-    message:
-      normalized.message,
-  };
+      rawMessage:
+        providerMessage,
+    }
+  );
 }
 
 async function purchaseElectricity({
@@ -1255,10 +1342,11 @@ async function purchaseElectricity({
       );
   } catch (error) {
     /*
-     * A timeout/network error means NovaPay does not know
-     * whether VTU.ng accepted the order.
+     * The request may have reached VTU.ng even if
+     * NovaPay did not receive the response.
      *
-     * The caller MUST keep the reservation locked.
+     * Therefore the caller MUST keep the reservation
+     * locked and reconcile later.
      */
     if (
       error instanceof
@@ -1338,7 +1426,7 @@ async function requeryElectricity(
   } catch (error) {
     /*
      * Reconciliation errors remain unresolved.
-     * No wallet operation belongs in this adapter.
+     * This adapter never changes wallet state.
      */
     if (
       error instanceof

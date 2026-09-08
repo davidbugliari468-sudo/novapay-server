@@ -15,6 +15,16 @@ const {
 const airtimeProviderClient =
   require("./airtime/vtu");
 
+// =====================================================
+// ELECTRICITY RECONCILIATION WORKER
+// =====================================================
+
+const {
+  runReconciliationBatch:
+    runElectricityReconciliationBatch
+} = require("./electricity/worker");
+
+
 const electricityRoutes =
   require("./electricity/routes");
 
@@ -1272,6 +1282,157 @@ app.listen(
 
       },
       airtimeIntervalMs
+    );
+
+
+    // =================================================
+    // ELECTRICITY RECONCILIATION WORKER
+    // =================================================
+    //
+    // This is the only new worker being added.
+    //
+    // It only reconciles existing UNKNOWN electricity
+    // transactions.
+    //
+    // It does NOT create a new electricity purchase.
+    // It does NOT directly change wallet balances.
+    // The electricity reconciliation service decides
+    // whether the provider outcome is:
+    //
+    //     SUCCESS  -> commit reservation
+    //     FAILED   -> release reservation
+    //     UNKNOWN  -> keep reservation locked
+    //
+    // =================================================
+
+    const electricityIntervalMs =
+      Number(
+        process.env.ELECTRICITY_RECONCILIATION_INTERVAL_MS
+      ) || 60000;
+
+
+    const electricityBatchSize =
+      Number(
+        process.env.ELECTRICITY_RECONCILIATION_BATCH_SIZE
+      ) || 25;
+
+
+    let electricityReconciliationRunning =
+      false;
+
+
+    const runElectricityReconciliation =
+      async () => {
+
+        if (
+          electricityReconciliationRunning
+        ) {
+
+          console.log(
+            "Electricity reconciliation already running; skipping overlapping run."
+          );
+
+          return;
+
+        }
+
+
+        electricityReconciliationRunning =
+          true;
+
+
+        try {
+
+          const result =
+            await runElectricityReconciliationBatch({
+
+              limit:
+                electricityBatchSize
+
+            });
+
+
+          if (
+            result.scanned > 0
+          ) {
+
+            console.log(
+              "Electricity reconciliation completed:",
+              {
+
+                scanned:
+                  result.scanned,
+
+                processed:
+                  result.processed,
+
+                failed:
+                  result.failed
+
+              }
+            );
+
+          }
+
+        }
+
+        catch (error) {
+
+          console.error(
+            "Electricity reconciliation worker error:",
+            error
+          );
+
+        }
+
+        finally {
+
+          electricityReconciliationRunning =
+            false;
+
+        }
+
+      };
+
+
+    console.log(
+      "Electricity reconciliation worker started:",
+      {
+
+        intervalMs:
+          electricityIntervalMs,
+
+        batchSize:
+          electricityBatchSize
+
+      }
+    );
+
+
+    /*
+     * Give the server a few seconds to finish starting
+     * before the first reconciliation scan.
+     */
+    setTimeout(
+      () => {
+        runElectricityReconciliation();
+      },
+      5000
+    );
+
+
+    /*
+     * Continue checking UNKNOWN electricity
+     * transactions according to their reconciliation
+     * schedule.
+     */
+    setInterval(
+      () => {
+
+        runElectricityReconciliation();
+
+      },
+      electricityIntervalMs
     );
 
   }
