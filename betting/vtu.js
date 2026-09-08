@@ -475,6 +475,75 @@ function extractAmount(response) {
     : null;
 }
 
+/*
+ * SECURITY:
+ *
+ * Never log the complete VTU response.
+ *
+ * Provider responses can contain customer names,
+ * email addresses, phone numbers, account information,
+ * balances, references, or other sensitive information.
+ *
+ * This diagnostic intentionally records only:
+ * - object shape
+ * - field names
+ * - safe status/code/message information
+ * - whether expected customer fields exist
+ *
+ * It does NOT log the raw provider response.
+ */
+function buildSafeResponseDiagnostic(
+  response
+) {
+  const topLevel =
+    response &&
+    typeof response === "object" &&
+    !Array.isArray(response)
+      ? response
+      : {};
+
+  const payload =
+    extractPayload(topLevel);
+
+  const payloadObject =
+    payload &&
+    typeof payload === "object" &&
+    !Array.isArray(payload)
+      ? payload
+      : {};
+
+  return {
+    responseType:
+      Array.isArray(response)
+        ? "array"
+        : typeof response,
+
+    topLevelKeys:
+      Object.keys(topLevel).sort(),
+
+    payloadKeys:
+      Object.keys(payloadObject).sort(),
+
+    providerCode:
+      extractProviderCode(response),
+
+    providerStatus:
+      extractProviderStatus(response),
+
+    providerMessage:
+      extractProviderMessage(response),
+
+    hasCustomerId:
+      Boolean(extractCustomerId(response)),
+
+    hasCustomerName:
+      Boolean(extractCustomerName(response)),
+
+    hasProviderReference:
+      Boolean(extractProviderReference(response)),
+  };
+}
+
 function normalizePurchaseResponse(
   response
 ) {
@@ -787,6 +856,33 @@ async function verifyBettingCustomer({
     };
   }
 
+  /*
+   * The HTTP request succeeded, but the response did not
+   * satisfy our expected VTU.ng verification contract.
+   *
+   * Do NOT treat this as successful verification.
+   *
+   * Log only sanitized structural information so we can
+   * identify the provider's actual response shape without
+   * exposing customer PII or credentials.
+   */
+  const diagnostic =
+    buildSafeResponseDiagnostic(
+      response
+    );
+
+  console.error(
+    "[VTU BETTING VERIFY RESPONSE]",
+    {
+      serviceId:
+        normalizedServiceId,
+
+      providerServiceId,
+
+      diagnostic,
+    }
+  );
+
   if (
     providerCode === "failure" ||
     isBettingDefiniteFailureCode(
@@ -804,6 +900,7 @@ async function verifyBettingCustomer({
         providerCode,
         providerStatus,
         response,
+        diagnostic,
       }
     );
   }
@@ -816,6 +913,7 @@ async function verifyBettingCustomer({
       providerCode,
       providerStatus,
       response,
+      diagnostic,
     }
   );
 }
