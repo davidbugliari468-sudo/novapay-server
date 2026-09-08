@@ -938,42 +938,16 @@ function normalizeProviderMessageOutcome(
 
 
     const definiteFailurePatterns = [
-
-        "insufficient wallet balance",
-
-        "insufficient wallet funds",
-
-        "insufficient funds",
-
-        "insufficient balance",
-
-        "wallet balance is insufficient",
-
-        "order failed",
-
-        "order has failed",
-
-        "airtime order failed",
-
-        "product unavailable",
-
-        "product is unavailable",
-
-        "transaction failed",
-
-        "transaction has failed",
-
-        "request failed",
-
-        "request has failed",
-
-        "cancelled",
-
-        "canceled",
-
-        "refunded"
-
-    ];
+  "insufficient funds",
+  "insufficient_funds",
+  "insufficient-funds",
+  "order failed",
+  "order_failed",
+  "order-failed",
+  "product unavailable",
+  "product_unavailable",
+  "product-unavailable",
+];
 
 
     for (

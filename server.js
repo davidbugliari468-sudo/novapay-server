@@ -3,7 +3,6 @@
 // NovaPay backend deployment update
 require("dotenv").config();
 
-const diagnosticRoutes = require("./diagnostics/wallet-debug");
 
 const {
   startReconciliationWorker
@@ -15,6 +14,9 @@ const {
 
 const airtimeProviderClient =
   require("./airtime/vtu");
+
+const electricityRoutes =
+  require("./electricity/routes");
 
 const notificationRoutes =
   require("./notifications/routes");
@@ -413,10 +415,9 @@ app.use(
   )
 );
 
-
 app.use(
-  "/api/diagnostics",
-  diagnosticRoutes.createDiagnosticRouter(requireAuth)
+  "/api/electricity",
+  electricityRoutes
 );
 
 // =====================================================
