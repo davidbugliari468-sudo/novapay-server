@@ -23,12 +23,19 @@ const bettingTransactionsRef =
 
 const DEFAULT_BATCH_SIZE = Math.max(
   1,
-  Number(process.env.BETTING_RECONCILIATION_BATCH_SIZE || 25)
+  Math.min(
+    Number(
+      process.env.BETTING_RECONCILIATION_BATCH_SIZE || 25
+    ),
+    100
+  )
 );
 
 const DEFAULT_BACKOFF_MINUTES = Math.max(
   1,
-  Number(process.env.BETTING_RECONCILIATION_BACKOFF_MINUTES || 5)
+  Number(
+    process.env.BETTING_RECONCILIATION_BACKOFF_MINUTES || 5
+  )
 );
 
 const MAX_RECONCILIATION_ATTEMPTS = Math.max(
@@ -38,16 +45,35 @@ const MAX_RECONCILIATION_ATTEMPTS = Math.max(
   )
 );
 
+/*
+ * A reconciliation claim prevents multiple workers from
+ * simultaneously querying the same transaction.
+ *
+ * The claim is intentionally short-lived so a crashed worker
+ * does not permanently lock reconciliation.
+ */
+const RECONCILIATION_CLAIM_MINUTES = Math.max(
+  1,
+  Number(
+    process.env.BETTING_RECONCILIATION_CLAIM_MINUTES || 5
+  )
+);
+
 function now() {
   return new Date();
 }
 
 function normalizeString(value) {
-  return typeof value === "string" ? value.trim() : "";
+  return typeof value === "string"
+    ? value.trim()
+    : "";
 }
 
 function getErrorMessage(error) {
-  return normalizeString(error?.message) || "Unknown error";
+  return (
+    normalizeString(error?.message) ||
+    "Unknown error"
+  );
 }
 
 function calculateNextRetry(attempts) {
@@ -76,23 +102,100 @@ function calculateNextRetry(attempts) {
   );
 }
 
+function calculateClaimExpiry() {
+  return new Date(
+    Date.now() +
+      RECONCILIATION_CLAIM_MINUTES *
+        60 *
+        1000
+  );
+}
+
+function toDate(value) {
+  if (!value) {
+    return null;
+  }
+
+  if (value instanceof Date) {
+    return value;
+  }
+
+  if (
+    typeof value.toDate === "function"
+  ) {
+    const converted = value.toDate();
+
+    return converted instanceof Date
+      ? converted
+      : null;
+  }
+
+  const converted = new Date(value);
+
+  if (Number.isNaN(converted.getTime())) {
+    return null;
+  }
+
+  return converted;
+}
+
 function isRetryDue(transaction) {
-  if (!transaction?.nextReconciliationAt) {
-    return true;
+  if (!transaction) {
+    return false;
   }
 
+  /*
+   * An exhausted transaction must not be continuously
+   * retried by the worker.
+   */
+  if (
+    transaction.reconciliationExhausted === true
+  ) {
+    return false;
+  }
+
+  /*
+   * Do not process a transaction that is no longer
+   * waiting for reconciliation.
+   */
+  if (
+    transaction.status !== STATUS_PENDING ||
+    transaction.reconciliationRequired !== true
+  ) {
+    return false;
+  }
+
+  /*
+   * Respect an existing reconciliation schedule.
+   */
   const next =
-    transaction.nextReconciliationAt instanceof Date
-      ? transaction.nextReconciliationAt
-      : new Date(
-          transaction.nextReconciliationAt
-        );
+    toDate(
+      transaction.nextReconciliationAt
+    );
 
-  if (Number.isNaN(next.getTime())) {
-    return true;
+  if (next && next.getTime() > Date.now()) {
+    return false;
   }
 
-  return next.getTime() <= Date.now();
+  /*
+   * Respect an active reconciliation claim.
+   *
+   * If the previous worker crashed, the claim eventually
+   * expires and another worker can continue.
+   */
+  const claimUntil =
+    toDate(
+      transaction.reconciliationClaimUntil
+    );
+
+  if (
+    claimUntil &&
+    claimUntil.getTime() > Date.now()
+  ) {
+    return false;
+  }
+
+  return true;
 }
 
 async function updateTransaction(
@@ -107,8 +210,144 @@ async function updateTransaction(
     });
 }
 
+async function claimTransaction(
+  transactionId
+) {
+  const transactionDocument =
+    bettingTransactionsRef.doc(
+      transactionId
+    );
+
+  return db.runTransaction(
+    async (firestoreTransaction) => {
+      const snapshot =
+        await firestoreTransaction.get(
+          transactionDocument
+        );
+
+      if (!snapshot.exists) {
+        return {
+          claimed: false,
+          reason: "transaction_not_found",
+          transaction: null,
+        };
+      }
+
+      const transaction =
+        snapshot.data();
+
+      if (
+        transaction.status !==
+        STATUS_PENDING
+      ) {
+        return {
+          claimed: false,
+          reason: "transaction_not_pending",
+          transaction,
+        };
+      }
+
+      if (
+        transaction.reconciliationRequired !==
+        true
+      ) {
+        return {
+          claimed: false,
+          reason:
+            "reconciliation_not_required",
+          transaction,
+        };
+      }
+
+      if (
+        transaction.reconciliationExhausted ===
+        true
+      ) {
+        return {
+          claimed: false,
+          reason:
+            "reconciliation_exhausted",
+          transaction,
+        };
+      }
+
+      const nextRetry =
+        toDate(
+          transaction.nextReconciliationAt
+        );
+
+      if (
+        nextRetry &&
+        nextRetry.getTime() >
+          Date.now()
+      ) {
+        return {
+          claimed: false,
+          reason: "retry_not_due",
+          transaction,
+        };
+      }
+
+      const existingClaim =
+        toDate(
+          transaction.reconciliationClaimUntil
+        );
+
+      if (
+        existingClaim &&
+        existingClaim.getTime() >
+          Date.now()
+      ) {
+        return {
+          claimed: false,
+          reason: "already_claimed",
+          transaction,
+        };
+      }
+
+      const claimUntil =
+        calculateClaimExpiry();
+
+      const attempts =
+        Number(
+          transaction.reconciliationAttempts
+        ) || 0;
+
+      firestoreTransaction.update(
+        transactionDocument,
+        {
+          reconciliationStartedAt:
+            now(),
+          reconciliationClaimedAt:
+            now(),
+          reconciliationClaimUntil:
+            claimUntil,
+          updatedAt: now(),
+        }
+      );
+
+      return {
+        claimed: true,
+        reason: "claimed",
+        transaction: {
+          id:
+            transaction.id ||
+            snapshot.id,
+          ...transaction,
+          reconciliationClaimUntil:
+            claimUntil,
+        },
+        attempts,
+      };
+    }
+  );
+}
+
 function normalizeProviderResult(result) {
-  if (!result || typeof result !== "object") {
+  if (
+    !result ||
+    typeof result !== "object"
+  ) {
     return {
       outcome: "unknown",
       providerReference: "",
@@ -154,11 +393,67 @@ function normalizeProviderResult(result) {
   };
 }
 
+function buildRequeryRequest(
+  transaction
+) {
+  return {
+    provider:
+      normalizeString(
+        transaction.provider
+      ),
+
+    serviceId:
+      normalizeString(
+        transaction.serviceId
+      ),
+
+    customerId:
+      normalizeString(
+        transaction.customerId
+      ),
+
+    transactionId:
+      normalizeString(
+        transaction.id
+      ),
+
+    providerRequestId:
+      normalizeString(
+        transaction.providerRequestId
+      ),
+  };
+}
+
+async function clearClaim(
+  transactionId
+) {
+  try {
+    await updateTransaction(
+      transactionId,
+      {
+        reconciliationClaimUntil: null,
+        reconciliationClaimedAt: null,
+      }
+    );
+  } catch (error) {
+    console.error(
+      "[Betting Reconciliation Claim Clear Error]",
+      {
+        transactionId,
+        message:
+          getErrorMessage(error),
+      }
+    );
+  }
+}
+
 async function reconcileTransaction(
   transaction
 ) {
   const transactionId =
-    normalizeString(transaction?.id);
+    normalizeString(
+      transaction?.id
+    );
 
   if (!transactionId) {
     throw new Error(
@@ -167,7 +462,9 @@ async function reconcileTransaction(
   }
 
   const uid =
-    normalizeString(transaction?.uid);
+    normalizeString(
+      transaction?.uid
+    );
 
   if (!uid) {
     throw new Error(
@@ -186,6 +483,7 @@ async function reconcileTransaction(
       {
         status: STATUS_PENDING,
         reconciliationRequired: true,
+        reconciliationExhausted: false,
         reconciliationError:
           "Transaction has no reservation",
         nextReconciliationAt:
@@ -211,6 +509,7 @@ async function reconcileTransaction(
       {
         status: STATUS_PENDING,
         reconciliationRequired: true,
+        reconciliationExhausted: false,
         reconciliationError:
           "Reservation could not be found",
         nextReconciliationAt:
@@ -232,8 +531,10 @@ async function reconcileTransaction(
   }
 
   /*
-   * If another process already committed the
-   * reservation, the financial result is known.
+   * The reservation is the financial authority.
+   *
+   * If another process already committed it, the
+   * transaction is financially successful.
    */
   if (
     reservation.status === "committed"
@@ -244,21 +545,25 @@ async function reconcileTransaction(
         status: STATUS_SUCCESSFUL,
         providerOutcome: "success",
         reconciliationRequired: false,
+        reconciliationExhausted: false,
         reconciliationError: "",
         nextReconciliationAt: null,
+        reconciliationClaimUntil: null,
+        reconciliationClaimedAt: null,
       }
     );
 
     return {
       transactionId,
       outcome: "success",
-      reason: "reservation_already_committed",
+      reason:
+        "reservation_already_committed",
     };
   }
 
   /*
    * If another process already released the
-   * reservation, the financial result is known.
+   * reservation, the transaction is financially failed.
    */
   if (
     reservation.status === "released"
@@ -269,8 +574,11 @@ async function reconcileTransaction(
         status: STATUS_FAILED,
         providerOutcome: "failure",
         reconciliationRequired: false,
+        reconciliationExhausted: false,
         reconciliationError: "",
         nextReconciliationAt: null,
+        reconciliationClaimUntil: null,
+        reconciliationClaimedAt: null,
         failureReason:
           transaction.failureReason ||
           "Betting transaction failed",
@@ -280,22 +588,28 @@ async function reconcileTransaction(
     return {
       transactionId,
       outcome: "failure",
-      reason: "reservation_already_released",
+      reason:
+        "reservation_already_released",
     };
   }
 
   /*
    * IMPORTANT:
-   * This is a REQUERY only.
-   * It never calls the original betting purchase
-   * endpoint.
+   *
+   * Reconciliation performs ONLY a provider status
+   * lookup.
+   *
+   * It NEVER calls the original betting funding
+   * endpoint again.
    */
   let providerResult;
 
   try {
     providerResult =
       await requeryBetting(
-        transactionId
+        buildRequeryRequest(
+          transaction
+        )
       );
   } catch (error) {
     const attempts =
@@ -314,25 +628,42 @@ async function reconcileTransaction(
       transactionId,
       {
         status: STATUS_PENDING,
+
         providerOutcome: "unknown",
-        reconciliationRequired: true,
+
+        reconciliationRequired:
+          !permanentlyWaiting,
+
+        reconciliationExhausted:
+          permanentlyWaiting,
+
         reconciliationAttempts:
           nextAttempts,
+
         reconciliationError:
           getErrorMessage(error),
+
         nextReconciliationAt:
           permanentlyWaiting
             ? null
             : calculateNextRetry(
                 nextAttempts
               ),
+
+        reconciliationClaimUntil:
+          null,
+
+        reconciliationClaimedAt:
+          null,
       }
     );
 
     return {
       transactionId,
       outcome: "unknown",
-      reason: "requery_error",
+      reason: permanentlyWaiting
+        ? "maximum_attempts_reached"
+        : "requery_error",
       attempts: nextAttempts,
     };
   }
@@ -345,8 +676,8 @@ async function reconcileTransaction(
   /*
    * DEFINITE SUCCESS
    *
-   * Commit the reservation only after
-   * VTU.ng gives us a definite success.
+   * Provider status is terminal success.
+   * Commit the reservation.
    */
   if (
     normalized.outcome === "success"
@@ -357,12 +688,6 @@ async function reconcileTransaction(
         reservationId,
       });
     } catch (error) {
-      /*
-       * Provider says success but our wallet
-       * commit failed. Do NOT release funds.
-       * Keep the reservation locked and retry
-       * reconciliation.
-       */
       const attempts =
         Number(
           transaction.reconciliationAttempts
@@ -371,6 +696,14 @@ async function reconcileTransaction(
       const nextAttempts =
         attempts + 1;
 
+      const permanentlyWaiting =
+        nextAttempts >=
+        MAX_RECONCILIATION_ATTEMPTS;
+
+      /*
+       * NEVER release the reservation after
+       * provider success.
+       */
       await updateTransaction(
         transactionId,
         {
@@ -393,7 +726,11 @@ async function reconcileTransaction(
 
           providerOutcome: "success",
 
-          reconciliationRequired: true,
+          reconciliationRequired:
+            !permanentlyWaiting,
+
+          reconciliationExhausted:
+            permanentlyWaiting,
 
           reconciliationAttempts:
             nextAttempts,
@@ -404,16 +741,27 @@ async function reconcileTransaction(
             )}`,
 
           nextReconciliationAt:
-            calculateNextRetry(
-              nextAttempts
-            ),
+            permanentlyWaiting
+              ? null
+              : calculateNextRetry(
+                  nextAttempts
+                ),
+
+          reconciliationClaimUntil:
+            null,
+
+          reconciliationClaimedAt:
+            null,
         }
       );
 
       return {
         transactionId,
         outcome: "unknown",
-        reason: "commit_failed",
+        reason:
+          permanentlyWaiting
+            ? "commit_failed_max_attempts"
+            : "commit_failed",
         attempts: nextAttempts,
       };
     }
@@ -442,6 +790,8 @@ async function reconcileTransaction(
 
         reconciliationRequired: false,
 
+        reconciliationExhausted: false,
+
         reconciliationAttempts:
           Number(
             transaction.reconciliationAttempts
@@ -450,13 +800,18 @@ async function reconcileTransaction(
         reconciliationError: "",
 
         nextReconciliationAt: null,
+
+        reconciliationClaimUntil: null,
+
+        reconciliationClaimedAt: null,
       }
     );
 
     return {
       transactionId,
       outcome: "success",
-      reason: "provider_confirmed_success",
+      reason:
+        "provider_confirmed_success",
     };
   }
 
@@ -464,7 +819,7 @@ async function reconcileTransaction(
    * DEFINITE FAILURE
    *
    * Release the reservation only after
-   * VTU.ng gives us a definite failure.
+   * provider confirmation.
    */
   if (
     normalized.outcome === "failure"
@@ -475,13 +830,6 @@ async function reconcileTransaction(
         reservationId,
       });
     } catch (error) {
-      /*
-       * If release fails, DO NOT mark the
-       * transaction as successfully failed.
-       *
-       * The wallet reservation must remain
-       * protected until release succeeds.
-       */
       const attempts =
         Number(
           transaction.reconciliationAttempts
@@ -490,6 +838,14 @@ async function reconcileTransaction(
       const nextAttempts =
         attempts + 1;
 
+      const permanentlyWaiting =
+        nextAttempts >=
+        MAX_RECONCILIATION_ATTEMPTS;
+
+      /*
+       * NEVER mark the transaction failed while
+       * the reservation is still locked.
+       */
       await updateTransaction(
         transactionId,
         {
@@ -512,7 +868,11 @@ async function reconcileTransaction(
 
           providerOutcome: "failure",
 
-          reconciliationRequired: true,
+          reconciliationRequired:
+            !permanentlyWaiting,
+
+          reconciliationExhausted:
+            permanentlyWaiting,
 
           reconciliationAttempts:
             nextAttempts,
@@ -523,16 +883,27 @@ async function reconcileTransaction(
             )}`,
 
           nextReconciliationAt:
-            calculateNextRetry(
-              nextAttempts
-            ),
+            permanentlyWaiting
+              ? null
+              : calculateNextRetry(
+                  nextAttempts
+                ),
+
+          reconciliationClaimUntil:
+            null,
+
+          reconciliationClaimedAt:
+            null,
         }
       );
 
       return {
         transactionId,
         outcome: "unknown",
-        reason: "release_failed",
+        reason:
+          permanentlyWaiting
+            ? "release_failed_max_attempts"
+            : "release_failed",
         attempts: nextAttempts,
       };
     }
@@ -565,6 +936,8 @@ async function reconcileTransaction(
 
         reconciliationRequired: false,
 
+        reconciliationExhausted: false,
+
         reconciliationAttempts:
           Number(
             transaction.reconciliationAttempts
@@ -573,20 +946,25 @@ async function reconcileTransaction(
         reconciliationError: "",
 
         nextReconciliationAt: null,
+
+        reconciliationClaimUntil: null,
+
+        reconciliationClaimedAt: null,
       }
     );
 
     return {
       transactionId,
       outcome: "failure",
-      reason: "provider_confirmed_failure",
+      reason:
+        "provider_confirmed_failure",
     };
   }
 
   /*
    * UNKNOWN / PROCESSING / AMBIGUOUS
    *
-   * NEVER release the reservation here.
+   * NEVER release the reservation.
    */
   const attempts =
     Number(
@@ -622,7 +1000,11 @@ async function reconcileTransaction(
 
       providerOutcome: "unknown",
 
-      reconciliationRequired: true,
+      reconciliationRequired:
+        !permanentlyWaiting,
+
+      reconciliationExhausted:
+        permanentlyWaiting,
 
       reconciliationAttempts:
         nextAttempts,
@@ -635,6 +1017,12 @@ async function reconcileTransaction(
           : calculateNextRetry(
               nextAttempts
             ),
+
+      reconciliationClaimUntil:
+        null,
+
+      reconciliationClaimedAt:
+        null,
     }
   );
 
@@ -654,7 +1042,8 @@ async function reconcileBettingTransactions({
   const safeBatchSize = Math.max(
     1,
     Math.min(
-      Number(batchSize) || DEFAULT_BATCH_SIZE,
+      Number(batchSize) ||
+        DEFAULT_BATCH_SIZE,
       100
     )
   );
@@ -680,6 +1069,7 @@ async function reconcileBettingTransactions({
       success: 0,
       failed: 0,
       pending: 0,
+      skipped: 0,
       errors: 0,
     };
   }
@@ -689,37 +1079,60 @@ async function reconcileBettingTransactions({
     success: 0,
     failed: 0,
     pending: 0,
+    skipped: 0,
     errors: 0,
   };
 
-  for (const document of snapshot.docs) {
+  for (
+    const document of snapshot.docs
+  ) {
     const transaction =
-      document.data();
+      {
+        id: document.id,
+        ...document.data(),
+      };
 
-    if (!isRetryDue(transaction)) {
+    if (
+      !isRetryDue(transaction)
+    ) {
+      results.skipped += 1;
       continue;
     }
 
     results.scanned += 1;
 
-    /*
-     * Mark this reconciliation attempt as
-     * being processed before querying.
-     *
-     * This is not a financial state change.
-     */
+    let claim;
+
     try {
-      await updateTransaction(
-        transaction.id,
+      claim =
+        await claimTransaction(
+          document.id
+        );
+    } catch (error) {
+      results.errors += 1;
+
+      console.error(
+        "[Betting Reconciliation Claim Error]",
         {
-          reconciliationStartedAt:
-            now(),
+          transactionId:
+            document.id,
+          message:
+            getErrorMessage(error),
         }
       );
 
+      continue;
+    }
+
+    if (!claim.claimed) {
+      results.skipped += 1;
+      continue;
+    }
+
+    try {
       const result =
         await reconcileTransaction(
-          transaction
+          claim.transaction
         );
 
       if (
@@ -738,26 +1151,50 @@ async function reconcileBettingTransactions({
 
       const attempts =
         Number(
-          transaction.reconciliationAttempts
+          claim.transaction
+            .reconciliationAttempts
         ) || 0;
 
       const nextAttempts =
         attempts + 1;
 
+      const permanentlyWaiting =
+        nextAttempts >=
+        MAX_RECONCILIATION_ATTEMPTS;
+
       try {
         await updateTransaction(
-          transaction.id,
+          document.id,
           {
             status: STATUS_PENDING,
-            reconciliationRequired: true,
+
+            providerOutcome:
+              "unknown",
+
+            reconciliationRequired:
+              !permanentlyWaiting,
+
+            reconciliationExhausted:
+              permanentlyWaiting,
+
             reconciliationAttempts:
               nextAttempts,
+
             reconciliationError:
               getErrorMessage(error),
+
             nextReconciliationAt:
-              calculateNextRetry(
-                nextAttempts
-              ),
+              permanentlyWaiting
+                ? null
+                : calculateNextRetry(
+                    nextAttempts
+                  ),
+
+            reconciliationClaimUntil:
+              null,
+
+            reconciliationClaimedAt:
+              null,
           }
         );
       } catch (updateError) {
@@ -765,7 +1202,7 @@ async function reconcileBettingTransactions({
           "[Betting Reconciliation Update Error]",
           {
             transactionId:
-              transaction.id,
+              document.id,
             message:
               getErrorMessage(
                 updateError
@@ -778,7 +1215,7 @@ async function reconcileBettingTransactions({
         "[Betting Reconciliation Error]",
         {
           transactionId:
-            transaction.id,
+            document.id,
           message:
             getErrorMessage(error),
         }

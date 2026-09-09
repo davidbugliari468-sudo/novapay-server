@@ -12,16 +12,16 @@ const {
 } = require("../wallet/reservation");
 
 const {
-  BETTING_SERVICES,
   isSupportedBettingServiceId,
   normalizeBettingServiceId,
-  isValidBettingCustomerId,
   normalizeBettingCustomerId,
+  isValidBettingCustomerId,
   isValidBettingAmountKobo,
   normalizeBettingProviderStatus,
   normalizeBettingProviderCode,
   isBettingDefiniteFailureCode,
   isBettingDefiniteFailureMessage,
+  getBettingProviderServiceId,
 } = require("./constants");
 
 const {
@@ -37,14 +37,23 @@ const STATUS_FAILED = "failed";
 const SERVICE_NAME = "betting";
 const CURRENCY = "NGN";
 
-const bettingTransactionsRef = db.collection("bettingTransactions");
+const bettingTransactionsRef =
+  db.collection("bettingTransactions");
+
+/*
+ * --------------------------------------------------------------------------
+ * General helpers
+ * --------------------------------------------------------------------------
+ */
 
 function now() {
   return new Date();
 }
 
 function normalizeString(value) {
-  return typeof value === "string" ? value.trim() : "";
+  return typeof value === "string"
+    ? value.trim()
+    : "";
 }
 
 function requireUid(uid) {
@@ -64,17 +73,27 @@ function createTransactionId() {
 }
 
 function getTransactionRef(transactionId) {
-  return bettingTransactionsRef.doc(transactionId);
+  return bettingTransactionsRef.doc(
+    normalizeString(transactionId)
+  );
 }
 
+/*
+ * --------------------------------------------------------------------------
+ * Transaction lookup
+ * --------------------------------------------------------------------------
+ */
+
 async function getBettingTransaction(transactionId) {
-  const normalizedId = normalizeString(transactionId);
+  const normalizedId =
+    normalizeString(transactionId);
 
   if (!normalizedId) {
     return null;
   }
 
-  const snapshot = await getTransactionRef(normalizedId).get();
+  const snapshot =
+    await getTransactionRef(normalizedId).get();
 
   if (!snapshot.exists) {
     return null;
@@ -82,6 +101,18 @@ async function getBettingTransaction(transactionId) {
 
   return snapshot.data();
 }
+
+/*
+ * --------------------------------------------------------------------------
+ * Existing transaction validation
+ * --------------------------------------------------------------------------
+ *
+ * Client supplied transaction IDs are idempotency keys.
+ *
+ * If the same ID is reused, all important transaction details must
+ * match the original request.
+ * --------------------------------------------------------------------------
+ */
 
 function assertMatchingExistingTransaction(
   existingTransaction,
@@ -98,34 +129,66 @@ function assertMatchingExistingTransaction(
   }
 
   if (existingTransaction.uid !== uid) {
-    throw new Error("Transaction does not belong to this user");
+    throw new Error(
+      "Transaction does not belong to this user"
+    );
   }
 
   if (
-    normalizeString(existingTransaction.provider) !==
-    normalizeString(provider)
+    normalizeString(
+      existingTransaction.provider
+    ) !== normalizeString(provider)
   ) {
-    throw new Error("Transaction details do not match");
+    throw new Error(
+      "Transaction details do not match"
+    );
   }
 
   if (
-    normalizeString(existingTransaction.customerId) !==
-    normalizeString(customerId)
+    normalizeString(
+      existingTransaction.customerId
+    ) !== normalizeString(customerId)
   ) {
-    throw new Error("Transaction details do not match");
+    throw new Error(
+      "Transaction details do not match"
+    );
   }
 
   if (
-    normalizeString(existingTransaction.serviceId) !==
-    normalizeString(serviceId)
+    normalizeString(
+      existingTransaction.serviceId
+    ) !== normalizeString(serviceId)
   ) {
-    throw new Error("Transaction details do not match");
+    throw new Error(
+      "Transaction details do not match"
+    );
   }
 
-  if (Number(existingTransaction.amountKobo) !== Number(amountKobo)) {
-    throw new Error("Transaction details do not match");
+  if (
+    Number(existingTransaction.amountKobo) !==
+    Number(amountKobo)
+  ) {
+    throw new Error(
+      "Transaction details do not match"
+    );
   }
 }
+
+/*
+ * --------------------------------------------------------------------------
+ * Transaction creation
+ * --------------------------------------------------------------------------
+ *
+ * Firestore create() gives us the actual uniqueness guarantee.
+ *
+ * We deliberately do not rely on:
+ *
+ *   get() -> if missing -> create()
+ *
+ * as the uniqueness mechanism because two requests can perform the
+ * initial read concurrently.
+ * --------------------------------------------------------------------------
+ */
 
 async function createTransaction({
   transactionId,
@@ -135,19 +198,26 @@ async function createTransaction({
   serviceId,
   amountKobo,
 }) {
-  const ref = getTransactionRef(transactionId);
-  const existingSnapshot = await ref.get();
+  const ref =
+    getTransactionRef(transactionId);
+
+  const existingSnapshot =
+    await ref.get();
 
   if (existingSnapshot.exists) {
-    const existing = existingSnapshot.data();
+    const existing =
+      existingSnapshot.data();
 
-    assertMatchingExistingTransaction(existing, {
-      uid,
-      provider,
-      customerId,
-      serviceId,
-      amountKobo,
-    });
+    assertMatchingExistingTransaction(
+      existing,
+      {
+        uid,
+        provider,
+        customerId,
+        serviceId,
+        amountKobo,
+      }
+    );
 
     return existing;
   }
@@ -159,10 +229,24 @@ async function createTransaction({
     uid,
 
     service: SERVICE_NAME,
+
+    /*
+     * Application provider ID.
+     *
+     * Example:
+     *   bet9ja
+     */
     provider,
 
-    customerId,
+    /*
+     * Canonical provider service ID.
+     *
+     * Example:
+     *   Bet9ja
+     */
     serviceId,
+
+    customerId,
 
     amountKobo,
     currency: CURRENCY,
@@ -185,29 +269,101 @@ async function createTransaction({
     failureReason: "",
 
     reconciliationRequired: false,
+    reconciliationExhausted: false,
 
     createdAt: timestamp,
     updatedAt: timestamp,
   };
 
-  await ref.create(transaction);
+  try {
+    await ref.create(transaction);
 
-  return transaction;
+    return transaction;
+  } catch (error) {
+    /*
+     * A concurrent request may have created the same transaction
+     * between our read and create.
+     *
+     * Reload the document and perform the normal idempotency checks.
+     */
+    if (
+      error?.code === 6 ||
+      error?.code === "already-exists" ||
+      error?.code === "ALREADY_EXISTS"
+    ) {
+      const concurrentSnapshot =
+        await ref.get();
+
+      if (!concurrentSnapshot.exists) {
+        throw error;
+      }
+
+      const existing =
+        concurrentSnapshot.data();
+
+      assertMatchingExistingTransaction(
+        existing,
+        {
+          uid,
+          provider,
+          customerId,
+          serviceId,
+          amountKobo,
+        }
+      );
+
+      return existing;
+    }
+
+    throw error;
+  }
 }
 
-async function updateTransaction(transactionId, updates) {
-  const ref = getTransactionRef(transactionId);
+/*
+ * --------------------------------------------------------------------------
+ * Transaction update
+ * --------------------------------------------------------------------------
+ */
+
+async function updateTransaction(
+  transactionId,
+  updates
+) {
+  const ref =
+    getTransactionRef(transactionId);
 
   await ref.update({
     ...updates,
     updatedAt: now(),
   });
 
-  return getBettingTransaction(transactionId);
+  return getBettingTransaction(
+    transactionId
+  );
 }
 
-async function validateProviderResult(providerResult) {
-  if (!providerResult || typeof providerResult !== "object") {
+/*
+ * --------------------------------------------------------------------------
+ * Provider result normalization
+ * --------------------------------------------------------------------------
+ *
+ * There are three possible financial outcomes:
+ *
+ *   success  -> commit reservation
+ *   failure  -> release reservation
+ *   unknown  -> keep reservation locked and reconcile
+ *
+ * Unknown is intentionally the safe default.
+ * --------------------------------------------------------------------------
+ */
+
+function validateProviderResult(
+  providerResult
+) {
+  if (
+    !providerResult ||
+    typeof providerResult !== "object"
+  ) {
     return {
       outcome: "unknown",
       providerReference: "",
@@ -215,87 +371,175 @@ async function validateProviderResult(providerResult) {
       providerStatus: "",
       providerCode: "",
       message: "",
+      amountKobo: null,
     };
   }
 
-  const providerStatus = normalizeBettingProviderStatus(
-    providerResult.providerStatus || providerResult.status
-  );
+  const providerStatus =
+    normalizeBettingProviderStatus(
+      providerResult.providerStatus ||
+        providerResult.status
+    );
 
-  const providerCode = normalizeBettingProviderCode(
-    providerResult.providerCode || providerResult.code
-  );
+  const providerCode =
+    normalizeBettingProviderCode(
+      providerResult.providerCode ||
+        providerResult.code
+    );
 
-  const message = normalizeString(
-    providerResult.message ||
-      providerResult.providerMessage
-  );
+  const message =
+    normalizeString(
+      providerResult.message ||
+        providerResult.providerMessage
+    );
 
+  const providerReference =
+    normalizeString(
+      providerResult.providerReference ||
+        providerResult.reference
+    );
+
+  const providerRequestId =
+    normalizeString(
+      providerResult.providerRequestId ||
+        providerResult.requestId
+    );
+
+  const amountKobo =
+    Number.isFinite(
+      Number(providerResult.amountKobo)
+    )
+      ? Number(providerResult.amountKobo)
+      : null;
+
+  /*
+   * Explicit success from our adapter is authoritative.
+   */
   if (
     providerResult.outcome === "success"
   ) {
     return {
       outcome: "success",
-      providerReference:
-        normalizeString(providerResult.providerReference),
-      providerRequestId:
-        normalizeString(providerResult.providerRequestId),
+      providerReference,
+      providerRequestId,
       providerStatus,
       providerCode,
       message,
-      amountKobo:
-        providerResult.amountKobo ?? null,
+      amountKobo,
     };
   }
 
+  /*
+   * Explicit failure from our adapter is authoritative.
+   *
+   * The adapter is responsible for only returning outcome=failure
+   * when the provider response is definitely unsuccessful.
+   */
   if (
     providerResult.outcome === "failure"
   ) {
     return {
       outcome: "failure",
-      providerReference:
-        normalizeString(providerResult.providerReference),
-      providerRequestId:
-        normalizeString(providerResult.providerRequestId),
+      providerReference,
+      providerRequestId,
       providerStatus,
       providerCode,
       message,
-      amountKobo:
-        providerResult.amountKobo ?? null,
+      amountKobo,
     };
   }
 
+  /*
+   * A known definite failure code/message can also be converted
+   * into a financial failure.
+   */
   if (
-    isBettingDefiniteFailureCode(providerCode) ||
-    isBettingDefiniteFailureMessage(message)
+    isBettingDefiniteFailureCode(
+      providerCode
+    ) ||
+    isBettingDefiniteFailureMessage(
+      message
+    )
   ) {
     return {
       outcome: "failure",
-      providerReference:
-        normalizeString(providerResult.providerReference),
-      providerRequestId:
-        normalizeString(providerResult.providerRequestId),
+      providerReference,
+      providerRequestId,
       providerStatus,
       providerCode,
       message,
-      amountKobo:
-        providerResult.amountKobo ?? null,
+      amountKobo,
     };
   }
 
+  /*
+   * Everything else is ambiguous.
+   *
+   * IMPORTANT:
+   * We do not release the customer's reservation here.
+   */
   return {
     outcome: "unknown",
-    providerReference:
-      normalizeString(providerResult.providerReference),
-    providerRequestId:
-      normalizeString(providerResult.providerRequestId),
+    providerReference,
+    providerRequestId,
     providerStatus,
     providerCode,
     message,
-    amountKobo:
-      providerResult.amountKobo ?? null,
+    amountKobo,
   };
 }
+
+/*
+ * --------------------------------------------------------------------------
+ * Provider metadata helper
+ * --------------------------------------------------------------------------
+ */
+
+function getProviderMetadata(
+  providerResult
+) {
+  return {
+    providerReference:
+      normalizeString(
+        providerResult.providerReference
+      ),
+
+    providerRequestId:
+      normalizeString(
+        providerResult.providerRequestId
+      ),
+
+    providerStatus:
+      normalizeBettingProviderStatus(
+        providerResult.providerStatus
+      ),
+
+    providerCode:
+      normalizeBettingProviderCode(
+        providerResult.providerCode
+      ),
+
+    providerMessage:
+      normalizeString(
+        providerResult.message
+      ),
+  };
+}
+
+/*
+ * --------------------------------------------------------------------------
+ * Successful transaction
+ * --------------------------------------------------------------------------
+ *
+ * Financial sequence:
+ *
+ *   reservation -> committed
+ *   transaction -> successful
+ *
+ * If transaction update fails after commit, reconciliation can observe
+ * the committed reservation and restore the transaction to successful.
+ * --------------------------------------------------------------------------
+ */
 
 async function handleSuccessfulBettingTransaction({
   transactionId,
@@ -308,35 +552,42 @@ async function handleSuccessfulBettingTransaction({
     reservationId,
   });
 
-  return updateTransaction(transactionId, {
-    status: STATUS_SUCCESSFUL,
+  const metadata =
+    getProviderMetadata(
+      providerResult
+    );
 
-    providerReference:
-      normalizeString(providerResult.providerReference),
+  return updateTransaction(
+    transactionId,
+    {
+      status: STATUS_SUCCESSFUL,
 
-    providerRequestId:
-      normalizeString(providerResult.providerRequestId),
+      ...metadata,
 
-    providerStatus:
-      normalizeBettingProviderStatus(
-        providerResult.providerStatus
-      ),
+      providerOutcome: "success",
 
-    providerCode:
-      normalizeBettingProviderCode(
-        providerResult.providerCode
-      ),
+      failureReason: "",
 
-    providerMessage:
-      normalizeString(providerResult.message),
+      reconciliationRequired: false,
 
-    providerOutcome: "success",
-
-    failureReason: "",
-
-    reconciliationRequired: false,
-  });
+      reconciliationExhausted: false,
+    }
+  );
 }
+
+/*
+ * --------------------------------------------------------------------------
+ * Failed transaction
+ * --------------------------------------------------------------------------
+ *
+ * Financial sequence:
+ *
+ *   reservation -> released
+ *   transaction -> failed
+ *
+ * A definite provider rejection releases the customer's locked funds.
+ * --------------------------------------------------------------------------
+ */
 
 async function handleFailedBettingTransaction({
   transactionId,
@@ -349,37 +600,44 @@ async function handleFailedBettingTransaction({
     reservationId,
   });
 
-  return updateTransaction(transactionId, {
-    status: STATUS_FAILED,
+  const metadata =
+    getProviderMetadata(
+      providerResult
+    );
 
-    providerReference:
-      normalizeString(providerResult.providerReference),
+  return updateTransaction(
+    transactionId,
+    {
+      status: STATUS_FAILED,
 
-    providerRequestId:
-      normalizeString(providerResult.providerRequestId),
+      ...metadata,
 
-    providerStatus:
-      normalizeBettingProviderStatus(
-        providerResult.providerStatus
-      ),
+      providerOutcome: "failure",
 
-    providerCode:
-      normalizeBettingProviderCode(
-        providerResult.providerCode
-      ),
+      failureReason:
+        normalizeString(
+          providerResult.message
+        ) ||
+        "Betting account funding was rejected",
 
-    providerMessage:
-      normalizeString(providerResult.message),
+      reconciliationRequired: false,
 
-    providerOutcome: "failure",
-
-    failureReason:
-      normalizeString(providerResult.message) ||
-      "Betting account funding was rejected",
-
-    reconciliationRequired: false,
-  });
+      reconciliationExhausted: false,
+    }
+  );
 }
+
+/*
+ * --------------------------------------------------------------------------
+ * Unknown transaction
+ * --------------------------------------------------------------------------
+ *
+ * An unknown provider response must NOT move customer funds.
+ *
+ * We inspect the reservation because the financial operation might have
+ * completed before our application received the provider response.
+ * --------------------------------------------------------------------------
+ */
 
 async function handleUnknownBettingTransaction({
   transactionId,
@@ -387,7 +645,10 @@ async function handleUnknownBettingTransaction({
   reservationId,
   providerResult,
 }) {
-  const reservation = await getReservation(reservationId);
+  const reservation =
+    await getReservation(
+      reservationId
+    );
 
   if (!reservation) {
     throw new Error(
@@ -395,191 +656,369 @@ async function handleUnknownBettingTransaction({
     );
   }
 
-  if (reservation.uid !== uid) {
+  if (
+    reservation.uid !== uid
+  ) {
     throw new Error(
       "Betting transaction reservation does not belong to this user"
     );
   }
 
-  if (reservation.status === "committed") {
-    return updateTransaction(transactionId, {
-      status: STATUS_SUCCESSFUL,
+  const metadata =
+    getProviderMetadata(
+      providerResult
+    );
 
-      providerReference:
-        normalizeString(providerResult.providerReference),
+  /*
+   * If the reservation is already committed,
+   * the money has been permanently deducted.
+   */
+  if (
+    reservation.status === "committed"
+  ) {
+    return updateTransaction(
+      transactionId,
+      {
+        status: STATUS_SUCCESSFUL,
 
-      providerRequestId:
-        normalizeString(providerResult.providerRequestId),
+        ...metadata,
 
-      providerStatus:
-        normalizeBettingProviderStatus(
-          providerResult.providerStatus
-        ),
+        providerOutcome: "success",
 
-      providerCode:
-        normalizeBettingProviderCode(
-          providerResult.providerCode
-        ),
+        failureReason: "",
 
-      providerMessage:
-        normalizeString(providerResult.message),
+        reconciliationRequired: false,
 
-      providerOutcome: "success",
+        reconciliationExhausted: false,
+      }
+    );
+  }
+
+  /*
+   * If the reservation is already released,
+   * the money is available again.
+   */
+  if (
+    reservation.status === "released"
+  ) {
+    return updateTransaction(
+      transactionId,
+      {
+        status: STATUS_FAILED,
+
+        ...metadata,
+
+        providerOutcome: "failure",
+
+        failureReason:
+          normalizeString(
+            providerResult.message
+          ) ||
+          "Betting transaction failed",
+
+        reconciliationRequired: false,
+
+        reconciliationExhausted: false,
+      }
+    );
+  }
+
+  /*
+   * Active reservation + unknown provider outcome.
+   *
+   * Funds stay locked.
+   */
+  return updateTransaction(
+    transactionId,
+    {
+      status: STATUS_PENDING,
+
+      ...metadata,
+
+      providerOutcome: "unknown",
 
       failureReason: "",
 
-      reconciliationRequired: false,
-    });
-  }
+      reconciliationRequired: true,
 
-  if (reservation.status === "released") {
-    return updateTransaction(transactionId, {
-      status: STATUS_FAILED,
-
-      providerReference:
-        normalizeString(providerResult.providerReference),
-
-      providerRequestId:
-        normalizeString(providerResult.providerRequestId),
-
-      providerStatus:
-        normalizeBettingProviderStatus(
-          providerResult.providerStatus
-        ),
-
-      providerCode:
-        normalizeBettingProviderCode(
-          providerResult.providerCode
-        ),
-
-      providerMessage:
-        normalizeString(providerResult.message),
-
-      providerOutcome: "failure",
-
-      failureReason:
-        normalizeString(providerResult.message) ||
-        "Betting transaction failed",
-
-      reconciliationRequired: false,
-    });
-  }
-
-  return updateTransaction(transactionId, {
-    status: STATUS_PENDING,
-
-    providerReference:
-      normalizeString(providerResult.providerReference),
-
-    providerRequestId:
-      normalizeString(providerResult.providerRequestId),
-
-    providerStatus:
-      normalizeBettingProviderStatus(
-        providerResult.providerStatus
-      ),
-
-    providerCode:
-      normalizeBettingProviderCode(
-        providerResult.providerCode
-      ),
-
-    providerMessage:
-      normalizeString(providerResult.message),
-
-    providerOutcome: "unknown",
-
-    failureReason: "",
-
-    reconciliationRequired: true,
-  });
+      reconciliationExhausted: false,
+    }
+  );
 }
+
+/*
+ * --------------------------------------------------------------------------
+ * Provider/service normalization
+ * --------------------------------------------------------------------------
+ *
+ * Application provider:
+ *
+ *   bet9ja
+ *
+ * VTU service ID:
+ *
+ *   Bet9ja
+ * --------------------------------------------------------------------------
+ */
+
+function normalizeProvider(provider) {
+  const normalized =
+    normalizeString(provider)
+      .toLowerCase();
+
+  if (!normalized) {
+    return "";
+  }
+
+  return normalized;
+}
+
+function resolveServiceId({
+  provider,
+  serviceId,
+}) {
+  /*
+   * Prefer the application provider because it gives us one
+   * canonical source of truth.
+   */
+  const normalizedProvider =
+    normalizeProvider(provider);
+
+  if (normalizedProvider) {
+    const mappedServiceId =
+      getBettingProviderServiceId(
+        normalizedProvider
+      );
+
+    if (mappedServiceId) {
+      return mappedServiceId;
+    }
+  }
+
+  /*
+   * Backwards compatibility:
+   * allow an already canonical service ID.
+   */
+  const normalizedServiceId =
+    normalizeBettingServiceId(
+      serviceId
+    );
+
+  if (
+    normalizedServiceId &&
+    isSupportedBettingServiceId(
+      normalizedServiceId
+    )
+  ) {
+    return normalizedServiceId;
+  }
+
+  return "";
+}
+
+/*
+ * --------------------------------------------------------------------------
+ * Verify betting customer
+ * --------------------------------------------------------------------------
+ */
 
 async function verifyBettingCustomer({
   providerClient,
+  provider,
   customerId,
   serviceId,
 }) {
   if (
     !providerClient ||
-    typeof providerClient.verifyBettingCustomer !== "function"
+    typeof providerClient.verifyBettingCustomer !==
+      "function"
   ) {
     throw new Error(
       "Betting provider verification client is unavailable"
     );
   }
 
+  const normalizedProvider =
+    normalizeProvider(provider);
+
   const normalizedCustomerId =
-    normalizeBettingCustomerId(customerId);
+    normalizeBettingCustomerId(
+      customerId
+    );
 
   const normalizedServiceId =
-    normalizeBettingServiceId(serviceId);
+    resolveServiceId({
+      provider:
+        normalizedProvider,
+      serviceId,
+    });
 
-  if (!isValidBettingCustomerId(normalizedCustomerId)) {
-    throw new Error("Invalid betting customer ID");
+  if (
+    !normalizedCustomerId ||
+    !isValidBettingCustomerId(
+      normalizedCustomerId
+    )
+  ) {
+    throw new Error(
+      "Invalid betting customer ID"
+    );
   }
 
   if (
     !normalizedServiceId ||
-    !isSupportedBettingServiceId(normalizedServiceId)
+    !isSupportedBettingServiceId(
+      normalizedServiceId
+    )
   ) {
-    throw new Error("Unsupported betting service");
+    throw new Error(
+      "Unsupported betting service"
+    );
   }
 
-  try {
-    const result =
-      await providerClient.verifyBettingCustomer({
-        customerId: normalizedCustomerId,
-        serviceId: normalizedServiceId,
-      });
-
-    if (!result || result.outcome !== "success") {
-      throw new Error(
-        result?.message ||
-          "Unable to verify the betting customer"
-      );
-    }
-
-    return {
-      outcome: "success",
-
+  const result =
+    await providerClient.verifyBettingCustomer({
       customerId:
-        normalizeBettingCustomerId(
-          result.customerId || normalizedCustomerId
-        ),
-
-      requestedCustomerId:
         normalizedCustomerId,
 
       serviceId:
         normalizedServiceId,
 
-      customerName:
-        normalizeString(result.customerName),
+      provider:
+        normalizedProvider,
+    });
 
-      balance:
-        result.balance ?? null,
+  /*
+   * Verification must explicitly succeed.
+   */
+  if (
+    !result ||
+    result.outcome !== "success"
+  ) {
+    const error =
+      new Error(
+        result?.message ||
+          "Unable to verify the betting customer"
+      );
 
-      providerReference:
-        normalizeString(result.providerReference),
+    /*
+     * Preserve provider rejection classification when the adapter
+     * supplies it.
+     */
+    if (
+      result?.kind ===
+      "provider_rejection"
+    ) {
+      error.kind =
+        "provider_rejection";
+    }
 
-      providerStatus:
-        normalizeBettingProviderStatus(
-          result.providerStatus
-        ),
+    if (
+      result?.type ===
+      "provider_rejection"
+    ) {
+      error.type =
+        "provider_rejection";
+    }
 
-      providerCode:
-        normalizeBettingProviderCode(
-          result.providerCode
-        ),
+    if (
+      Number.isInteger(
+        result?.httpStatus
+      )
+    ) {
+      error.httpStatus =
+        result.httpStatus;
+    }
 
-      message:
-        normalizeString(result.message),
-    };
-  } catch (error) {
+    if (
+      typeof result?.providerCode ===
+      "string"
+    ) {
+      error.providerCode =
+        result.providerCode;
+    }
+
+    if (
+      typeof result?.providerStatus ===
+      "string"
+    ) {
+      error.providerStatus =
+        result.providerStatus;
+    }
+
     throw error;
   }
+
+  return {
+    outcome: "success",
+
+    customerId:
+      normalizeBettingCustomerId(
+        result.customerId ||
+          normalizedCustomerId
+      ),
+
+    requestedCustomerId:
+      normalizedCustomerId,
+
+    provider:
+      normalizedProvider,
+
+    serviceId:
+      normalizedServiceId,
+
+    customerName:
+      normalizeString(
+        result.customerName
+      ),
+
+    balance:
+      result.balance ?? null,
+
+    providerReference:
+      normalizeString(
+        result.providerReference
+      ),
+
+    providerRequestId:
+      normalizeString(
+        result.providerRequestId
+      ),
+
+    providerStatus:
+      normalizeBettingProviderStatus(
+        result.providerStatus
+      ),
+
+    providerCode:
+      normalizeBettingProviderCode(
+        result.providerCode
+      ),
+
+    message:
+      normalizeString(
+        result.message
+      ),
+  };
 }
+
+/*
+ * --------------------------------------------------------------------------
+ * Purchase/funding
+ * --------------------------------------------------------------------------
+ *
+ * Financial state machine:
+ *
+ * 1. Validate request.
+ * 2. Create/reuse transaction.
+ * 3. If already settled, return it.
+ * 4. If reservation already exists, NEVER fund again.
+ * 5. Reserve customer funds.
+ * 6. Call VTU exactly once.
+ * 7. Success    -> commit reservation.
+ * 8. Failure    -> release reservation.
+ * 9. Ambiguous  -> keep reservation locked + reconcile.
+ * --------------------------------------------------------------------------
+ */
 
 async function purchaseBettingAccount({
   uid,
@@ -590,19 +1029,44 @@ async function purchaseBettingAccount({
   transactionId,
   providerClient,
 }) {
-  const normalizedUid = requireUid(uid);
+  const normalizedUid =
+    requireUid(uid);
 
-  const validated = validateBettingRequest({
-    provider,
-    customerId,
-    serviceId,
-    amountKobo,
-    transactionId,
-  });
+  /*
+   * Validate through the central validation contract.
+   */
+  const validation =
+    validateBettingRequest({
+      provider,
+      customerId,
+      serviceId:
+        serviceId || provider,
+      amountKobo,
+      transactionId,
+    });
+
+  if (
+    !validation ||
+    validation.valid !== true
+  ) {
+    throw new Error(
+      validation?.error ||
+        "Invalid betting request"
+    );
+  }
+
+  /*
+   * IMPORTANT:
+   *
+   * validation.data is the actual normalized payload.
+   */
+  const validated =
+    validation.data;
 
   const normalizedProvider =
-    normalizeString(validated.provider) ||
-    DEFAULT_PROVIDER;
+    normalizeProvider(
+      validated.provider
+    );
 
   const normalizedCustomerId =
     normalizeBettingCustomerId(
@@ -610,19 +1074,27 @@ async function purchaseBettingAccount({
     );
 
   const normalizedServiceId =
-    normalizeBettingServiceId(
-      validated.serviceId
-    );
+    resolveServiceId({
+      provider:
+        normalizedProvider,
+      serviceId:
+        validated.serviceId,
+    });
 
   const normalizedAmountKobo =
-    Number(validated.amountKobo);
+    Number(
+      validated.amountKobo
+    );
 
   if (
+    !normalizedProvider ||
     !isSupportedBettingServiceId(
       normalizedServiceId
     )
   ) {
-    throw new Error("Unsupported betting service");
+    throw new Error(
+      "Unsupported betting service"
+    );
   }
 
   if (
@@ -630,7 +1102,9 @@ async function purchaseBettingAccount({
       normalizedCustomerId
     )
   ) {
-    throw new Error("Invalid betting customer ID");
+    throw new Error(
+      "Invalid betting customer ID"
+    );
   }
 
   if (
@@ -638,7 +1112,9 @@ async function purchaseBettingAccount({
       normalizedAmountKobo
     )
   ) {
-    throw new Error("Invalid betting amount");
+    throw new Error(
+      "Invalid betting amount"
+    );
   }
 
   if (
@@ -652,25 +1128,50 @@ async function purchaseBettingAccount({
   }
 
   const id =
-    normalizeString(transactionId) ||
+    normalizeString(
+      validated.transactionId
+    ) ||
     createTransactionId();
 
   let transaction =
     await createTransaction({
       transactionId: id,
       uid: normalizedUid,
-      provider: normalizedProvider,
-      customerId: normalizedCustomerId,
-      serviceId: normalizedServiceId,
-      amountKobo: normalizedAmountKobo,
+      provider:
+        normalizedProvider,
+      customerId:
+        normalizedCustomerId,
+      serviceId:
+        normalizedServiceId,
+      amountKobo:
+        normalizedAmountKobo,
     });
 
+  /*
+   * Idempotent terminal states.
+   *
+   * Never call VTU again.
+   */
   if (
-    transaction.status === STATUS_SUCCESSFUL ||
-    transaction.status === STATUS_FAILED
+    transaction.status ===
+      STATUS_SUCCESSFUL ||
+    transaction.status ===
+      STATUS_FAILED
   ) {
     return transaction;
   }
+
+  /*
+   * ----------------------------------------------------------------------
+   * Existing reservation
+   * ----------------------------------------------------------------------
+   *
+   * This is critical for preventing duplicate provider funding.
+   *
+   * If a previous attempt already reserved the money, the same
+   * transaction must not send another funding request.
+   * ----------------------------------------------------------------------
+   */
 
   if (transaction.reservationId) {
     const existingReservation =
@@ -693,114 +1194,248 @@ async function purchaseBettingAccount({
       );
     }
 
+    /*
+     * The financial state says the transaction succeeded.
+     */
     if (
       existingReservation.status ===
       "committed"
     ) {
-      return updateTransaction(id, {
-        status: STATUS_SUCCESSFUL,
-        providerOutcome: "success",
-        reconciliationRequired: false,
-      });
+      return updateTransaction(
+        id,
+        {
+          status:
+            STATUS_SUCCESSFUL,
+
+          providerOutcome:
+            "success",
+
+          reconciliationRequired:
+            false,
+
+          reconciliationExhausted:
+            false,
+        }
+      );
     }
 
+    /*
+     * The financial state says the transaction failed.
+     */
     if (
       existingReservation.status ===
       "released"
     ) {
-      return updateTransaction(id, {
-        status: STATUS_FAILED,
-        providerOutcome: "failure",
-        reconciliationRequired: false,
-        failureReason:
-          transaction.failureReason ||
-          "Betting transaction failed",
-      });
+      return updateTransaction(
+        id,
+        {
+          status:
+            STATUS_FAILED,
+
+          providerOutcome:
+            "failure",
+
+          reconciliationRequired:
+            false,
+
+          reconciliationExhausted:
+            false,
+
+          failureReason:
+            transaction.failureReason ||
+            "Betting transaction failed",
+        }
+      );
     }
 
+    /*
+     * Reservation is active.
+     *
+     * Do NOT call VTU again.
+     *
+     * Reconciliation owns the next provider-status check.
+     */
     return transaction;
   }
+
+  /*
+   * ----------------------------------------------------------------------
+   * Reserve customer funds BEFORE calling VTU.
+   * ----------------------------------------------------------------------
+   */
 
   const reservation =
     await reserveFunds({
       uid: normalizedUid,
-      amountKobo: normalizedAmountKobo,
+
+      amountKobo:
+        normalizedAmountKobo,
+
       reference: id,
-      service: SERVICE_NAME,
+
+      service:
+        SERVICE_NAME,
     });
 
+  /*
+   * Link the reservation to the transaction.
+   */
   transaction =
-    await updateTransaction(id, {
-      reservationId: reservation.id,
-    });
+    await updateTransaction(
+      id,
+      {
+        reservationId:
+          reservation.id,
+      }
+    );
 
+  /*
+   * ----------------------------------------------------------------------
+   * Provider funding
+   * ----------------------------------------------------------------------
+   *
+   * The adapter must translate our internal amountKobo/request identity
+   * into the exact VTU API request.
+   *
+   * We do not retry here after an exception.
+   */
   let providerResult;
 
   try {
     providerResult =
       await providerClient.fundBettingAccount({
         transactionId: id,
-        customerId: normalizedCustomerId,
-        serviceId: normalizedServiceId,
-        amountKobo: normalizedAmountKobo,
+
+        provider:
+          normalizedProvider,
+
+        customerId:
+          normalizedCustomerId,
+
+        serviceId:
+          normalizedServiceId,
+
+        amountKobo:
+          normalizedAmountKobo,
       });
   } catch (error) {
+    /*
+     * A network error, timeout, connection reset, or similar exception
+     * does NOT prove that VTU rejected the transaction.
+     *
+     * Therefore:
+     *
+     *   reservation stays locked
+     *   transaction stays pending
+     *   reconciliation queries provider status later
+     *
+     * NEVER retry the funding request here.
+     */
     return handleUnknownBettingTransaction({
       transactionId: id,
+
       uid: normalizedUid,
-      reservationId: reservation.id,
+
+      reservationId:
+        reservation.id,
+
       providerResult: {
         outcome: "unknown",
+
         providerReference: "",
+
         providerRequestId: "",
+
         providerStatus: "",
+
         providerCode: "",
+
         message:
           error?.message ||
-          "Unable to determine the VTU.ng betting transaction result",
+          "Unable to determine the betting transaction result",
       },
     });
   }
 
+  /*
+   * Normalize the provider response into our three-state model.
+   */
   const normalizedProviderResult =
-    await validateProviderResult(
+    validateProviderResult(
       providerResult
     );
 
+  /*
+   * ----------------------------------------------------------------------
+   * DEFINITE SUCCESS
+   * ----------------------------------------------------------------------
+   */
   if (
     normalizedProviderResult.outcome ===
     "success"
   ) {
     return handleSuccessfulBettingTransaction({
       transactionId: id,
+
       uid: normalizedUid,
-      reservationId: reservation.id,
+
+      reservationId:
+        reservation.id,
+
       providerResult:
         normalizedProviderResult,
     });
   }
 
+  /*
+   * ----------------------------------------------------------------------
+   * DEFINITE FAILURE
+   * ----------------------------------------------------------------------
+   */
   if (
     normalizedProviderResult.outcome ===
     "failure"
   ) {
     return handleFailedBettingTransaction({
       transactionId: id,
+
       uid: normalizedUid,
-      reservationId: reservation.id,
+
+      reservationId:
+        reservation.id,
+
       providerResult:
         normalizedProviderResult,
     });
   }
 
+  /*
+   * ----------------------------------------------------------------------
+   * AMBIGUOUS / UNKNOWN
+   * ----------------------------------------------------------------------
+   *
+   * Funds remain reserved.
+   * Reconciliation takes over.
+   * ----------------------------------------------------------------------
+   */
   return handleUnknownBettingTransaction({
     transactionId: id,
+
     uid: normalizedUid,
-    reservationId: reservation.id,
+
+    reservationId:
+      reservation.id,
+
     providerResult:
       normalizedProviderResult,
   });
 }
+
+/*
+ * --------------------------------------------------------------------------
+ * Exports
+ * --------------------------------------------------------------------------
+ */
 
 module.exports = {
   STATUS_PENDING,
