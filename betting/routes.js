@@ -102,6 +102,7 @@ function getSafeErrorMessage(error) {
     "Betting transaction reservation does not belong to this user",
     "Existing betting transaction reservation could not be found",
     "Betting transaction does not belong to this user",
+    "Betting provider and service do not match",
   ]);
 
   if (safeMessages.has(message)) {
@@ -419,17 +420,57 @@ router.post(
         });
       }
 
+      /*
+       * IMPORTANT:
+       *
+       * validation.js returns:
+       *
+       * {
+       *   valid: true,
+       *   data: {
+       *     provider: "bet9ja",
+       *     serviceId: "Bet9ja"
+       *   }
+       * }
+       *
+       * The old code incorrectly passed the entire data object
+       * as the provider. That produced:
+       *
+       * provider: {
+       *   provider: "bet9ja",
+       *   serviceId: "Bet9ja"
+       * }
+       *
+       * which caused "Unsupported betting service".
+       */
       const normalizedProvider =
-        providerValidation.data;
+        providerValidation.data.provider;
+
+      const normalizedServiceId =
+        providerValidation.data.serviceId;
 
       const normalizedCustomerId =
         customerValidation.data;
+
+      /*
+       * Defensive validation of the new validator contract.
+       */
+      if (
+        !normalizedProvider ||
+        !normalizedServiceId
+      ) {
+        return res.status(400).json({
+          success: false,
+          error: "Invalid betting provider",
+        });
+      }
 
       console.log(
         "[BETTING VERIFY REQUEST]",
         {
           uid,
           provider: normalizedProvider,
+          serviceId: normalizedServiceId,
           customerIdProvided: true,
         }
       );
@@ -441,6 +482,8 @@ router.post(
             normalizedCustomerId,
           provider:
             normalizedProvider,
+          serviceId:
+            normalizedServiceId,
         });
 
       console.log(
@@ -448,6 +491,7 @@ router.post(
         {
           uid,
           provider: normalizedProvider,
+          serviceId: normalizedServiceId,
           providerCode:
             result.providerCode || "",
           providerStatus:
@@ -461,6 +505,8 @@ router.post(
         status: "verified",
         provider:
           normalizedProvider,
+        serviceId:
+          normalizedServiceId,
         customerId:
           result.customerId ||
           normalizedCustomerId,
@@ -544,6 +590,12 @@ router.post(
        * Build one normalized validation input.
        *
        * accountId remains supported for backwards compatibility.
+       *
+       * NOTE:
+       * We no longer force serviceId to body.provider here.
+       * validation.js already derives the correct canonical
+       * VTU service ID from the provider and validates an
+       * explicitly supplied serviceId when present.
        */
       const validationInput = {
         provider:
@@ -554,8 +606,7 @@ router.post(
           body.accountId,
 
         serviceId:
-          body.serviceId ||
-          body.provider,
+          body.serviceId,
 
         amountKobo:
           body.amountKobo,
@@ -570,8 +621,6 @@ router.post(
         );
 
       /*
-       * THIS CHECK WAS MISSING IN THE OLD CODE.
-       *
        * validateBettingRequest() returns a result object,
        * not the validated data itself.
        */
@@ -590,6 +639,23 @@ router.post(
        */
       const data =
         validation.data;
+
+      /*
+       * Defensive check so a malformed validator result
+       * cannot reach the funding service.
+       */
+      if (
+        !data ||
+        !data.provider ||
+        !data.serviceId ||
+        !data.customerId ||
+        !Number.isInteger(data.amountKobo)
+      ) {
+        return res.status(400).json({
+          success: false,
+          error: "Invalid betting request",
+        });
+      }
 
       const transaction =
         await purchaseBettingAccount({
