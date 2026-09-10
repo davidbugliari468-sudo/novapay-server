@@ -102,6 +102,25 @@ const {
 } = require("./add-money/paystack/webhook");
 
 
+// =====================================================
+// KYC ROUTES
+// =====================================================
+//
+// KYC endpoints:
+//
+//     POST /api/kyc/nin
+//     POST /api/kyc/bvn
+//     GET  /api/kyc/status
+//
+// The KYC routes communicate with BabsPay only from
+// the NovaPay backend. The BabsPay API key is therefore
+// never exposed to the browser.
+// =====================================================
+
+const kycRoutes =
+  require("./kyc/routes");
+
+
 const app =
   express();
 
@@ -455,6 +474,30 @@ app.use(
 app.use(
   "/api/electricity",
   electricityRoutes
+);
+
+
+// =====================================================
+// KYC
+// =====================================================
+//
+// Identity verification:
+//
+//     POST /api/kyc/nin
+//     POST /api/kyc/bvn
+//     GET  /api/kyc/status
+//
+// Authentication, email verification, validation,
+// KYC-specific rate limiting, provider communication,
+// and tier upgrades are handled inside kyc/routes.js
+// and kyc/service.js.
+//
+// The BabsPay API key never reaches the browser.
+// =====================================================
+
+app.use(
+  "/api/kyc",
+  kycRoutes
 );
 
 
@@ -1619,6 +1662,7 @@ app.listen(
           tvBatchSize
 
       }
+
     );
 
 
