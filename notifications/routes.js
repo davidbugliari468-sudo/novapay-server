@@ -10,8 +10,12 @@ const {
     getUnreadCount,
     markNotificationRead,
     markAllNotificationsRead,
+
     registerDeviceToken,
-    removeDeviceToken
+    removeDeviceToken,
+
+    registerPushSubscription,
+    removePushSubscription
 } = require("./service");
 
 const router = express.Router();
@@ -23,16 +27,11 @@ const router = express.Router();
 //
 // POST /api/notifications
 //
-// Creates a notification for the authenticated user.
+// Creates an in-app notification for the authenticated
+// user and optionally sends a push notification.
 //
 // The frontend NEVER supplies a UID.
 // req.user.uid is always used.
-//
-// body/message are both accepted for compatibility.
-// The notification service stores the final value as
-// "body".
-//
-// sendPush defaults to true.
 // =====================================================
 
 router.post(
@@ -141,8 +140,8 @@ router.post(
 // ?limit=30
 // ?cursor=<cursor>
 //
-// The authenticated Firebase UID determines which
-// user's notifications are returned.
+// Returns notification history belonging only to the
+// authenticated user.
 // =====================================================
 
 router.get(
@@ -153,19 +152,18 @@ router.get(
         try {
 
             const result =
-                await getUserNotifications(
+                await getUserNotifications({
 
-                    req.user.uid,
+                    userId:
+                        req.user.uid,
 
-                    {
-                        limit:
-                            req.query.limit,
+                    limit:
+                        req.query.limit,
 
-                        cursor:
-                            req.query.cursor
-                    }
+                    cursor:
+                        req.query.cursor
 
-                );
+                });
 
 
             return res.status(200).json({
@@ -243,7 +241,7 @@ router.get(
 
         try {
 
-            const count =
+            const result =
                 await getUnreadCount(
                     req.user.uid
                 );
@@ -253,7 +251,8 @@ router.get(
 
                 success: true,
 
-                count,
+                count:
+                    result.count ?? 0,
 
                 requestId:
                     req.requestId
@@ -406,13 +405,14 @@ router.patch(
 
 
             const result =
-                await markNotificationRead(
+                await markNotificationRead({
 
-                    req.user.uid,
+                    userId:
+                        req.user.uid,
 
                     notificationId
 
-                );
+                });
 
 
             return res.status(200).json({
@@ -465,13 +465,331 @@ router.patch(
 
 
 // =====================================================
-// REGISTER DEVICE TOKEN
+// GET WEB PUSH PUBLIC KEY
+// =====================================================
+//
+// GET /api/notifications/push-public-key
+//
+// The browser needs the VAPID public key to create its
+// Web Push subscription.
+//
+// The private key is NEVER returned to the browser.
+// =====================================================
+
+router.get(
+    "/push-public-key",
+    requireAuth,
+    async (req, res) => {
+
+        try {
+
+            const publicKey =
+                String(
+                    process.env.WEB_PUSH_VAPID_PUBLIC_KEY ||
+                    ""
+                ).trim();
+
+
+            if (!publicKey) {
+
+                return res.status(503).json({
+
+                    success: false,
+
+                    error:
+                        "Web Push public key is not configured.",
+
+                    requestId:
+                        req.requestId
+
+                });
+
+            }
+
+
+            return res.status(200).json({
+
+                success: true,
+
+                publicKey,
+
+                requestId:
+                    req.requestId
+
+            });
+
+        }
+
+        catch (error) {
+
+            console.error(
+                "NovaPay get Web Push public key error:",
+                {
+                    requestId:
+                        req.requestId,
+
+                    uid:
+                        req.user?.uid,
+
+                    error:
+                        error.message
+                }
+            );
+
+
+            return res.status(500).json({
+
+                success: false,
+
+                error:
+                    "Unable to get Web Push configuration.",
+
+                requestId:
+                    req.requestId
+
+            });
+
+        }
+
+    }
+);
+
+
+// =====================================================
+// REGISTER WEB PUSH SUBSCRIPTION
+// =====================================================
+//
+// POST /api/notifications/push-subscription
+//
+// Expected body:
+//
+// {
+//     subscription: {
+//         endpoint: "...",
+//         keys: {
+//             p256dh: "...",
+//             auth: "..."
+//         }
+//     },
+//     platform: "ios" | "android" | "desktop" | "web"
+// }
+//
+// The UID always comes from authenticated Firebase auth.
+// =====================================================
+
+router.post(
+    "/push-subscription",
+    requireAuth,
+    async (req, res) => {
+
+        try {
+
+            const {
+                subscription,
+                platform
+            } = req.body || {};
+
+
+            if (
+                !subscription ||
+                typeof subscription !== "object"
+            ) {
+
+                return res.status(400).json({
+
+                    success: false,
+
+                    error:
+                        "A valid push subscription is required.",
+
+                    requestId:
+                        req.requestId
+
+                });
+
+            }
+
+
+            const result =
+                await registerPushSubscription({
+
+                    userId:
+                        req.user.uid,
+
+                    subscription,
+
+                    platform
+
+                });
+
+
+            return res.status(201).json({
+
+                success: true,
+
+                ...result,
+
+                requestId:
+                    req.requestId
+
+            });
+
+        }
+
+        catch (error) {
+
+            console.error(
+                "NovaPay register Web Push subscription error:",
+                {
+                    requestId:
+                        req.requestId,
+
+                    uid:
+                        req.user?.uid,
+
+                    error:
+                        error.message
+                }
+            );
+
+
+            return res.status(400).json({
+
+                success: false,
+
+                error:
+                    error?.message ||
+                    "Unable to register push subscription.",
+
+                requestId:
+                    req.requestId
+
+            });
+
+        }
+
+    }
+);
+
+
+// =====================================================
+// REMOVE WEB PUSH SUBSCRIPTION
+// =====================================================
+//
+// DELETE /api/notifications/push-subscription
+//
+// Expected body:
+//
+// {
+//     subscription: {
+//         endpoint: "...",
+//         keys: {
+//             p256dh: "...",
+//             auth: "..."
+//         }
+//     }
+// }
+// =====================================================
+
+router.delete(
+    "/push-subscription",
+    requireAuth,
+    async (req, res) => {
+
+        try {
+
+            const subscription =
+                req.body?.subscription ||
+                null;
+
+
+            if (
+                !subscription ||
+                typeof subscription !== "object"
+            ) {
+
+                return res.status(400).json({
+
+                    success: false,
+
+                    error:
+                        "A valid push subscription is required.",
+
+                    requestId:
+                        req.requestId
+
+                });
+
+            }
+
+
+            const result =
+                await removePushSubscription({
+
+                    userId:
+                        req.user.uid,
+
+                    subscription
+
+                });
+
+
+            return res.status(200).json({
+
+                success: true,
+
+                ...result,
+
+                requestId:
+                    req.requestId
+
+            });
+
+        }
+
+        catch (error) {
+
+            console.error(
+                "NovaPay remove Web Push subscription error:",
+                {
+                    requestId:
+                        req.requestId,
+
+                    uid:
+                        req.user?.uid,
+
+                    error:
+                        error.message
+                }
+            );
+
+
+            return res.status(400).json({
+
+                success: false,
+
+                error:
+                    error?.message ||
+                    "Unable to remove push subscription.",
+
+                requestId:
+                    req.requestId
+
+            });
+
+        }
+
+    }
+);
+
+
+// =====================================================
+// REGISTER LEGACY FCM DEVICE TOKEN
 // =====================================================
 //
 // POST /api/notifications/device-token
 //
-// Stores an FCM registration token for the authenticated
-// user's device.
+// Kept for compatibility with the existing FCM system.
 // =====================================================
 
 router.post(
@@ -488,15 +806,16 @@ router.post(
 
 
             const result =
-                await registerDeviceToken(
+                await registerDeviceToken({
 
-                    req.user.uid,
+                    userId:
+                        req.user.uid,
 
                     token,
 
                     platform
 
-                );
+                });
 
 
             return res.status(201).json({
@@ -549,7 +868,7 @@ router.post(
 
 
 // =====================================================
-// REMOVE DEVICE TOKEN
+// REMOVE LEGACY FCM DEVICE TOKEN
 // =====================================================
 //
 // DELETE /api/notifications/device-token
@@ -577,13 +896,14 @@ router.delete(
 
 
             const result =
-                await removeDeviceToken(
+                await removeDeviceToken({
 
-                    req.user.uid,
+                    userId:
+                        req.user.uid,
 
                     token
 
-                );
+                });
 
 
             return res.status(200).json({

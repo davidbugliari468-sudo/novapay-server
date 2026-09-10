@@ -1,2009 +1,1396 @@
-/* =========================================================
-   NOVAPAY — NOTIFICATION SERVICE
-   =========================================================
-   Responsibilities:
-   - Create backend-controlled in-app notifications
-   - Send Firebase Cloud Messaging push notifications
-   - Store notifications under the authenticated user's account
-   - Register/remove user device tokens
-   - Retrieve only the authenticated user's notifications
-   - Mark notifications as read
-   - Mark all notifications as read
-   - Remove invalid FCM tokens
-   - Support trusted backend notification helpers
-
-   FIRESTORE STRUCTURE
-
-   users/{uid}/notifications/{notificationId}
-
-   notificationTokens/{uid}/tokens/{tokenId}
-
-   IMPORTANT:
-   - Browser requests must NEVER decide notification ownership.
-   - Trusted backend services supply userId.
-   - Client-facing routes must obtain userId from verified Firebase Auth.
-   ========================================================= */
-
 const crypto = require("crypto");
+const { db } = require("../firebase-admin");
+const { getMessaging } = require("firebase-admin/messaging");
 
-const {
-    db
-} = require("../firebase-admin");
+/*
+|--------------------------------------------------------------------------
+| Configuration
+|--------------------------------------------------------------------------
+*/
 
-const {
-    getMessaging
-} = require("firebase-admin/messaging");
+const MAX_TITLE_LENGTH = 120;
+const MAX_BODY_LENGTH = 500;
+const MAX_DATA_KEYS = 20;
+const MAX_DATA_VALUE_LENGTH = 1000;
+const MAX_TOKENS_PER_USER = 10;
+const MAX_NOTIFICATIONS_PER_PAGE = 50;
 
+const ALLOWED_TYPES = new Set([
+    "transaction",
+    "security",
+    "account",
+    "promotion",
+    "system",
+    "payment",
+    "wallet",
+    "airtime",
+    "data",
+    "electricity",
+    "tv",
+    "add_money",
+    "failed",
+    "reversed",
+    "refund"
+]);
 
-/* =========================================================
-   FIREBASE MESSAGING
-   ========================================================= */
+const NOTIFICATIONS_COLLECTION = "notifications";
+const FCM_TOKENS_COLLECTION = "notificationTokens";
+const WEB_PUSH_COLLECTION = "notificationPushSubscriptions";
 
-const messaging =
-    getMessaging();
+/*
+|--------------------------------------------------------------------------
+| Web Push
+|--------------------------------------------------------------------------
+*/
 
+let webPush = null;
+let webPushLoadAttempted = false;
 
-/* =========================================================
-   COLLECTIONS
-   ========================================================= */
-
-const USERS_COLLECTION =
-    "users";
-
-const NOTIFICATIONS_SUBCOLLECTION =
-    "notifications";
-
-const DEVICE_TOKENS_COLLECTION =
-    "notificationTokens";
-
-const DEVICE_TOKENS_SUBCOLLECTION =
-    "tokens";
-
-
-/* =========================================================
-   LIMITS
-   ========================================================= */
-
-const MAX_TITLE_LENGTH =
-    120;
-
-const MAX_BODY_LENGTH =
-    500;
-
-const MAX_DATA_KEYS =
-    20;
-
-const MAX_DATA_VALUE_LENGTH =
-    1000;
-
-const MAX_DEVICE_TOKENS_PER_USER =
-    10;
-
-const MAX_NOTIFICATIONS_PER_PAGE =
-    50;
-
-
-/* =========================================================
-   SUPPORTED TYPES
-   ========================================================= */
-
-const ALLOWED_TYPES =
-    new Set([
-
-        "transaction",
-
-        "security",
-
-        "account",
-
-        "promotion",
-
-        "system",
-
-        "payment",
-
-        "wallet"
-
-    ]);
-
-
-/* =========================================================
-   INTERNAL HELPERS
-   ========================================================= */
-
-/**
- * Generates a cryptographically strong notification ID.
- */
-function createNotificationId() {
-
-    return crypto.randomUUID();
-
-}
-
-
-/**
- * Safely converts a value into a trimmed string.
- */
-function safeString(
-    value
-) {
-
-    if (
-        value === undefined ||
-        value === null
-    ) {
-
-        return "";
-
+function getWebPush() {
+    if (webPushLoadAttempted) {
+        return webPush;
     }
 
-    return String(
-        value
+    webPushLoadAttempted = true;
+
+    try {
+        webPush = require("web-push");
+    } catch (error) {
+        console.error(
+            "Web Push dependency is not installed. Run: npm install web-push"
+        );
+        webPush = null;
+    }
+
+    return webPush;
+}
+
+function configureWebPush() {
+    const library = getWebPush();
+
+    if (!library) {
+        return false;
+    }
+
+    const subject = String(
+        process.env.WEB_PUSH_VAPID_SUBJECT || ""
     ).trim();
 
-}
+    const publicKey = String(
+        process.env.WEB_PUSH_VAPID_PUBLIC_KEY || ""
+    ).trim();
 
+    const privateKey = String(
+        process.env.WEB_PUSH_VAPID_PRIVATE_KEY || ""
+    ).trim();
 
-/**
- * Restricts a string to a maximum length.
- */
-function limitString(
-    value,
-    maxLength
-) {
+    if (!subject || !publicKey || !privateKey) {
+        console.warn(
+            "Web Push is not configured. Missing WEB_PUSH_VAPID_SUBJECT, WEB_PUSH_VAPID_PUBLIC_KEY or WEB_PUSH_VAPID_PRIVATE_KEY."
+        );
 
-    return safeString(
-        value
-    ).slice(
-        0,
-        maxLength
-    );
-
-}
-
-
-/**
- * Normalizes notification type.
- */
-function normalizeType(
-    type
-) {
-
-    const normalized =
-        safeString(
-            type
-        )
-            .toLowerCase();
-
-
-    if (
-        ALLOWED_TYPES.has(
-            normalized
-        )
-    ) {
-
-        return normalized;
-
+        return false;
     }
 
+    try {
+        library.setVapidDetails(
+            subject,
+            publicKey,
+            privateKey
+        );
+
+        return true;
+    } catch (error) {
+        console.error(
+            "Failed to configure Web Push:",
+            error.message
+        );
+
+        return false;
+    }
+}
+
+/*
+|--------------------------------------------------------------------------
+| Helpers
+|--------------------------------------------------------------------------
+*/
+
+function normalizeString(value, maxLength) {
+    return String(value ?? "")
+        .trim()
+        .slice(0, maxLength);
+}
+
+function normalizeNotificationType(type) {
+    const normalized = normalizeString(type, 50).toLowerCase();
+
+    if (ALLOWED_TYPES.has(normalized)) {
+        return normalized;
+    }
 
     return "system";
-
 }
 
-
-/**
- * Normalizes FCM data.
- *
- * Firebase Cloud Messaging data values must be strings.
- */
-function normalizeData(
-    data
-) {
-
-    if (
-        !data ||
-        typeof data !== "object" ||
-        Array.isArray(data)
-    ) {
-
+function normalizeData(data) {
+    if (!data || typeof data !== "object" || Array.isArray(data)) {
         return {};
-
     }
 
-
     const result = {};
+    const entries = Object.entries(data).slice(0, MAX_DATA_KEYS);
 
-    const entries =
-        Object.entries(
-            data
-        )
-            .slice(
-                0,
-                MAX_DATA_KEYS
-            );
+    for (const [key, value] of entries) {
+        const normalizedKey = normalizeString(key, 100);
 
-
-    for (
-        const [key, value]
-        of entries
-    ) {
-
-        const safeKey =
-            limitString(
-                key,
-                100
-            );
-
-
-        if (!safeKey) {
-
+        if (!normalizedKey) {
             continue;
-
         }
-
-
-        if (
-            value === undefined ||
-            value === null
-        ) {
-
-            continue;
-
-        }
-
 
         let normalizedValue;
 
-
         if (
-            typeof value === "string"
+            typeof value === "string" ||
+            typeof value === "number" ||
+            typeof value === "boolean"
         ) {
-
-            normalizedValue =
-                value;
-
+            normalizedValue = String(value);
         } else {
-
             try {
-
-                normalizedValue =
-                    JSON.stringify(
-                        value
-                    );
-
+                normalizedValue = JSON.stringify(value);
+            } catch {
+                normalizedValue = "";
             }
-
-            catch {
-
-                normalizedValue =
-                    String(
-                        value
-                    );
-
-            }
-
         }
 
-
-        result[safeKey] =
-            limitString(
-                normalizedValue,
-                MAX_DATA_VALUE_LENGTH
-            );
-
+        result[normalizedKey] = normalizedValue.slice(
+            0,
+            MAX_DATA_VALUE_LENGTH
+        );
     }
-
 
     return result;
-
 }
 
+function createNotificationId() {
+    return crypto.randomUUID();
+}
 
-/**
- * Removes undefined object properties.
- */
-function removeUndefined(
-    object
-) {
+function normalizePushSubscription(subscription) {
+    if (!subscription || typeof subscription !== "object") {
+        return null;
+    }
 
-    return Object.fromEntries(
-
-        Object.entries(
-            object
-        )
-            .filter(
-                ([, value]) =>
-                    value !== undefined
-            )
-
+    const endpoint = normalizeString(
+        subscription.endpoint,
+        2000
     );
 
-}
+    const keys =
+        subscription.keys &&
+        typeof subscription.keys === "object"
+            ? subscription.keys
+            : {};
 
+    const p256dh = normalizeString(
+        keys.p256dh,
+        1000
+    );
 
-/**
- * Returns a user's notification collection.
- *
- * Ownership is structural because notifications live
- * underneath the user's own Firestore document.
- */
-function notificationCollection(
-    userId
-) {
+    const auth = normalizeString(
+        keys.auth,
+        1000
+    );
 
-    const normalizedUserId =
-        safeString(
-            userId
-        );
-
-
-    if (!normalizedUserId) {
-
-        throw new Error(
-            "Notification user ID is required."
-        );
-
+    if (!endpoint || !p256dh || !auth) {
+        return null;
     }
 
-
-    return db
-        .collection(
-            USERS_COLLECTION
-        )
-        .doc(
-            normalizedUserId
-        )
-        .collection(
-            NOTIFICATIONS_SUBCOLLECTION
-        );
-
+    return {
+        endpoint,
+        expirationTime:
+            subscription.expirationTime == null
+                ? null
+                : Number(subscription.expirationTime),
+        keys: {
+            p256dh,
+            auth
+        }
+    };
 }
 
+/*
+|--------------------------------------------------------------------------
+| Create In-App Notification
+|--------------------------------------------------------------------------
+*/
 
-/**
- * Returns one user's notification reference.
- */
-function notificationRef(
+async function createNotification({
     userId,
-    notificationId
-) {
-
-    const normalizedNotificationId =
-        safeString(
-            notificationId
-        );
-
-
-    if (
-        !normalizedNotificationId ||
-        normalizedNotificationId.length > 200 ||
-        normalizedNotificationId.includes("/") ||
-        normalizedNotificationId.includes("\\")
-    ) {
-
-        throw new Error(
-            "Invalid notification ID."
-        );
-
+    type,
+    title,
+    body,
+    message,
+    data = {},
+    sendPush = true
+}) {
+    if (!userId) {
+        throw new Error("userId is required.");
     }
 
+    const normalizedType = normalizeNotificationType(type);
 
-    return notificationCollection(
-        userId
-    )
-        .doc(
-            normalizedNotificationId
-        );
+    const normalizedTitle = normalizeString(
+        title || "NovaPay",
+        MAX_TITLE_LENGTH
+    );
 
-}
+    const normalizedBody = normalizeString(
+        body || message || "You have a new notification.",
+        MAX_BODY_LENGTH
+    );
 
+    const normalizedData = normalizeData(data);
 
-/**
- * Returns the device-token collection for a user.
- */
-function userTokenCollection(
-    userId
-) {
+    const notificationId = createNotificationId();
 
-    const normalizedUserId =
-        safeString(
-            userId
-        );
-
-
-    if (!normalizedUserId) {
-
-        throw new Error(
-            "Notification user ID is required."
-        );
-
-    }
-
-
-    return db
-        .collection(
-            DEVICE_TOKENS_COLLECTION
-        )
-        .doc(
-            normalizedUserId
-        )
-        .collection(
-            DEVICE_TOKENS_SUBCOLLECTION
-        );
-
-}
-
-
-/* =========================================================
-   CREATE IN-APP NOTIFICATION
-   ========================================================= */
-
-/**
- * Creates an in-app notification.
- *
- * ONLY trusted backend code should call this function.
- */
-async function createNotification(
-    {
-        userId,
-        type = "system",
-        title,
-        body,
-        data = {},
-        sendPush = true
-    }
-) {
-
-    const normalizedUserId =
-        safeString(
-            userId
-        );
-
-
-    if (!normalizedUserId) {
-
-        throw new Error(
-            "Notification user ID is required."
-        );
-
-    }
-
-
-    const normalizedTitle =
-        limitString(
-            title,
-            MAX_TITLE_LENGTH
-        );
-
-
-    const normalizedBody =
-        limitString(
-            body,
-            MAX_BODY_LENGTH
-        );
-
-
-    if (!normalizedTitle) {
-
-        throw new Error(
-            "Notification title is required."
-        );
-
-    }
-
-
-    if (!normalizedBody) {
-
-        throw new Error(
-            "Notification body is required."
-        );
-
-    }
-
-
-    const notificationId =
-        createNotificationId();
-
-
-    const normalizedType =
-        normalizeType(
-            type
-        );
-
-
-    const normalizedData =
-        normalizeData(
-            data
-        );
-
-
-    const now =
-        new Date();
-
+    const notificationRef = db
+        .collection("users")
+        .doc(userId)
+        .collection(NOTIFICATIONS_COLLECTION)
+        .doc(notificationId);
 
     const notification = {
-
-        id:
-            notificationId,
-
-        type:
-            normalizedType,
-
-        title:
-            normalizedTitle,
-
-        body:
-            normalizedBody,
-
-        data:
-            normalizedData,
-
-        read:
-            false,
-
-        createdAt:
-            now,
-
-        updatedAt:
-            now
-
+        id: notificationId,
+        type: normalizedType,
+        title: normalizedTitle,
+        body: normalizedBody,
+        message: normalizedBody,
+        data: normalizedData,
+        isRead: false,
+        createdAt: new Date()
     };
 
-
-    const ref =
-        notificationRef(
-            normalizedUserId,
-            notificationId
-        );
-
-
-    /*
-     * Ownership is represented by the Firestore path:
-     *
-     * users/{uid}/notifications/{notificationId}
-     *
-     * The userId is therefore not exposed as a mutable
-     * client-controlled notification field.
-     */
-    await ref.create(
-        notification
-    );
-
+    await notificationRef.set(notification);
 
     let pushResult = {
-
-        attempted:
-            false,
-
-        sent:
-            0,
-
-        failed:
-            0
-
+        attempted: false,
+        sent: 0,
+        failed: 0
     };
 
-
-    if (sendPush) {
-
+    if (sendPush === true) {
         try {
-
-            pushResult =
-                await sendPushNotification(
-                    normalizedUserId,
-                    {
-
-                        title:
-                            normalizedTitle,
-
-                        body:
-                            normalizedBody,
-
-                        data:
-                            {
-
-                                notificationId,
-
-                                type:
-                                    normalizedType,
-
-                                ...normalizedData
-
-                            }
-
-                    }
-                );
-
-        }
-
-        catch (pushError) {
-
-            /*
-             * The in-app notification has already been
-             * stored successfully.
-             *
-             * A temporary push-service problem must not
-             * erase the user's transaction notification.
-             */
+            pushResult = await sendPushNotification({
+                userId,
+                notificationId,
+                type: normalizedType,
+                title: normalizedTitle,
+                body: normalizedBody,
+                data: normalizedData
+            });
+        } catch (error) {
             console.error(
-                "NovaPay push notification error:",
-                {
-                    userId:
-                        normalizedUserId,
-
-                    notificationId,
-
-                    error:
-                        pushError.message
-                }
+                "Push notification failed:",
+                error.message
             );
 
             pushResult = {
-
-                attempted:
-                    true,
-
-                sent:
-                    0,
-
-                failed:
-                    0,
-
-                error:
-                    "Push notification delivery failed."
-
+                attempted: true,
+                sent: 0,
+                failed: 1,
+                error: error.message
             };
-
         }
-
     }
-
 
     return {
-
-        ...notification,
-
-        push:
-            pushResult
-
+        success: true,
+        notification: {
+            ...notification,
+            createdAt: notification.createdAt.toISOString()
+        },
+        push: pushResult
     };
-
 }
 
+/*
+|--------------------------------------------------------------------------
+| Send Push Notification
+|--------------------------------------------------------------------------
+*/
 
-/* =========================================================
-   SEND PUSH NOTIFICATION
-   ========================================================= */
-
-/**
- * Sends an FCM notification to all registered devices
- * belonging to the supplied authenticated user.
- */
-async function sendPushNotification(
+async function sendPushNotification({
     userId,
-    {
-        title,
-        body,
-        data = {}
-    }
-) {
+    notificationId,
+    type,
+    title,
+    body,
+    data = {}
+}) {
+    const results = {
+        attempted: true,
+        webPush: {
+            attempted: false,
+            sent: 0,
+            failed: 0
+        },
+        fcm: {
+            attempted: false,
+            sent: 0,
+            failed: 0
+        },
+        sent: 0,
+        failed: 0
+    };
 
-    const normalizedUserId =
-        safeString(
-            userId
+    try {
+        const webPushResult = await sendWebPushNotification({
+            userId,
+            notificationId,
+            type,
+            title,
+            body,
+            data
+        });
+
+        results.webPush = webPushResult;
+    } catch (error) {
+        console.error(
+            "Standard Web Push error:",
+            error.message
         );
 
-
-    if (!normalizedUserId) {
-
-        return {
-
-            attempted:
-                false,
-
-            sent:
-                0,
-
-            failed:
-                0
-
+        results.webPush = {
+            attempted: true,
+            sent: 0,
+            failed: 1,
+            error: error.message
         };
-
     }
 
+    try {
+        const fcmResult = await sendLegacyFCMNotification({
+            userId,
+            notificationId,
+            type,
+            title,
+            body,
+            data
+        });
 
-    const tokenSnapshot =
-        await userTokenCollection(
-            normalizedUserId
-        )
-            .get();
+        results.fcm = fcmResult;
+    } catch (error) {
+        console.error(
+            "Legacy FCM error:",
+            error.message
+        );
 
-
-    if (
-        tokenSnapshot.empty
-    ) {
-
-        return {
-
-            attempted:
-                false,
-
-            sent:
-                0,
-
-            failed:
-                0
-
+        results.fcm = {
+            attempted: true,
+            sent: 0,
+            failed: 1,
+            error: error.message
         };
-
     }
 
+    results.sent =
+        results.webPush.sent +
+        results.fcm.sent;
 
-    const uniqueTokens =
-        [
-            ...new Set(
+    results.failed =
+        results.webPush.failed +
+        results.fcm.failed;
 
-                tokenSnapshot.docs
-                    .map(
-                        doc =>
-                            safeString(
-                                doc.data()?.token
-                            )
-                    )
-                    .filter(
-                        Boolean
-                    )
+    return results;
+}
 
-            )
-        ];
+/*
+|--------------------------------------------------------------------------
+| Standard Web Push
+|--------------------------------------------------------------------------
+*/
 
+async function sendWebPushNotification({
+    userId,
+    notificationId,
+    type,
+    title,
+    body,
+    data = {}
+}) {
+    const library = getWebPush();
 
-    if (
-        uniqueTokens.length === 0
-    ) {
-
+    if (!library) {
         return {
-
-            attempted:
-                false,
-
-            sent:
-                0,
-
-            failed:
-                0
-
+            attempted: false,
+            sent: 0,
+            failed: 0,
+            error: "Web Push dependency is not installed."
         };
-
     }
 
+    if (!configureWebPush()) {
+        return {
+            attempted: false,
+            sent: 0,
+            failed: 0,
+            error: "Web Push is not configured."
+        };
+    }
 
-    /*
-     * Firebase multicast messages support a maximum
-     * number of registration tokens per request.
-     *
-     * We already cap each user at 10 devices, so one
-     * multicast request is sufficient.
-     */
-    const response =
-        await messaging
-            .sendEachForMulticast({
+    const snapshot = await db
+        .collection(WEB_PUSH_COLLECTION)
+        .doc(userId)
+        .collection("subscriptions")
+        .limit(MAX_TOKENS_PER_USER)
+        .get();
 
-                tokens:
-                    uniqueTokens,
+    if (snapshot.empty) {
+        return {
+            attempted: false,
+            sent: 0,
+            failed: 0,
+            error: "No Web Push subscriptions found."
+        };
+    }
 
-                notification: {
+    const payload = JSON.stringify({
+        notification: {
+            title,
+            body,
+            icon: "/icon-192.png",
+            badge: "/icon-192.png",
+            tag: notificationId,
+            data: {
+                notificationId,
+                type,
+                ...data
+            }
+        },
+        data: {
+            notificationId,
+            type,
+            ...data
+        }
+    });
 
-                    title:
-                        limitString(
-                            title,
-                            MAX_TITLE_LENGTH
-                        ),
+    let sent = 0;
+    let failed = 0;
 
-                    body:
-                        limitString(
-                            body,
-                            MAX_BODY_LENGTH
-                        )
+    for (const document of snapshot.docs) {
+        const subscriptionRecord = document.data();
 
-                },
+        const subscription =
+            subscriptionRecord.subscription;
 
-                data:
-                    normalizeData(
-                        data
-                    ),
+        if (!subscription) {
+            failed += 1;
+            continue;
+        }
 
-                android: {
-
-                    priority:
-                        "high",
-
-                    notification: {
-
-                        channelId:
-                            "novapay_default",
-
-                        sound:
-                            "default"
-
-                    }
-
-                },
-
-                apns: {
-
-                    payload: {
-
-                        aps: {
-
-                            sound:
-                                "default",
-
-                            badge:
-                                1
-
-                        }
-
-                    }
-
+        try {
+            await library.sendNotification(
+                subscription,
+                payload,
+                {
+                    TTL: 60 * 60 * 24
                 }
+            );
 
-            });
+            sent += 1;
+        } catch (error) {
+            failed += 1;
 
+            const statusCode =
+                Number(error.statusCode) || 0;
 
-    const invalidTokenPromises = [];
+            console.error(
+                "Web Push delivery failed:",
+                {
+                    userId,
+                    subscriptionId: document.id,
+                    statusCode,
+                    message: error.message
+                }
+            );
 
+            if (
+                statusCode === 404 ||
+                statusCode === 410
+            ) {
+                await document.ref.delete().catch(
+                    deleteError => {
+                        console.error(
+                            "Failed to remove expired Web Push subscription:",
+                            deleteError.message
+                        );
+                    }
+                );
+            }
+        }
+    }
+
+    return {
+        attempted: true,
+        sent,
+        failed
+    };
+}
+
+/*
+|--------------------------------------------------------------------------
+| Register Web Push Subscription
+|--------------------------------------------------------------------------
+*/
+
+async function registerPushSubscription({
+    userId,
+    subscription,
+    platform = "web"
+}) {
+    if (!userId) {
+        throw new Error("userId is required.");
+    }
+
+    const normalizedSubscription =
+        normalizePushSubscription(subscription);
+
+    if (!normalizedSubscription) {
+        throw new Error(
+            "A valid Web Push subscription is required."
+        );
+    }
+
+    const endpointHash = crypto
+        .createHash("sha256")
+        .update(normalizedSubscription.endpoint)
+        .digest("hex");
+
+    const subscriptionRef = db
+        .collection(WEB_PUSH_COLLECTION)
+        .doc(userId)
+        .collection("subscriptions")
+        .doc(endpointHash);
+
+    await subscriptionRef.set(
+        {
+            subscription: normalizedSubscription,
+            platform: normalizeString(
+                platform,
+                50
+            ) || "web",
+            endpoint: normalizedSubscription.endpoint,
+            updatedAt: new Date()
+        },
+        {
+            merge: true
+        }
+    );
+
+    return {
+        success: true,
+        subscriptionId: endpointHash
+    };
+}
+
+/*
+|--------------------------------------------------------------------------
+| Remove Web Push Subscription
+|--------------------------------------------------------------------------
+*/
+
+async function removePushSubscription({
+    userId,
+    subscription
+}) {
+    if (!userId) {
+        throw new Error("userId is required.");
+    }
+
+    const normalizedSubscription =
+        normalizePushSubscription(subscription);
+
+    if (!normalizedSubscription) {
+        throw new Error(
+            "A valid Web Push subscription is required."
+        );
+    }
+
+    const endpointHash = crypto
+        .createHash("sha256")
+        .update(normalizedSubscription.endpoint)
+        .digest("hex");
+
+    await db
+        .collection(WEB_PUSH_COLLECTION)
+        .doc(userId)
+        .collection("subscriptions")
+        .doc(endpointHash)
+        .delete();
+
+    return {
+        success: true
+    };
+}
+
+async function removePushSubscriptionById({
+    userId,
+    subscriptionId
+}) {
+    if (!userId) {
+        throw new Error("userId is required.");
+    }
+
+    const normalizedId = normalizeString(
+        subscriptionId,
+        200
+    );
+
+    if (!normalizedId) {
+        throw new Error(
+            "subscriptionId is required."
+        );
+    }
+
+    await db
+        .collection(WEB_PUSH_COLLECTION)
+        .doc(userId)
+        .collection("subscriptions")
+        .doc(normalizedId)
+        .delete();
+
+    return {
+        success: true
+    };
+}
+
+async function removeAllPushSubscriptions(userId) {
+    if (!userId) {
+        throw new Error("userId is required.");
+    }
+
+    const collectionRef = db
+        .collection(WEB_PUSH_COLLECTION)
+        .doc(userId)
+        .collection("subscriptions");
+
+    const snapshot = await collectionRef.get();
+
+    if (snapshot.empty) {
+        return {
+            success: true,
+            removed: 0
+        };
+    }
+
+    const batch = db.batch();
+
+    snapshot.docs.forEach(document => {
+        batch.delete(document.ref);
+    });
+
+    await batch.commit();
+
+    return {
+        success: true,
+        removed: snapshot.size
+    };
+}
+
+/*
+|--------------------------------------------------------------------------
+| Legacy Firebase Cloud Messaging
+|--------------------------------------------------------------------------
+*/
+
+async function sendLegacyFCMNotification({
+    userId,
+    notificationId,
+    type,
+    title,
+    body,
+    data = {}
+}) {
+    const snapshot = await db
+        .collection(FCM_TOKENS_COLLECTION)
+        .doc(userId)
+        .collection("tokens")
+        .limit(MAX_TOKENS_PER_USER)
+        .get();
+
+    if (snapshot.empty) {
+        return {
+            attempted: false,
+            sent: 0,
+            failed: 0,
+            error: "No FCM tokens found."
+        };
+    }
+
+    const tokens = snapshot.docs
+        .map(document => document.data()?.token)
+        .filter(Boolean);
+
+    if (!tokens.length) {
+        return {
+            attempted: false,
+            sent: 0,
+            failed: 0,
+            error: "No valid FCM tokens found."
+        };
+    }
+
+    const messaging = getMessaging();
+
+    const stringData = {
+        notificationId: String(notificationId),
+        type: String(type),
+        ...normalizeData(data)
+    };
+
+    const message = {
+        tokens,
+        notification: {
+            title,
+            body
+        },
+        data: stringData,
+        webpush: {
+            notification: {
+                title,
+                body,
+                icon: "/icon-192.png",
+                badge: "/icon-192.png"
+            },
+            fcmOptions: {
+                link: "/notifications.html"
+            }
+        }
+    };
+
+    const response =
+        await messaging.sendEachForMulticast(message);
+
+    const invalidTokens = [];
 
     response.responses.forEach(
         (result, index) => {
+            if (!result.success) {
+                const errorCode =
+                    result.error?.code || "";
 
-            if (
-                result.success
-            ) {
-
-                return;
-
-            }
-
-
-            const errorCode =
-                result.error?.code ||
-                "";
-
-
-            if (
-
-                errorCode ===
-                    "messaging/invalid-registration-token" ||
-
-                errorCode ===
-                    "messaging/registration-token-not-registered"
-
-            ) {
-
-                const token =
-                    uniqueTokens[index];
-
-
-                invalidTokenPromises.push(
-                    removeDeviceToken(
-                        normalizedUserId,
-                        token
+                if (
+                    errorCode.includes(
+                        "registration-token-not-registered"
+                    ) ||
+                    errorCode.includes(
+                        "invalid-registration-token"
                     )
-                );
-
+                ) {
+                    invalidTokens.push(
+                        tokens[index]
+                    );
+                }
             }
-
         }
     );
 
+    if (invalidTokens.length) {
+        const deleteBatch = db.batch();
 
-    await Promise.allSettled(
-        invalidTokenPromises
-    );
+        snapshot.docs.forEach(document => {
+            const token = document.data()?.token;
 
+            if (invalidTokens.includes(token)) {
+                deleteBatch.delete(document.ref);
+            }
+        });
+
+        await deleteBatch.commit();
+    }
 
     return {
-
-        attempted:
-            true,
-
-        sent:
-            response.successCount,
-
-        failed:
-            response.failureCount
-
+        attempted: true,
+        sent: response.successCount,
+        failed: response.failureCount
     };
-
 }
 
+/*
+|--------------------------------------------------------------------------
+| FCM Device Token Management
+|--------------------------------------------------------------------------
+*/
 
-/* =========================================================
-   REGISTER DEVICE TOKEN
-   ========================================================= */
-
-/**
- * Registers an FCM device token.
- *
- * The route calling this function MUST obtain userId
- * from verified Firebase Authentication.
- */
-async function registerDeviceToken(
+async function registerDeviceToken({
     userId,
     token,
-    platform = "unknown"
-) {
-
-    const normalizedUserId =
-        safeString(
-            userId
-        );
-
-
-    const normalizedToken =
-        safeString(
-            token
-        );
-
-
-    const normalizedPlatform =
-        limitString(
-            platform,
-            30
-        )
-            .toLowerCase();
-
-
-    if (!normalizedUserId) {
-
-        throw new Error(
-            "User ID is required."
-        );
-
+    platform = "web"
+}) {
+    if (!userId) {
+        throw new Error("userId is required.");
     }
 
+    const normalizedToken = normalizeString(
+        token,
+        4000
+    );
 
     if (!normalizedToken) {
-
-        throw new Error(
-            "Device token is required."
-        );
-
+        throw new Error("FCM token is required.");
     }
 
+    const tokenHash = crypto
+        .createHash("sha256")
+        .update(normalizedToken)
+        .digest("hex");
 
-    if (
-        normalizedToken.length < 20 ||
-        normalizedToken.length > 4096
-    ) {
+    const tokenRef = db
+        .collection(FCM_TOKENS_COLLECTION)
+        .doc(userId)
+        .collection("tokens")
+        .doc(tokenHash);
 
-        throw new Error(
-            "Invalid device token."
-        );
-
-    }
-
-
-    const tokenCollection =
-        userTokenCollection(
-            normalizedUserId
-        );
-
-
-    const existingSnapshot =
-        await tokenCollection
-            .where(
-                "token",
-                "==",
-                normalizedToken
-            )
-            .limit(1)
-            .get();
-
-
-    if (
-        !existingSnapshot.empty
-    ) {
-
-        const existingDoc =
-            existingSnapshot.docs[0];
-
-
-        await existingDoc.ref.set(
-
-            {
-
-                token:
-                    normalizedToken,
-
-                platform:
-                    normalizedPlatform ||
-                    "unknown",
-
-                updatedAt:
-                    new Date()
-
-            },
-
-            {
-                merge:
-                    true
-            }
-
-        );
-
-
-        return {
-
-            success:
-                true,
-
-            tokenId:
-                existingDoc.id
-
-        };
-
-    }
-
-
-    /*
-     * Keep device-token count bounded.
-     */
-    const currentSnapshot =
-        await tokenCollection
-            .orderBy(
-                "updatedAt",
-                "asc"
-            )
-            .get();
-
-
-    if (
-        currentSnapshot.size >=
-        MAX_DEVICE_TOKENS_PER_USER
-    ) {
-
-        const oldest =
-            currentSnapshot.docs[0];
-
-
-        if (oldest) {
-
-            await oldest.ref.delete();
-
+    await tokenRef.set(
+        {
+            token: normalizedToken,
+            platform: normalizeString(
+                platform,
+                50
+            ) || "web",
+            updatedAt: new Date()
+        },
+        {
+            merge: true
         }
-
-    }
-
-
-    const tokenId =
-        crypto.randomUUID();
-
-
-    const now =
-        new Date();
-
-
-    await tokenCollection
-        .doc(
-            tokenId
-        )
-        .create({
-
-            id:
-                tokenId,
-
-            token:
-                normalizedToken,
-
-            platform:
-                normalizedPlatform ||
-                "unknown",
-
-            createdAt:
-                now,
-
-            updatedAt:
-                now
-
-        });
-
+    );
 
     return {
-
-        success:
-            true,
-
-        tokenId
-
+        success: true,
+        tokenId: tokenHash
     };
-
 }
 
-
-/* =========================================================
-   REMOVE DEVICE TOKEN
-   ========================================================= */
-
-async function removeDeviceToken(
+async function removeDeviceToken({
     userId,
     token
-) {
-
-    const normalizedUserId =
-        safeString(
-            userId
-        );
-
-
-    const normalizedToken =
-        safeString(
-            token
-        );
-
-
-    if (
-        !normalizedUserId ||
-        !normalizedToken
-    ) {
-
-        return false;
-
+}) {
+    if (!userId) {
+        throw new Error("userId is required.");
     }
 
-
-    const snapshot =
-        await userTokenCollection(
-            normalizedUserId
-        )
-            .where(
-                "token",
-                "==",
-                normalizedToken
-            )
-            .get();
-
-
-    if (
-        snapshot.empty
-    ) {
-
-        return false;
-
-    }
-
-
-    const batch =
-        db.batch();
-
-
-    snapshot.docs.forEach(
-        doc => {
-
-            batch.delete(
-                doc.ref
-            );
-
-        }
+    const normalizedToken = normalizeString(
+        token,
+        4000
     );
 
+    if (!normalizedToken) {
+        throw new Error("FCM token is required.");
+    }
+
+    const tokenHash = crypto
+        .createHash("sha256")
+        .update(normalizedToken)
+        .digest("hex");
+
+    await db
+        .collection(FCM_TOKENS_COLLECTION)
+        .doc(userId)
+        .collection("tokens")
+        .doc(tokenHash)
+        .delete();
+
+    return {
+        success: true
+    };
+}
+
+async function removeAllDeviceTokens(userId) {
+    if (!userId) {
+        throw new Error("userId is required.");
+    }
+
+    const collectionRef = db
+        .collection(FCM_TOKENS_COLLECTION)
+        .doc(userId)
+        .collection("tokens");
+
+    const snapshot = await collectionRef.get();
+
+    if (snapshot.empty) {
+        return {
+            success: true,
+            removed: 0
+        };
+    }
+
+    const batch = db.batch();
+
+    snapshot.docs.forEach(document => {
+        batch.delete(document.ref);
+    });
 
     await batch.commit();
 
-
-    return true;
-
+    return {
+        success: true,
+        removed: snapshot.size
+    };
 }
 
+/*
+|--------------------------------------------------------------------------
+| Notification History
+|--------------------------------------------------------------------------
+*/
 
-/* =========================================================
-   REMOVE ALL DEVICE TOKENS
-   ========================================================= */
-
-async function removeAllDeviceTokens(
-    userId
-) {
-
-    const normalizedUserId =
-        safeString(
-            userId
-        );
-
-
-    if (!normalizedUserId) {
-
-        return 0;
-
-    }
-
-
-    const snapshot =
-        await userTokenCollection(
-            normalizedUserId
-        )
-            .get();
-
-
-    if (
-        snapshot.empty
-    ) {
-
-        return 0;
-
-    }
-
-
-    const batch =
-        db.batch();
-
-
-    snapshot.docs.forEach(
-        doc => {
-
-            batch.delete(
-                doc.ref
-            );
-
-        }
-    );
-
-
-    await batch.commit();
-
-
-    return snapshot.size;
-
-}
-
-
-/* =========================================================
-   GET USER NOTIFICATIONS
-   ========================================================= */
-
-async function getUserNotifications(
+async function getUserNotifications({
     userId,
-    {
-        limit = 30,
-        cursor = null
-    } = {}
-) {
-
-    const normalizedUserId =
-        safeString(
-            userId
-        );
-
-
-    if (!normalizedUserId) {
-
-        throw new Error(
-            "User ID is required."
-        );
-
+    limit = 30,
+    cursor = null
+}) {
+    if (!userId) {
+        throw new Error("userId is required.");
     }
 
+    const safeLimit = Math.min(
+        Math.max(Number(limit) || 30, 1),
+        MAX_NOTIFICATIONS_PER_PAGE
+    );
 
-    let safeLimit =
-        Number(
-            limit
-        );
+    let query = db
+        .collection("users")
+        .doc(userId)
+        .collection(NOTIFICATIONS_COLLECTION)
+        .orderBy("createdAt", "desc")
+        .limit(safeLimit);
 
-
-    if (
-        !Number.isInteger(
-            safeLimit
-        )
-    ) {
-
-        safeLimit = 30;
-
-    }
-
-
-    safeLimit =
-        Math.min(
-            Math.max(
-                safeLimit,
-                1
-            ),
-            MAX_NOTIFICATIONS_PER_PAGE
-        );
-
-
-    let query =
-        notificationCollection(
-            normalizedUserId
-        )
-            .orderBy(
-                "createdAt",
-                "desc"
-            )
-            .limit(
-                safeLimit + 1
-            );
-
-
-    /*
-     * Cursor is the last notification document ID.
-     *
-     * Because the query already belongs to the user's
-     * subcollection, a cursor cannot cross into another
-     * user's notification collection.
-     */
     if (cursor) {
-
-        const cursorId =
-            safeString(
-                cursor
-            );
-
-
-        if (
-            !cursorId ||
-            cursorId.length > 200 ||
-            cursorId.includes("/") ||
-            cursorId.includes("\\")
-        ) {
-
-            throw new Error(
-                "Invalid notification cursor."
-            );
-
-        }
-
-
-        const cursorSnapshot =
-            await notificationCollection(
-                normalizedUserId
-            )
-                .doc(
-                    cursorId
-                )
+        const cursorDocument =
+            await db
+                .collection("users")
+                .doc(userId)
+                .collection(NOTIFICATIONS_COLLECTION)
+                .doc(cursor)
                 .get();
 
-
-        if (
-            !cursorSnapshot.exists
-        ) {
-
-            throw new Error(
-                "Invalid notification cursor."
+        if (cursorDocument.exists) {
+            query = query.startAfter(
+                cursorDocument
             );
-
         }
-
-
-        query =
-            query.startAfter(
-                cursorSnapshot
-            );
-
     }
 
+    const snapshot = await query.get();
 
-    const snapshot =
-        await query.get();
+    const notifications = snapshot.docs.map(
+        document => {
+            const data = document.data();
 
+            let createdAt = null;
 
-    const documents =
-        snapshot.docs;
-
-
-    const hasMore =
-        documents.length >
-        safeLimit;
-
-
-    const visibleDocuments =
-        hasMore
-            ? documents.slice(
-                0,
-                safeLimit
-            )
-            : documents;
-
-
-    const notifications =
-        visibleDocuments.map(
-            doc => {
-
-                const data =
-                    doc.data();
-
-
-                return removeUndefined({
-
-                    id:
-                        doc.id,
-
-                    type:
-                        data.type,
-
-                    title:
-                        data.title,
-
-                    body:
-                        data.body,
-
-                    data:
-                        data.data || {},
-
-                    read:
-                        data.read === true,
-
-                    createdAt:
-                        data.createdAt,
-
-                    updatedAt:
-                        data.updatedAt
-
-                });
-
+            if (
+                data.createdAt &&
+                typeof data.createdAt.toDate === "function"
+            ) {
+                createdAt =
+                    data.createdAt.toDate().toISOString();
+            } else if (
+                data.createdAt instanceof Date
+            ) {
+                createdAt =
+                    data.createdAt.toISOString();
+            } else if (data.createdAt) {
+                createdAt = String(
+                    data.createdAt
+                );
             }
-        );
 
+            return {
+                id: document.id,
+                ...data,
+                createdAt
+            };
+        }
+    );
 
-    const nextCursor =
-        hasMore &&
-        visibleDocuments.length > 0
-            ? visibleDocuments[
-                visibleDocuments.length - 1
-            ].id
-            : null;
-
+    const lastDocument =
+        snapshot.docs[snapshot.docs.length - 1];
 
     return {
-
+        success: true,
         notifications,
-
-        pagination: {
-
-            limit:
-                safeLimit,
-
-            returned:
-                notifications.length,
-
-            hasMore,
-
-            nextCursor
-
-        }
-
+        nextCursor:
+            lastDocument?.id || null,
+        hasMore:
+            snapshot.docs.length === safeLimit
     };
-
 }
 
+/*
+|--------------------------------------------------------------------------
+| Unread Count
+|--------------------------------------------------------------------------
+*/
 
-/* =========================================================
-   GET UNREAD COUNT
-   ========================================================= */
-
-async function getUnreadCount(
-    userId
-) {
-
-    const normalizedUserId =
-        safeString(
-            userId
-        );
-
-
-    if (!normalizedUserId) {
-
-        throw new Error(
-            "User ID is required."
-        );
-
+async function getUnreadCount(userId) {
+    if (!userId) {
+        throw new Error("userId is required.");
     }
 
+    const snapshot = await db
+        .collection("users")
+        .doc(userId)
+        .collection(NOTIFICATIONS_COLLECTION)
+        .where("isRead", "==", false)
+        .limit(100)
+        .get();
 
-    const snapshot =
-        await notificationCollection(
-            normalizedUserId
-        )
-            .where(
-                "read",
-                "==",
-                false
-            )
-            .get();
-
-
-    return snapshot.size;
-
+    return {
+        success: true,
+        count: snapshot.size
+    };
 }
 
+/*
+|--------------------------------------------------------------------------
+| Mark Notification Read
+|--------------------------------------------------------------------------
+*/
 
-/* =========================================================
-   MARK ONE NOTIFICATION AS READ
-   ========================================================= */
-
-async function markNotificationRead(
+async function markNotificationRead({
     userId,
     notificationId
-) {
-
-    const normalizedUserId =
-        safeString(
-            userId
-        );
-
-
-    const normalizedNotificationId =
-        safeString(
-            notificationId
-        );
-
-
-    if (
-        !normalizedUserId ||
-        !normalizedNotificationId
-    ) {
-
-        throw new Error(
-            "User ID and notification ID are required."
-        );
-
+}) {
+    if (!userId) {
+        throw new Error("userId is required.");
     }
 
-
-    const ref =
-        notificationRef(
-            normalizedUserId,
-            normalizedNotificationId
+    if (!notificationId) {
+        throw new Error(
+            "notificationId is required."
         );
+    }
 
+    const notificationRef = db
+        .collection("users")
+        .doc(userId)
+        .collection(NOTIFICATIONS_COLLECTION)
+        .doc(notificationId);
 
     const snapshot =
-        await ref.get();
+        await notificationRef.get();
 
-
-    if (
-        !snapshot.exists
-    ) {
-
-        return {
-
-            success:
-                false,
-
-            found:
-                false
-
-        };
-
+    if (!snapshot.exists) {
+        throw new Error(
+            "Notification not found."
+        );
     }
 
-
-    await ref.update({
-
-        read:
-            true,
-
-        updatedAt:
-            new Date()
-
+    await notificationRef.update({
+        isRead: true,
+        readAt: new Date()
     });
-
 
     return {
-
-        success:
-            true,
-
-        found:
-            true
-
+        success: true
     };
-
 }
 
+/*
+|--------------------------------------------------------------------------
+| Mark All Notifications Read
+|--------------------------------------------------------------------------
+*/
 
-/* =========================================================
-   MARK ALL NOTIFICATIONS AS READ
-   ========================================================= */
-
-async function markAllNotificationsRead(
-    userId
-) {
-
-    const normalizedUserId =
-        safeString(
-            userId
-        );
-
-
-    if (!normalizedUserId) {
-
-        throw new Error(
-            "User ID is required."
-        );
-
+async function markAllNotificationsRead(userId) {
+    if (!userId) {
+        throw new Error("userId is required.");
     }
 
+    const collectionRef = db
+        .collection("users")
+        .doc(userId)
+        .collection(NOTIFICATIONS_COLLECTION);
 
-    const snapshot =
-        await notificationCollection(
-            normalizedUserId
-        )
-            .where(
-                "read",
-                "==",
-                false
-            )
-            .get();
+    const snapshot = await collectionRef
+        .where("isRead", "==", false)
+        .limit(500)
+        .get();
 
-
-    if (
-        snapshot.empty
-    ) {
-
-        return 0;
-
+    if (snapshot.empty) {
+        return {
+            success: true,
+            updated: 0
+        };
     }
 
+    const batch = db.batch();
 
-    const batch =
-        db.batch();
-
-
-    snapshot.docs.forEach(
-        doc => {
-
-            batch.update(
-                doc.ref,
-                {
-
-                    read:
-                        true,
-
-                    updatedAt:
-                        new Date()
-
-                }
-            );
-
-        }
-    );
-
-
-    await batch.commit();
-
-
-    return snapshot.size;
-
-}
-
-
-/* =========================================================
-   DELETE OLD NOTIFICATIONS
-   ========================================================= */
-
-/**
- * Trusted maintenance helper.
- *
- * This is NOT exposed to browser users.
- */
-async function deleteOldNotifications(
-    userId,
-    days = 180
-) {
-
-    const normalizedUserId =
-        safeString(
-            userId
-        );
-
-
-    if (!normalizedUserId) {
-
-        throw new Error(
-            "User ID is required."
-        );
-
-    }
-
-
-    let safeDays =
-        Number(
-            days
-        );
-
-
-    if (
-        !Number.isInteger(
-            safeDays
-        ) ||
-        safeDays < 30
-    ) {
-
-        safeDays = 180;
-
-    }
-
-
-    const cutoff =
-        new Date(
-
-            Date.now() -
-            safeDays *
-            24 *
-            60 *
-            60 *
-            1000
-
-        );
-
-
-    const snapshot =
-        await notificationCollection(
-            normalizedUserId
-        )
-            .where(
-                "createdAt",
-                "<",
-                cutoff
-            )
-            .limit(
-                500
-            )
-            .get();
-
-
-    if (
-        snapshot.empty
-    ) {
-
-        return 0;
-
-    }
-
-
-    const batch =
-        db.batch();
-
-
-    snapshot.docs.forEach(
-        doc => {
-
-            batch.delete(
-                doc.ref
-            );
-
-        }
-    );
-
-
-    await batch.commit();
-
-
-    return snapshot.size;
-
-}
-
-
-/* =========================================================
-   TRANSACTION NOTIFICATION
-   ========================================================= */
-
-async function notifyTransaction(
-    {
-        userId,
-        title,
-        body,
-        transactionId,
-        reference,
-        direction,
-        amountKobo,
-        status = "successful",
-        provider = null
-    }
-) {
-
-    const data =
-        removeUndefined({
-
-            transactionId:
-                safeString(
-                    transactionId
-                ),
-
-            reference:
-                safeString(
-                    reference
-                ),
-
-            direction:
-                safeString(
-                    direction
-                ),
-
-            amountKobo:
-                Number.isSafeInteger(
-                    Number(
-                        amountKobo
-                    )
-                )
-                    ? String(
-                        Number(
-                            amountKobo
-                        )
-                    )
-                    : undefined,
-
-            status:
-                safeString(
-                    status
-                ),
-
-            provider:
-                provider
-                    ? safeString(
-                        provider
-                    )
-                    : undefined
-
+    snapshot.docs.forEach(document => {
+        batch.update(document.ref, {
+            isRead: true,
+            readAt: new Date()
         });
-
-
-    return createNotification({
-
-        userId,
-
-        type:
-            "transaction",
-
-        title,
-
-        body,
-
-        data,
-
-        sendPush:
-            true
-
     });
 
+    await batch.commit();
+
+    return {
+        success: true,
+        updated: snapshot.size
+    };
 }
 
+/*
+|--------------------------------------------------------------------------
+| Convenience Notification Helpers
+|--------------------------------------------------------------------------
+*/
 
-/* =========================================================
-   SECURITY NOTIFICATION
-   ========================================================= */
-
-async function notifySecurity(
-    {
-        userId,
-        title,
-        body,
-        data = {}
-    }
-) {
-
+async function notifyTransaction({
+    userId,
+    title,
+    body,
+    data = {},
+    sendPush = true
+}) {
     return createNotification({
-
         userId,
-
-        type:
-            "security",
-
+        type: "transaction",
         title,
-
         body,
-
         data,
-
-        sendPush:
-            true
-
-    });
-
-}
-
-
-/* =========================================================
-   ACCOUNT NOTIFICATION
-   ========================================================= */
-
-async function notifyAccount(
-    {
-        userId,
-        title,
-        body,
-        data = {}
-    }
-) {
-
-    return createNotification({
-
-        userId,
-
-        type:
-            "account",
-
-        title,
-
-        body,
-
-        data,
-
-        sendPush:
-            true
-
-    });
-
-}
-
-
-/* =========================================================
-   SYSTEM NOTIFICATION
-   ========================================================= */
-
-async function notifySystem(
-    {
-        userId,
-        title,
-        body,
-        data = {},
-        sendPush = true
-    }
-) {
-
-    return createNotification({
-
-        userId,
-
-        type:
-            "system",
-
-        title,
-
-        body,
-
-        data,
-
         sendPush
-
     });
-
 }
 
+async function notifySecurity({
+    userId,
+    title,
+    body,
+    data = {},
+    sendPush = true
+}) {
+    return createNotification({
+        userId,
+        type: "security",
+        title,
+        body,
+        data,
+        sendPush
+    });
+}
 
-/* =========================================================
-   EXPORTS
-   ========================================================= */
+async function notifyAccount({
+    userId,
+    title,
+    body,
+    data = {},
+    sendPush = true
+}) {
+    return createNotification({
+        userId,
+        type: "account",
+        title,
+        body,
+        data,
+        sendPush
+    });
+}
+
+async function notifySystem({
+    userId,
+    title,
+    body,
+    data = {},
+    sendPush = true
+}) {
+    return createNotification({
+        userId,
+        type: "system",
+        title,
+        body,
+        data,
+        sendPush
+    });
+}
+
+async function notifyAirtime({
+    userId,
+    title = "Airtime purchase",
+    body,
+    data = {},
+    sendPush = true
+}) {
+    return createNotification({
+        userId,
+        type: "airtime",
+        title,
+        body,
+        data,
+        sendPush
+    });
+}
+
+async function notifyData({
+    userId,
+    title = "Data purchase",
+    body,
+    data = {},
+    sendPush = true
+}) {
+    return createNotification({
+        userId,
+        type: "data",
+        title,
+        body,
+        data,
+        sendPush
+    });
+}
+
+async function notifyElectricity({
+    userId,
+    title = "Electricity payment",
+    body,
+    data = {},
+    sendPush = true
+}) {
+    return createNotification({
+        userId,
+        type: "electricity",
+        title,
+        body,
+        data,
+        sendPush
+    });
+}
+
+async function notifyTV({
+    userId,
+    title = "TV subscription",
+    body,
+    data = {},
+    sendPush = true
+}) {
+    return createNotification({
+        userId,
+        type: "tv",
+        title,
+        body,
+        data,
+        sendPush
+    });
+}
+
+async function notifyAddMoney({
+    userId,
+    title = "Money added",
+    body,
+    data = {},
+    sendPush = true
+}) {
+    return createNotification({
+        userId,
+        type: "add_money",
+        title,
+        body,
+        data,
+        sendPush
+    });
+}
+
+async function notifyFailed({
+    userId,
+    title = "Transaction failed",
+    body,
+    data = {},
+    sendPush = true
+}) {
+    return createNotification({
+        userId,
+        type: "failed",
+        title,
+        body,
+        data,
+        sendPush
+    });
+}
+
+async function notifyReversed({
+    userId,
+    title = "Transaction reversed",
+    body,
+    data = {},
+    sendPush = true
+}) {
+    return createNotification({
+        userId,
+        type: "reversed",
+        title,
+        body,
+        data,
+        sendPush
+    });
+}
+
+async function notifyRefund({
+    userId,
+    title = "Refund processed",
+    body,
+    data = {},
+    sendPush = true
+}) {
+    return createNotification({
+        userId,
+        type: "refund",
+        title,
+        body,
+        data,
+        sendPush
+    });
+}
+
+/*
+|--------------------------------------------------------------------------
+| Exports
+|--------------------------------------------------------------------------
+*/
 
 module.exports = {
-
     createNotification,
 
     sendPushNotification,
+    sendWebPushNotification,
+    sendLegacyFCMNotification,
+
+    registerPushSubscription,
+    removePushSubscription,
+    removePushSubscriptionById,
+    removeAllPushSubscriptions,
 
     registerDeviceToken,
-
     removeDeviceToken,
-
     removeAllDeviceTokens,
 
     getUserNotifications,
-
     getUnreadCount,
-
     markNotificationRead,
-
     markAllNotificationsRead,
 
-    deleteOldNotifications,
-
     notifyTransaction,
-
     notifySecurity,
-
     notifyAccount,
+    notifySystem,
 
-    notifySystem
-
+    notifyAirtime,
+    notifyData,
+    notifyElectricity,
+    notifyTV,
+    notifyAddMoney,
+    notifyFailed,
+    notifyReversed,
+    notifyRefund
 };
