@@ -1,28 +1,11 @@
-/* =========================================================
-   NOVAPAY — NOTIFICATION ROUTES
-   ---------------------------------------------------------
-   Responsibilities:
-   - Return authenticated user's notifications
-   - Return unread notification count
-   - Mark one notification as read
-   - Mark all notifications as read
-   - Register authenticated user's FCM device token
-   - Remove authenticated user's FCM device token
-   -
-   IMPORTANT:
-   - User identity ALWAYS comes from Firebase Auth
-   - Client cannot choose another user's userId
-   - Notification creation is NOT exposed to browsers
-   - Backend-only notification creation stays in service.js
-   ========================================================= */
+"use strict";
 
 const express = require("express");
 
-const {
-    requireAuth
-} = require("../auth");
+const { requireAuth } = require("../middleware/auth");
 
 const {
+    createNotification,
     getUserNotifications,
     getUnreadCount,
     markNotificationRead,
@@ -31,510 +14,251 @@ const {
     removeDeviceToken
 } = require("./service");
 
+const router = express.Router();
 
-const router =
-    express.Router();
+/*
+|--------------------------------------------------------------------------
+| Create notification
+|--------------------------------------------------------------------------
+| Creates an in-app notification for the currently authenticated user.
+| If sendPush is true, the notification service will also attempt FCM push.
+|--------------------------------------------------------------------------
+*/
+router.post("/", requireAuth, async (req, res) => {
+    try {
+        const {
+            type,
+            title,
+            body,
+            message,
+            data,
+            sendPush
+        } = req.body || {};
 
+        const result = await createNotification({
+            userId: req.user.uid,
+            type,
+            title,
+            body: body ?? message,
+            data,
+            sendPush: sendPush !== false
+        });
 
-/* =========================================================
-   GET USER NOTIFICATIONS
-   ========================================================= */
+        const {
+            push,
+            ...notification
+        } = result;
 
-router.get(
-    "/",
-    requireAuth,
-    async (req, res) => {
+        return res.status(201).json({
+            success: true,
+            notification,
+            push,
+            requestId: req.requestId
+        });
+    } catch (error) {
+        console.error("Create notification route error:", error);
 
-        try {
-
-            const userId =
-                req.user.uid;
-
-
-            const limit =
-                req.query.limit;
-
-
-            const cursor =
-                req.query.cursor ||
-                null;
-
-
-            const result =
-                await getUserNotifications(
-                    userId,
-                    {
-                        limit,
-                        cursor
-                    }
-                );
-
-
-            return res.status(200).json({
-
-                success:
-                    true,
-
-                notifications:
-                    result.notifications,
-
-                pagination:
-                    result.pagination,
-
-                requestId:
-                    req.requestId
-
-            });
-
-        } catch (error) {
-
-            console.error(
-                "NovaPay notification retrieval error:",
-                error
-            );
-
-
-            return res.status(500).json({
-
-                success:
-                    false,
-
-                error:
-                    "Unable to load notifications.",
-
-                requestId:
-                    req.requestId
-
-            });
-
-        }
-
+        return res.status(400).json({
+            success: false,
+            error: error?.message || "Unable to create notification.",
+            requestId: req.requestId
+        });
     }
-);
+});
 
+/*
+|--------------------------------------------------------------------------
+| Get notifications
+|--------------------------------------------------------------------------
+*/
+router.get("/", requireAuth, async (req, res) => {
+    try {
+        const limit = req.query.limit;
+        const cursor = req.query.cursor;
 
-/* =========================================================
-   GET UNREAD COUNT
-   ========================================================= */
-
-router.get(
-    "/unread-count",
-    requireAuth,
-    async (req, res) => {
-
-        try {
-
-            const userId =
-                req.user.uid;
-
-
-            const count =
-                await getUnreadCount(
-                    userId
-                );
-
-
-            return res.status(200).json({
-
-                success:
-                    true,
-
-                unreadCount:
-                    count,
-
-                requestId:
-                    req.requestId
-
-            });
-
-        } catch (error) {
-
-            console.error(
-                "NovaPay unread notification count error:",
-                error
-            );
-
-
-            return res.status(500).json({
-
-                success:
-                    false,
-
-                error:
-                    "Unable to load notification status.",
-
-                requestId:
-                    req.requestId
-
-            });
-
-        }
-
-    }
-);
-
-
-/* =========================================================
-   MARK ALL AS READ
-   ---------------------------------------------------------
-   This route uses the authenticated Firebase UID.
-   The browser cannot specify another user's UID.
-   ========================================================= */
-
-router.patch(
-    "/read-all",
-    requireAuth,
-    async (req, res) => {
-
-        try {
-
-            const userId =
-                req.user.uid;
-
-
-            const updatedCount =
-                await markAllNotificationsRead(
-                    userId
-                );
-
-
-            return res.status(200).json({
-
-                success:
-                    true,
-
-                updatedCount,
-
-                requestId:
-                    req.requestId
-
-            });
-
-        } catch (error) {
-
-            console.error(
-                "NovaPay mark-all-notifications-read error:",
-                error
-            );
-
-
-            return res.status(500).json({
-
-                success:
-                    false,
-
-                error:
-                    "Unable to update notifications.",
-
-                requestId:
-                    req.requestId
-
-            });
-
-        }
-
-    }
-);
-
-
-/* =========================================================
-   MARK ONE NOTIFICATION AS READ
-   ========================================================= */
-
-router.patch(
-    "/:notificationId/read",
-    requireAuth,
-    async (req, res) => {
-
-        try {
-
-            const userId =
-                req.user.uid;
-
-
-            const notificationId =
-                String(
-                    req.params.notificationId ||
-                    ""
-                ).trim();
-
-
-            if (!notificationId) {
-
-                return res.status(400).json({
-
-                    success:
-                        false,
-
-                    error:
-                        "Notification could not be identified.",
-
-                    requestId:
-                        req.requestId
-
-                });
-
+        const result = await getUserNotifications(
+            req.user.uid,
+            {
+                limit,
+                cursor
             }
+        );
 
+        return res.json({
+            success: true,
+            notifications: result.notifications || [],
+            pagination: {
+                hasMore: result.hasMore === true,
+                nextCursor: result.nextCursor || null
+            },
+            requestId: req.requestId
+        });
+    } catch (error) {
+        console.error("Get notifications route error:", error);
 
-            const result =
-                await markNotificationRead(
-                    userId,
-                    notificationId
-                );
-
-
-            if (
-                result.found !== true
-            ) {
-
-                /*
-                 * Do not reveal whether another user's
-                 * notification exists.
-                 */
-                return res.status(404).json({
-
-                    success:
-                        false,
-
-                    error:
-                        "Notification not found.",
-
-                    requestId:
-                        req.requestId
-
-                });
-
-            }
-
-
-            return res.status(200).json({
-
-                success:
-                    true,
-
-                requestId:
-                    req.requestId
-
-            });
-
-        } catch (error) {
-
-            console.error(
-                "NovaPay mark-notification-read error:",
-                error
-            );
-
-
-            return res.status(500).json({
-
-                success:
-                    false,
-
-                error:
-                    "Unable to update notification.",
-
-                requestId:
-                    req.requestId
-
-            });
-
-        }
-
+        return res.status(400).json({
+            success: false,
+            error: error?.message || "Unable to load notifications.",
+            requestId: req.requestId
+        });
     }
-);
+});
 
+/*
+|--------------------------------------------------------------------------
+| Get unread notification count
+|--------------------------------------------------------------------------
+*/
+router.get("/unread-count", requireAuth, async (req, res) => {
+    try {
+        const count = await getUnreadCount(req.user.uid);
 
-/* =========================================================
-   REGISTER FCM DEVICE TOKEN
-   ---------------------------------------------------------
-   The browser supplies only the token and platform.
-   The authenticated UID comes from Firebase Auth.
-   ========================================================= */
+        return res.json({
+            success: true,
+            count,
+            requestId: req.requestId
+        });
+    } catch (error) {
+        console.error("Unread notification count route error:", error);
 
-router.post(
-    "/device-token",
-    requireAuth,
-    async (req, res) => {
+        return res.status(400).json({
+            success: false,
+            error: error?.message || "Unable to get unread notification count.",
+            requestId: req.requestId
+        });
+    }
+});
 
-        try {
+/*
+|--------------------------------------------------------------------------
+| Mark all notifications as read
+|--------------------------------------------------------------------------
+*/
+router.patch("/read-all", requireAuth, async (req, res) => {
+    try {
+        const result = await markAllNotificationsRead(req.user.uid);
 
-            const userId =
-                req.user.uid;
+        return res.json({
+            success: true,
+            ...result,
+            requestId: req.requestId
+        });
+    } catch (error) {
+        console.error("Mark all notifications read route error:", error);
 
+        return res.status(400).json({
+            success: false,
+            error: error?.message || "Unable to mark notifications as read.",
+            requestId: req.requestId
+        });
+    }
+});
 
-            const token =
-                String(
-                    req.body?.token ||
-                    ""
-                ).trim();
+/*
+|--------------------------------------------------------------------------
+| Mark one notification as read
+|--------------------------------------------------------------------------
+*/
+router.patch("/:notificationId/read", requireAuth, async (req, res) => {
+    try {
+        const notificationId = String(
+            req.params.notificationId || ""
+        ).trim();
 
-
-            const platform =
-                String(
-                    req.body?.platform ||
-                    "unknown"
-                ).trim();
-
-
-            if (!token) {
-
-                return res.status(400).json({
-
-                    success:
-                        false,
-
-                    error:
-                        "Device notification registration could not be completed.",
-
-                    requestId:
-                        req.requestId
-
-                });
-
-            }
-
-
-            const result =
-                await registerDeviceToken(
-                    userId,
-                    token,
-                    platform
-                );
-
-
-            return res.status(200).json({
-
-                success:
-                    true,
-
-                tokenId:
-                    result.tokenId,
-
-                requestId:
-                    req.requestId
-
-            });
-
-        } catch (error) {
-
-            console.error(
-                "NovaPay device token registration error:",
-                error
-            );
-
-
+        if (!notificationId) {
             return res.status(400).json({
-
-                success:
-                    false,
-
-                error:
-                    "Unable to register this device for notifications.",
-
-                requestId:
-                    req.requestId
-
+                success: false,
+                error: "Notification ID is required.",
+                requestId: req.requestId
             });
-
         }
 
+        const result = await markNotificationRead(
+            req.user.uid,
+            notificationId
+        );
+
+        return res.json({
+            success: true,
+            ...result,
+            requestId: req.requestId
+        });
+    } catch (error) {
+        console.error("Mark notification read route error:", error);
+
+        return res.status(400).json({
+            success: false,
+            error: error?.message || "Unable to mark notification as read.",
+            requestId: req.requestId
+        });
     }
-);
+});
 
+/*
+|--------------------------------------------------------------------------
+| Register FCM device token
+|--------------------------------------------------------------------------
+*/
+router.post("/device-token", requireAuth, async (req, res) => {
+    try {
+        const {
+            token,
+            platform
+        } = req.body || {};
 
-/* =========================================================
-   REMOVE FCM DEVICE TOKEN
-   ---------------------------------------------------------
-   Only removes a token belonging to the authenticated user.
-   ========================================================= */
+        const result = await registerDeviceToken(
+            req.user.uid,
+            token,
+            platform
+        );
 
-router.delete(
-    "/device-token",
-    requireAuth,
-    async (req, res) => {
+        return res.status(201).json({
+            success: true,
+            ...result,
+            requestId: req.requestId
+        });
+    } catch (error) {
+        console.error("Register device token route error:", error);
 
-        try {
-
-            const userId =
-                req.user.uid;
-
-
-            const token =
-                String(
-                    req.body?.token ||
-                    ""
-                ).trim();
-
-
-            if (!token) {
-
-                return res.status(400).json({
-
-                    success:
-                        false,
-
-                    error:
-                        "Device notification registration could not be removed.",
-
-                    requestId:
-                        req.requestId
-
-                });
-
-            }
-
-
-            await removeDeviceToken(
-                userId,
-                token
-            );
-
-
-            /*
-             * Return a generic success response.
-             * We do not expose whether the token existed.
-             */
-            return res.status(200).json({
-
-                success:
-                    true,
-
-                requestId:
-                    req.requestId
-
-            });
-
-        } catch (error) {
-
-            console.error(
-                "NovaPay device token removal error:",
-                error
-            );
-
-
-            return res.status(500).json({
-
-                success:
-                    false,
-
-                error:
-                    "Unable to update notification settings.",
-
-                requestId:
-                    req.requestId
-
-            });
-
-        }
-
+        return res.status(400).json({
+            success: false,
+            error: error?.message || "Unable to register device token.",
+            requestId: req.requestId
+        });
     }
-);
+});
 
+/*
+|--------------------------------------------------------------------------
+| Remove FCM device token
+|--------------------------------------------------------------------------
+*/
+router.delete("/device-token", requireAuth, async (req, res) => {
+    try {
+        const token =
+            req.body?.token ||
+            req.query?.token ||
+            null;
 
-/* =========================================================
-   EXPORT ROUTER
-   ========================================================= */
+        const result = await removeDeviceToken(
+            req.user.uid,
+            token
+        );
 
-module.exports =
-    router;
+        return res.json({
+            success: true,
+            ...result,
+            requestId: req.requestId
+        });
+    } catch (error) {
+        console.error("Remove device token route error:", error);
+
+        return res.status(400).json({
+            success: false,
+            error: error?.message || "Unable to remove device token.",
+            requestId: req.requestId
+        });
+    }
+});
+
+module.exports = router;
