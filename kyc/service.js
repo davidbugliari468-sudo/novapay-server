@@ -22,6 +22,123 @@ const TIER_1 = 1;
 const TIER_2 = 2;
 const TIER_3 = 3;
 
+/*
+ * SECURITY:
+ * Never log raw NIN/BVN values or complete provider responses.
+ *
+ * These helpers keep diagnostics useful while preventing sensitive
+ * identity information from being written into Render logs.
+ */
+function sanitizeDiagnosticText(value) {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const cleaned = value
+    .replace(/\b\d{11}\b/g, "[REDACTED_11_DIGIT_ID]")
+    .replace(/\b\d{10,}\b/g, "[REDACTED_NUMBER]")
+    .trim();
+
+  if (!cleaned) {
+    return null;
+  }
+
+  return cleaned.slice(0, 300);
+}
+
+function safeProviderRef(value) {
+  if (typeof value !== "string" || !value.trim()) {
+    return null;
+  }
+
+  const ref = value.trim();
+
+  if (ref.length <= 8) {
+    return ref;
+  }
+
+  return `${ref.slice(0, 4)}...${ref.slice(-4)}`;
+}
+
+function logProviderDiagnostic(type, providerResponse) {
+  if (!providerResponse || typeof providerResponse !== "object") {
+    console.warn(`[KYC][${type}] BabsPay returned no usable response.`);
+    return;
+  }
+
+  console.warn(`[KYC][${type}] BabsPay verification result`, {
+    providerStatus:
+      typeof providerResponse.status === "string"
+        ? providerResponse.status
+        : null,
+
+    providerState:
+      typeof providerResponse.state === "string"
+        ? providerResponse.state
+        : null,
+
+    providerMessage: sanitizeDiagnosticText(
+      providerResponse.msg || providerResponse.message
+    ),
+
+    providerRef: safeProviderRef(providerResponse.ref),
+
+    hasData:
+      providerResponse.data !== null &&
+      providerResponse.data !== undefined,
+
+    dataType: Array.isArray(providerResponse.data)
+      ? "array"
+      : typeof providerResponse.data,
+  });
+}
+
+function logProviderErrorDiagnostic(type, error) {
+  if (!error) {
+    console.error(`[KYC][${type}] Unknown BabsPay error.`);
+    return;
+  }
+
+  const diagnostic = {
+    errorType:
+      error instanceof BabsPayError
+        ? "BabsPayError"
+        : error.constructor?.name || "Error",
+
+    code:
+      typeof error.code === "string"
+        ? error.code
+        : "UNKNOWN_ERROR",
+
+    status:
+      Number.isFinite(error.status)
+        ? error.status
+        : Number.isFinite(error.statusCode)
+          ? error.statusCode
+          : null,
+
+    message: sanitizeDiagnosticText(error.message),
+
+    providerStatus:
+      typeof error.data?.status === "string"
+        ? error.data.status
+        : null,
+
+    providerState:
+      typeof error.data?.state === "string"
+        ? error.data.state
+        : null,
+
+    providerMessage: sanitizeDiagnosticText(
+      error.data?.msg || error.data?.message
+    ),
+
+    providerRef: safeProviderRef(error.data?.ref),
+  };
+
+  console.error(`[KYC][${type}] BabsPay request error`, diagnostic);
+}
+
 function getUserRef(uid) {
   return db.collection(USERS_COLLECTION).doc(uid);
 }
@@ -189,6 +306,8 @@ async function verifyNINForUser(uid, nin) {
   try {
     providerResponse = await verifyNIN(normalizedNIN);
   } catch (error) {
+    logProviderErrorDiagnostic("NIN", error);
+
     const safeError = buildSafeError(
       error,
       "NIN verification service is currently unavailable."
@@ -212,6 +331,15 @@ async function verifyNINForUser(uid, nin) {
       error: safeError.message,
     };
   }
+
+  /*
+   * DIAGNOSTICS:
+   * Log only safe provider metadata.
+   *
+   * Raw NIN and complete provider response are intentionally
+   * excluded from logs.
+   */
+  logProviderDiagnostic("NIN", providerResponse);
 
   const verificationState = getVerificationState(providerResponse.state);
 
@@ -310,6 +438,17 @@ async function verifyNINForUser(uid, nin) {
         provider: "babspay",
         providerRef: providerResponse.ref || null,
         errorCode: "VERIFICATION_FAILED",
+        providerStatus:
+          typeof providerResponse.status === "string"
+            ? providerResponse.status
+            : null,
+        providerState:
+          typeof providerResponse.state === "string"
+            ? providerResponse.state
+            : null,
+        providerMessage: sanitizeDiagnosticText(
+          providerResponse.msg || providerResponse.message
+        ),
         updatedAt: FieldValue.serverTimestamp(),
       },
       updatedAt: FieldValue.serverTimestamp(),
@@ -380,6 +519,8 @@ async function verifyBVNForUser(uid, bvn) {
   try {
     providerResponse = await verifyBVN(normalizedBVN);
   } catch (error) {
+    logProviderErrorDiagnostic("BVN", error);
+
     const safeError = buildSafeError(
       error,
       "BVN verification service is currently unavailable."
@@ -403,6 +544,15 @@ async function verifyBVNForUser(uid, bvn) {
       error: safeError.message,
     };
   }
+
+  /*
+   * DIAGNOSTICS:
+   * Log only safe provider metadata.
+   *
+   * Raw BVN and complete provider response are intentionally
+   * excluded from logs.
+   */
+  logProviderDiagnostic("BVN", providerResponse);
 
   const verificationState = getVerificationState(providerResponse.state);
 
@@ -499,6 +649,17 @@ async function verifyBVNForUser(uid, bvn) {
         provider: "babspay",
         providerRef: providerResponse.ref || null,
         errorCode: "VERIFICATION_FAILED",
+        providerStatus:
+          typeof providerResponse.status === "string"
+            ? providerResponse.status
+            : null,
+        providerState:
+          typeof providerResponse.state === "string"
+            ? providerResponse.state
+            : null,
+        providerMessage: sanitizeDiagnosticText(
+          providerResponse.msg || providerResponse.message
+        ),
         updatedAt: FieldValue.serverTimestamp(),
       },
       updatedAt: FieldValue.serverTimestamp(),
