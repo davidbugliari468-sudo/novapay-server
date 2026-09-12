@@ -4,10 +4,12 @@ const express = require("express");
 const rateLimit = require("express-rate-limit");
 
 const { requireAuth } = require("../auth");
+
 const {
   validateNIN,
   validateBVN,
 } = require("./validation");
+
 const {
   verifyNINForUser,
   verifyBVNForUser,
@@ -52,24 +54,6 @@ const kycRateLimiter = rateLimit({
 });
 
 /*
- * Require a verified Firebase account before KYC.
- *
- * The Firebase ID token is already verified by requireAuth.
- * We only use the UID from the verified token.
- */
-function requireVerifiedEmail(req, res, next) {
-  if (req.user?.emailVerified !== true) {
-    return res.status(403).json({
-      success: false,
-      error: "Please verify your email before completing identity verification.",
-      requestId: req.requestId,
-    });
-  }
-
-  next();
-}
-
-/*
  * POST /api/kyc/nin
  *
  * Verifies a user's NIN through the NovaPay backend.
@@ -78,11 +62,13 @@ function requireVerifiedEmail(req, res, next) {
  * {
  *   "nin": "12345678901"
  * }
+ *
+ * Firebase authentication is still required.
+ * Email verification is NOT required for KYC.
  */
 router.post(
   "/nin",
   requireAuth,
-  requireVerifiedEmail,
   kycRateLimiter,
   async (req, res) => {
     try {
@@ -104,7 +90,10 @@ router.post(
        *
        * The UID comes exclusively from the Firebase ID token.
        */
-      const result = await verifyNINForUser(req.user.uid, nin);
+      const result = await verifyNINForUser(
+        req.user.uid,
+        nin
+      );
 
       if (result.state === "invalid") {
         return res.status(400).json({
@@ -129,7 +118,8 @@ router.post(
         return res.status(200).json({
           success: true,
           state: "verified",
-          alreadyVerified: result.alreadyVerified === true,
+          alreadyVerified:
+            result.alreadyVerified === true,
           tier: result.tier,
           message: result.message,
           nin: result.nin,
@@ -141,24 +131,30 @@ router.post(
         success: false,
         state: result.state || "failed",
         tier: result.tier,
-        error: result.error || "NIN verification was unsuccessful.",
+        error:
+          result.error ||
+          "NIN verification was unsuccessful.",
         requestId: req.requestId,
       });
     } catch (error) {
       /*
-       * Do not pass raw KYC/provider errors to the central error
-       * handler because they could potentially contain sensitive
-       * provider response information.
+       * Do not pass raw KYC/provider errors to the central
+       * error handler because they could potentially contain
+       * sensitive provider response information.
        */
-      console.error("NIN verification route failed:", {
-        requestId: req.requestId,
-        uid: req.user?.uid,
-        code: error?.code || "UNKNOWN",
-      });
+      console.error(
+        "NIN verification route failed:",
+        {
+          requestId: req.requestId,
+          uid: req.user?.uid,
+          code: error?.code || "UNKNOWN",
+        }
+      );
 
       return res.status(500).json({
         success: false,
-        error: "Unable to process NIN verification right now.",
+        error:
+          "Unable to process NIN verification right now.",
         requestId: req.requestId,
       });
     }
@@ -174,11 +170,13 @@ router.post(
  * {
  *   "bvn": "22345678901"
  * }
+ *
+ * Firebase authentication is still required.
+ * Email verification is NOT required for KYC.
  */
 router.post(
   "/bvn",
   requireAuth,
-  requireVerifiedEmail,
   kycRateLimiter,
   async (req, res) => {
     try {
@@ -198,7 +196,10 @@ router.post(
        * Again, the UID is obtained from the verified Firebase
        * authentication token and never from the request body.
        */
-      const result = await verifyBVNForUser(req.user.uid, bvn);
+      const result = await verifyBVNForUser(
+        req.user.uid,
+        bvn
+      );
 
       if (result.state === "invalid") {
         return res.status(400).json({
@@ -233,7 +234,8 @@ router.post(
         return res.status(200).json({
           success: true,
           state: "verified",
-          alreadyVerified: result.alreadyVerified === true,
+          alreadyVerified:
+            result.alreadyVerified === true,
           tier: result.tier,
           message: result.message,
           bvn: result.bvn,
@@ -245,19 +247,25 @@ router.post(
         success: false,
         state: result.state || "failed",
         tier: result.tier,
-        error: result.error || "BVN verification was unsuccessful.",
+        error:
+          result.error ||
+          "BVN verification was unsuccessful.",
         requestId: req.requestId,
       });
     } catch (error) {
-      console.error("BVN verification route failed:", {
-        requestId: req.requestId,
-        uid: req.user?.uid,
-        code: error?.code || "UNKNOWN",
-      });
+      console.error(
+        "BVN verification route failed:",
+        {
+          requestId: req.requestId,
+          uid: req.user?.uid,
+          code: error?.code || "UNKNOWN",
+        }
+      );
 
       return res.status(500).json({
         success: false,
-        error: "Unable to process BVN verification right now.",
+        error:
+          "Unable to process BVN verification right now.",
         requestId: req.requestId,
       });
     }
@@ -270,29 +278,37 @@ router.post(
  * Returns only safe KYC status information.
  *
  * No NIN/BVN values are returned.
+ *
+ * Firebase authentication is still required.
+ * Email verification is NOT required for KYC.
  */
 router.get(
   "/status",
   requireAuth,
-  requireVerifiedEmail,
   async (req, res) => {
     try {
-      const result = await getKYCStatus(req.user.uid);
+      const result = await getKYCStatus(
+        req.user.uid
+      );
 
       return res.status(200).json({
         ...result,
         requestId: req.requestId,
       });
     } catch (error) {
-      console.error("KYC status route failed:", {
-        requestId: req.requestId,
-        uid: req.user?.uid,
-        code: error?.code || "UNKNOWN",
-      });
+      console.error(
+        "KYC status route failed:",
+        {
+          requestId: req.requestId,
+          uid: req.user?.uid,
+          code: error?.code || "UNKNOWN",
+        }
+      );
 
       return res.status(500).json({
         success: false,
-        error: "Unable to retrieve verification status right now.",
+        error:
+          "Unable to retrieve verification status right now.",
         requestId: req.requestId,
       });
     }
