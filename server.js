@@ -81,22 +81,36 @@ const {
 
 
 // =====================================================
-// NOVAPAY ADMIN AUTHORIZATION
+// NOVAPAY ADMIN MANAGEMENT SYSTEM
 // =====================================================
 //
-// Admin access requires:
+// Admin access is now handled by the separate Admin
+// Management System.
 //
-//     1. A valid Firebase authentication token
-//     2. The Firebase Custom Claim:
+// The old Firebase custom-claim admin middleware has
+// been removed.
 //
-//            adminp: true
+// Admin routes are connected through:
 //
-// requireAdmin.js checks the admin claim.
+//     ./admin/routes/adminRoutes
+//
+// The new system uses:
+//
+//     Admin identifier
+//     Admin token
+//     Admin session
+//     Admin session protection
+//
+// Normal NovaPay user authentication remains handled
+// separately by requireAuth from ./auth.
 // =====================================================
 
+const adminRoutes =
+  require("./admin/routes/adminRoutes");
+
 const {
-  requireAdmin
-} = require("./admin/middleware/requireAdmin");
+  initializeAdminSystem
+} = require("./admin/services/adminBootstrap");
 
 
 const {
@@ -378,78 +392,40 @@ app.get(
 
 
 // =====================================================
-// NOVAPAY ADMIN API PROTECTION
+// NOVAPAY ADMIN MANAGEMENT API
 // =====================================================
 //
-// Every route placed under:
-//
-//     /api/admin
-//
-// must pass BOTH:
+// The old:
 //
 //     requireAuth
 //     requireAdmin
 //
-// requireAuth verifies the Firebase ID token.
+// protection has been removed.
 //
-// requireAdmin verifies:
+// The new Admin Management System owns everything
+// under:
 //
-//     adminp === true
+//     /api/admin
 //
-// This prevents normal authenticated users from
-// accessing admin APIs.
+// Login:
 //
+//     POST /api/admin/login
+//
+// Change token:
+//
+//     POST /api/admin/change-token
+//
+// Logout:
+//
+//     POST /api/admin/logout
+//
+// Protected admin routes perform their own admin
+// session verification through requireAdminSession.
 // =====================================================
 
 app.use(
   "/api/admin",
-  requireAuth,
-  requireAdmin
-);
-
-
-// =====================================================
-// ADMIN AUTHORIZATION TEST ROUTE
-// =====================================================
-//
-// This route is intentionally small.
-//
-// It allows us to verify that the admin security
-// foundation is correctly connected before we build
-// the real admin dashboard APIs.
-//
-// Required:
-//
-//     Valid Firebase ID token
-//
-// AND:
-//
-//     Firebase Custom Claim:
-//     adminp: true
-//
-// =====================================================
-
-app.get(
-  "/api/admin/protected",
-  (req, res) => {
-
-    res.status(200).json({
-
-      success:
-        true,
-
-      message:
-        "Admin authenticated",
-
-      admin:
-        req.admin,
-
-      requestId:
-        req.requestId,
-
-    });
-
-  }
+  adminRoutes
 );
 
 
@@ -1340,6 +1316,69 @@ app.listen(
 
 
     // =================================================
+    // ADMIN MANAGEMENT SYSTEM BOOTSTRAP
+    // =================================================
+    //
+    // Creates the initial super-admin record only when
+    // the adminManagement/superAdmin record does not
+    // already exist.
+    //
+    // It does NOT create additional admin accounts.
+    //
+    // Once the record exists, Firestore remains the
+    // authority for the stored admin credentials.
+    //
+    // =================================================
+
+    initializeAdminSystem()
+      .then(
+        (result) => {
+
+          if (
+            result.alreadyInitialized
+          ) {
+
+            console.log(
+              "Admin Management System already initialized."
+            );
+
+            return;
+
+          }
+
+
+          if (
+            result.initialized
+          ) {
+
+            console.log(
+              "Admin Management System initialized successfully."
+            );
+
+            return;
+
+          }
+
+
+          console.log(
+            "Admin Management System initialization completed."
+          );
+
+        }
+      )
+      .catch(
+        (error) => {
+
+          console.error(
+            "Admin Management System initialization error:",
+            error.message
+          );
+
+        }
+      );
+
+
+    // =================================================
     // DATA RECONCILIATION WORKER
     // =================================================
 
@@ -1734,6 +1773,7 @@ app.listen(
           console.error(
             "TV reconciliation worker error:",
             error
+
           );
 
         }
