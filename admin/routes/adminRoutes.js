@@ -9,6 +9,10 @@ const {
 } = require("../controllers/adminTokenController");
 
 const {
+  recoverAdminToken
+} = require("../controllers/adminTokenRecoveryController");
+
+const {
   checkAdminLock
 } = require("../middleware/adminRateLimiter");
 
@@ -34,6 +38,23 @@ router.post(
   "/login",
   checkAdminLock,
   adminLogin
+);
+
+
+// =====================================================
+// FORGOT PASSWORD
+// =====================================================
+//
+// Public recovery route.
+// The UID is verified by the backend before a new
+// admin token is generated.
+//
+// POST /api/admin/forgot-password
+// =====================================================
+
+router.post(
+  "/forgot-password",
+  recoverAdminToken
 );
 
 
