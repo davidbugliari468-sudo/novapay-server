@@ -79,6 +79,26 @@ const {
   requireAuth
 } = require("./auth");
 
+
+// =====================================================
+// NOVAPAY ADMIN AUTHORIZATION
+// =====================================================
+//
+// Admin access requires:
+//
+//     1. A valid Firebase authentication token
+//     2. The Firebase Custom Claim:
+//
+//            adminp: true
+//
+// requireAdmin.js checks the admin claim.
+// =====================================================
+
+const {
+  requireAdmin
+} = require("./admin/middleware/requireAdmin");
+
+
 const {
   db,
   auth: adminAuth
@@ -347,6 +367,82 @@ app.get(
 
       status:
         "online",
+
+      requestId:
+        req.requestId,
+
+    });
+
+  }
+);
+
+
+// =====================================================
+// NOVAPAY ADMIN API PROTECTION
+// =====================================================
+//
+// Every route placed under:
+//
+//     /api/admin
+//
+// must pass BOTH:
+//
+//     requireAuth
+//     requireAdmin
+//
+// requireAuth verifies the Firebase ID token.
+//
+// requireAdmin verifies:
+//
+//     adminp === true
+//
+// This prevents normal authenticated users from
+// accessing admin APIs.
+//
+// =====================================================
+
+app.use(
+  "/api/admin",
+  requireAuth,
+  requireAdmin
+);
+
+
+// =====================================================
+// ADMIN AUTHORIZATION TEST ROUTE
+// =====================================================
+//
+// This route is intentionally small.
+//
+// It allows us to verify that the admin security
+// foundation is correctly connected before we build
+// the real admin dashboard APIs.
+//
+// Required:
+//
+//     Valid Firebase ID token
+//
+// AND:
+//
+//     Firebase Custom Claim:
+//     adminp: true
+//
+// =====================================================
+
+app.get(
+  "/api/admin/protected",
+  (req, res) => {
+
+    res.status(200).json({
+
+      success:
+        true,
+
+      message:
+        "Admin authenticated",
+
+      admin:
+        req.admin,
 
       requestId:
         req.requestId,
@@ -1052,6 +1148,7 @@ app.post(
                 new Date(),
 
             }
+
           );
 
 
