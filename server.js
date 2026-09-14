@@ -1717,29 +1717,3 @@ app.listen(
 
   }
 );
-// =====================================================
-// NOVAPAY REQUEST DIAGNOSTICS — ADD ONLY
-// =====================================================
-
-app.use((req, res, next) => {
-  console.log("========== NOVAPAY REQUEST DIAGNOSTIC ==========");
-
-  console.log("[REQUEST] Method:", req.method);
-  console.log("[REQUEST] Path:", req.path);
-  console.log("[REQUEST] Origin:", req.headers.origin || "NO ORIGIN");
-  console.log("[REQUEST] Host:", req.headers.host || "NO HOST");
-
-  console.log(
-    "[REQUEST] Authorization present:",
-    Boolean(req.headers.authorization)
-  );
-
-  console.log(
-    "[REQUEST] FRONTEND_ORIGIN:",
-    process.env.FRONTEND_ORIGIN || "MISSING"
-  );
-
-  console.log("=================================================");
-
-  next();
-});
