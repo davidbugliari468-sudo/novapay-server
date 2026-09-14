@@ -117,4 +117,38 @@ module.exports = {
   app,
   auth,
   db
-};
+}; 
+// =====================================================
+// NOVAPAY AUTH DIAGNOSTICS — ADD ONLY
+// =====================================================
+
+console.log("========== NOVAPAY AUTH DIAGNOSTICS ==========");
+
+console.log(
+  "[DIAGNOSTIC] Firebase Admin project_id:",
+  serviceAccount?.project_id || "MISSING"
+);
+
+console.log(
+  "[DIAGNOSTIC] Firebase Admin client_email:",
+  serviceAccount?.client_email || "MISSING"
+);
+
+console.log(
+  "[DIAGNOSTIC] Expected Firebase project_id:",
+  "novapay-a0875"
+);
+
+console.log(
+  "[DIAGNOSTIC] FRONTEND_ORIGIN:",
+  process.env.FRONTEND_ORIGIN || "MISSING"
+);
+
+console.log(
+  "[DIAGNOSTIC] FIREBASE_SERVICE_ACCOUNT_JSON:",
+  process.env.FIREBASE_SERVICE_ACCOUNT_JSON
+    ? "PRESENT"
+    : "MISSING"
+);
+
+console.log("================================================");

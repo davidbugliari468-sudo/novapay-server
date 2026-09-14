@@ -42,4 +42,31 @@ async function requireAuth(req, res, next) {
   }
 }
 
-module.exports = { requireAuth };
+module.exports = { requireAuth }; 
+console.log("========== AUTH VERIFY DIAGNOSTIC ==========");
+
+console.log(
+  "[AUTH] Authorization header present:",
+  Boolean(header)
+);
+
+console.log(
+  "[AUTH] Bearer token present:",
+  Boolean(idToken)
+);
+
+console.log(
+  "[AUTH] Request origin:",
+  req.headers.origin || "NO ORIGIN"
+);
+
+console.log(
+  "[AUTH] Request host:",
+  req.headers.host || "NO HOST"
+);
+
+console.log(
+  "[AUTH] Attempting Firebase ID token verification..."
+);
+
+console.log("=============================================");
