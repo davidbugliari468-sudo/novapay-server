@@ -40,7 +40,7 @@ const kycRateLimiter = rateLimit({
       return `kyc-user:${req.user.uid}`;
     }
 
-    return `kyc-ip:${req.ip}`;
+    return `kyc-ip:${rateLimit.ipKeyGenerator(req.ip)}`;
   },
 
   handler: (req, res) => {

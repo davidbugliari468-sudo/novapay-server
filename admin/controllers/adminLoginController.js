@@ -8,6 +8,10 @@ const {
 } = require("../services/adminTokenService");
 
 const {
+  createAdminSession
+} = require("../services/adminSessionService");
+
+const {
   recordFailedAdminLogin
 } = require("../middleware/adminRateLimiter");
 
@@ -27,6 +31,8 @@ const {
 // - The token is verified against its stored hash.
 // - Failed attempts are handled by the admin rate
 //   limiter.
+// - A secure admin session is created after successful
+//   authentication.
 // =====================================================
 
 
@@ -91,6 +97,22 @@ async function adminLogin(req, res) {
       return res.status(503).json({
         success: false,
         error: "Admin security system is not initialized.",
+        requestId: req.requestId
+      });
+    }
+
+
+    // -------------------------------------------------
+    // VERIFY ADMIN STATUS
+    // -------------------------------------------------
+
+    if (
+      admin.status !== "active"
+    ) {
+
+      return res.status(403).json({
+        success: false,
+        error: "Admin account is not active.",
         requestId: req.requestId
       });
     }
@@ -174,32 +196,55 @@ async function adminLogin(req, res) {
     // SUCCESSFUL AUTHENTICATION
     // -------------------------------------------------
     //
-    // Clear the failed-attempt counter.
-    // The secure admin session will be created by
-    // the session layer we build next.
+    // Clear the failed-attempt counter first.
     // -------------------------------------------------
 
     await resetLoginProtection();
 
 
     // -------------------------------------------------
-    // RETURN SAFE LOGIN RESULT
+    // CREATE SECURE ADMIN SESSION
     // -------------------------------------------------
+    //
+    // The admin document ID is used internally only.
+    // It is never returned to the frontend.
+    // -------------------------------------------------
+
+    const session =
+      await createAdminSession({
+        adminId: "superAdmin"
+      });
+
+
+    // -------------------------------------------------
+    // RETURN SECURE LOGIN RESULT
+    // -------------------------------------------------
+    //
+    // Return only what the frontend needs to maintain
+    // the authenticated admin session.
     //
     // Never return:
     // - adminUid
     // - tokenHash
-    // - raw token
+    // - raw admin token
     // - Firestore admin document
     // -------------------------------------------------
 
     return res.status(200).json({
       success: true,
       message: "Admin authentication successful",
+
+      session: {
+        sessionId: session.sessionId,
+        sessionToken: session.sessionToken,
+        expiresAt: session.expiresAt
+      },
+
       admin: {
         role: admin.role,
         status: admin.status
       },
+
       requestId: req.requestId
     });
 
