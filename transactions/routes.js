@@ -16,11 +16,11 @@ const router = express.Router();
 //        ↓
 // verified req.user.uid
 //        ↓
-// wallet ledger
+// wallet/{uid}/ledger
 // airtimeTransactions
 // dataTransactions
 //        ↓
-// unified read-only transaction history
+// read-only transaction history
 //
 // IMPORTANT:
 //
@@ -94,32 +94,6 @@ function getLedgerCollection(uid) {
 
 
 // =====================================================
-// AIRTIME TRANSACTION COLLECTION
-// =====================================================
-
-function getAirtimeTransactionsCollection() {
-
-    return db.collection(
-        AIRTIME_TRANSACTIONS_COLLECTION
-    );
-
-}
-
-
-// =====================================================
-// DATA TRANSACTION COLLECTION
-// =====================================================
-
-function getDataTransactionsCollection() {
-
-    return db.collection(
-        DATA_TRANSACTIONS_COLLECTION
-    );
-
-}
-
-
-// =====================================================
 // PAGE SIZE
 // =====================================================
 
@@ -183,36 +157,6 @@ function normalizeTransactionType(
 
 // =====================================================
 // TRANSACTION DIRECTION
-// =====================================================
-
-function normalizeDirection(
-    value,
-    fallback = "debit"
-) {
-
-    const direction =
-        String(
-            value || ""
-        )
-            .trim()
-            .toLowerCase();
-
-    if (
-        direction === "credit" ||
-        direction === "debit"
-    ) {
-
-        return direction;
-
-    }
-
-    return fallback;
-
-}
-
-
-// =====================================================
-// LEDGER TRANSACTION DIRECTION
 // =====================================================
 
 function getTransactionDirection(
@@ -326,13 +270,19 @@ function normalizeServiceStatus(
         status === "failed" ||
         status === "fail" ||
         status === "cancelled" ||
-        status === "canceled" ||
+        status === "canceled"
+    ) {
+
+        return "failed";
+
+    }
+
+
+    if (
         status === "reversed"
     ) {
 
-        return status === "reversed"
-            ? "reversed"
-            : "failed";
+        return "reversed";
 
     }
 
@@ -347,7 +297,7 @@ function normalizeServiceStatus(
     }
 
 
-    return status || "pending";
+    return "pending";
 
 }
 
@@ -410,72 +360,6 @@ function serializeTimestamp(
 
 
     return null;
-
-}
-
-
-// =====================================================
-// DATE TO MILLISECONDS
-// =====================================================
-
-function timestampToMillis(
-    timestamp
-) {
-
-    if (!timestamp) {
-
-        return 0;
-
-    }
-
-
-    if (
-        typeof timestamp.toMillis ===
-        "function"
-    ) {
-
-        return timestamp.toMillis();
-
-    }
-
-
-    if (
-        typeof timestamp.toDate ===
-        "function"
-    ) {
-
-        return timestamp
-            .toDate()
-            .getTime();
-
-    }
-
-
-    if (
-        timestamp instanceof Date
-    ) {
-
-        return timestamp.getTime();
-
-    }
-
-
-    const date =
-        new Date(timestamp);
-
-
-    if (
-        !Number.isNaN(
-            date.getTime()
-        )
-    ) {
-
-        return date.getTime();
-
-    }
-
-
-    return 0;
 
 }
 
@@ -617,26 +501,14 @@ function serializeTransaction(
     }
 
 
-    const direction =
-        getTransactionDirection(
-            ledger
-        );
-
-
-    const status =
-        getTransactionStatus(
-            ledger
-        );
-
-
     return {
 
         id:
             snapshot.id,
 
         reference:
-            safeString(
-                ledger.reference
+            String(
+                ledger.reference || ""
             ),
 
         type:
@@ -644,9 +516,15 @@ function serializeTransaction(
                 ledger.type
             ),
 
-        direction,
+        direction:
+            getTransactionDirection(
+                ledger
+            ),
 
-        status,
+        status:
+            getTransactionStatus(
+                ledger
+            ),
 
         amountKobo,
 
@@ -690,6 +568,20 @@ function serializeServiceTransaction(
 
     const transaction =
         snapshot.data();
+
+
+    if (
+        String(
+            transaction.uid || ""
+        ) !==
+        String(
+            transaction._uid || ""
+        )
+    ) {
+
+        // UID verification is performed by the caller.
+        // This block intentionally does nothing.
+    }
 
 
     const createdAt =
@@ -744,19 +636,6 @@ function serializeServiceTransaction(
     }
 
 
-    const type =
-        normalizeTransactionType(
-            transaction.type ||
-            service
-        );
-
-
-    const status =
-        normalizeServiceStatus(
-            transaction.status
-        );
-
-
     let reference =
         safeString(
             transaction.reference
@@ -781,18 +660,6 @@ function serializeServiceTransaction(
     }
 
 
-    const provider =
-        transaction.provider
-            ? safeString(
-                transaction.provider
-            )
-            : (
-                service === "airtime"
-                    ? "vtu.ng"
-                    : "babspay"
-            );
-
-
     return {
 
         id:
@@ -800,15 +667,16 @@ function serializeServiceTransaction(
 
         reference,
 
-        type,
+        type:
+            service,
 
         direction:
-            normalizeDirection(
-                transaction.direction,
-                "debit"
-            ),
+            "debit",
 
-        status,
+        status:
+            normalizeServiceStatus(
+                transaction.status
+            ),
 
         amountKobo,
 
@@ -830,7 +698,16 @@ function serializeServiceTransaction(
                 transaction.balanceAfterKobo
             ),
 
-        provider,
+        provider:
+            transaction.provider
+                ? String(
+                    transaction.provider
+                )
+                : (
+                    service === "airtime"
+                        ? "vtu.ng"
+                        : "babspay"
+                ),
 
         createdAt,
 
@@ -843,87 +720,41 @@ function serializeServiceTransaction(
 
 
 // =====================================================
-// TRANSACTION IDENTITY
+// CURSOR ENCODING
 // =====================================================
 
-function getTransactionIdentity(
-    transaction
+function encodeCursor(
+    createdAt,
+    documentId
 ) {
 
-    const reference =
-        safeString(
-            transaction.reference
+    const date =
+        createdAt instanceof Date
+            ? createdAt
+            : new Date(createdAt);
+
+
+    if (
+        Number.isNaN(
+            date.getTime()
         )
-            .toLowerCase();
+    ) {
 
-
-    if (reference) {
-
-        return `reference:${reference}`;
+        throw new Error(
+            "Unable to create transaction cursor."
+        );
 
     }
 
 
-    return `id:${safeString(
-        transaction.id
-    ).toLowerCase()}`;
-
-}
-
-
-// =====================================================
-// CURSOR ENCODING
-// =====================================================
-//
-// The cursor stores one cursor for each transaction
-// source. This keeps pagination correct when records
-// come from three different Firestore collections.
-// =====================================================
-
-function encodeSourceCursor(
-    cursor
-) {
-
-    return {
-
-        createdAt:
-            cursor?.createdAt
-                ? new Date(
-                    cursor.createdAt
-                ).toISOString()
-                : null,
-
-        documentId:
-            cursor?.documentId
-                ? String(
-                    cursor.documentId
-                )
-                : null
-
-    };
-
-}
-
-
-function encodeCursor(
-    cursors
-) {
-
     const payload = {
 
-        ledger:
-            encodeSourceCursor(
-                cursors.ledger
-            ),
+        createdAt:
+            date.toISOString(),
 
-        airtime:
-            encodeSourceCursor(
-                cursors.airtime
-            ),
-
-        data:
-            encodeSourceCursor(
-                cursors.data
+        documentId:
+            String(
+                documentId
             )
 
     };
@@ -964,7 +795,7 @@ function decodeCursor(
 
     if (
         typeof cursor !== "string" ||
-        cursor.length > 5000
+        cursor.length > 1000
     ) {
 
         throw new Error(
@@ -1014,173 +845,57 @@ function decodeCursor(
     }
 
 
-    const sources = [
-        "ledger",
-        "airtime",
-        "data"
-    ];
-
-
-    const result = {};
-
-
-    for (
-        const source of sources
+    if (
+        typeof decoded.createdAt !==
+        "string" ||
+        typeof decoded.documentId !==
+        "string"
     ) {
 
-        const sourceCursor =
-            decoded[source];
-
-
-        if (
-            sourceCursor === null ||
-            sourceCursor === undefined
-        ) {
-
-            result[source] = null;
-
-            continue;
-
-        }
-
-
-        if (
-            typeof sourceCursor !== "object"
-        ) {
-
-            throw new Error(
-                "Invalid transaction cursor."
-            );
-
-        }
-
-
-        if (
-            sourceCursor.createdAt === null &&
-            sourceCursor.documentId === null
-        ) {
-
-            result[source] = null;
-
-            continue;
-
-        }
-
-
-        if (
-            typeof sourceCursor.createdAt !==
-            "string" ||
-            typeof sourceCursor.documentId !==
-            "string" ||
-            !sourceCursor.documentId ||
-            sourceCursor.documentId.length > 200
-        ) {
-
-            throw new Error(
-                "Invalid transaction cursor."
-            );
-
-        }
-
-
-        const createdAt =
-            new Date(
-                sourceCursor.createdAt
-            );
-
-
-        if (
-            Number.isNaN(
-                createdAt.getTime()
-            )
-        ) {
-
-            throw new Error(
-                "Invalid transaction cursor date."
-            );
-
-        }
-
-
-        result[source] = {
-
-            createdAt,
-
-            documentId:
-                sourceCursor.documentId
-
-        };
+        throw new Error(
+            "Invalid transaction cursor."
+        );
 
     }
 
 
-    return result;
-
-}
-
-
-// =====================================================
-// FIRESTORE SOURCE QUERY
-// =====================================================
-
-async function readTransactionSource(
-    collection,
-    uid,
-    limit,
-    cursor
-) {
-
-    let query =
-        collection
-            .where(
-                "uid",
-                "==",
-                uid
-            )
-            .orderBy(
-                "createdAt",
-                "desc"
-            )
-            .limit(
-                limit + 1
-            );
+    const createdAt =
+        new Date(
+            decoded.createdAt
+        );
 
 
-    if (cursor) {
+    if (
+        Number.isNaN(
+            createdAt.getTime()
+        )
+    ) {
 
-        query =
-            collection
-                .where(
-                    "uid",
-                    "==",
-                    uid
-                )
-                .orderBy(
-                    "createdAt",
-                    "desc"
-                )
-                .startAfter(
-                    cursor.createdAt
-                )
-                .limit(
-                    limit + 1
-                );
+        throw new Error(
+            "Invalid transaction cursor date."
+        );
 
     }
 
 
-    const snapshot =
-        await query.get();
+    if (
+        !decoded.documentId ||
+        decoded.documentId.length > 200
+    ) {
+
+        throw new Error(
+            "Invalid transaction cursor document ID."
+        );
+
+    }
 
 
     return {
 
-        documents:
-            snapshot.docs,
+        createdAt,
 
-        hasMore:
-            snapshot.docs.length >
-            limit
+        documentId:
+            decoded.documentId
 
     };
 
@@ -1188,81 +903,120 @@ async function readTransactionSource(
 
 
 // =====================================================
-// CURSOR COMPARISON
+// READ SERVICE TRANSACTIONS
+// =====================================================
+//
+// IMPORTANT:
+//
+// These queries intentionally use only:
+//
+// where("uid", "==", uid)
+//
+// They do NOT combine where() with orderBy().
+// This avoids introducing a new Firestore composite
+// index requirement.
 // =====================================================
 
-function isAfterCursor(
-    transaction,
-    cursor
+async function readServiceTransactions(
+    collectionName,
+    uid
 ) {
 
-    if (!cursor) {
-
-        return true;
-
-    }
-
-
-    const transactionTime =
-        new Date(
-            transaction.createdAt
-        ).getTime();
-
-
-    const cursorTime =
-        cursor.createdAt.getTime();
+    const snapshot =
+        await db
+            .collection(
+                collectionName
+            )
+            .where(
+                "uid",
+                "==",
+                uid
+            )
+            .get();
 
 
-    if (
-        transactionTime <
-        cursorTime
-    ) {
+    return snapshot.docs;
 
-        return true;
-
-    }
+}
 
 
-    if (
-        transactionTime >
-        cursorTime
-    ) {
+// =====================================================
+// TRANSACTION SORT
+// =====================================================
 
-        return false;
+function sortTransactions(
+    transactions
+) {
 
-    }
+    return transactions.sort(
+        (
+            first,
+            second
+        ) => {
+
+            const firstTime =
+                new Date(
+                    first.createdAt
+                ).getTime();
+
+            const secondTime =
+                new Date(
+                    second.createdAt
+                ).getTime();
 
 
-    return String(
-        transaction.id
-    ) > String(
-        cursor.documentId
+            if (
+                secondTime !==
+                firstTime
+            ) {
+
+                return (
+                    secondTime -
+                    firstTime
+                );
+
+            }
+
+
+            return String(
+                second.id
+            ).localeCompare(
+                String(
+                    first.id
+                )
+            );
+
+        }
     );
 
 }
 
 
 // =====================================================
-// GET SOURCE CURSOR
+// TRANSACTION IDENTITY
 // =====================================================
 
-function getSourceCursorFromTransaction(
+function transactionIdentity(
     transaction
 ) {
 
-    return {
+    const reference =
+        safeString(
+            transaction.reference
+        )
+            .toLowerCase();
 
-        createdAt:
-            new Date(
-                transaction.createdAt
-            ),
 
-        documentId:
-            String(
-                transaction.id
-            )
+    if (reference) {
 
-    };
+        return `reference:${reference}`;
+
+    }
+
+
+    return `id:${safeString(
+        transaction.id
+    ).toLowerCase()}`;
 
 }
 
@@ -1277,9 +1031,6 @@ function getSourceCursorFromTransaction(
 //
 // ?limit=20
 // ?cursor=<cursor>
-//
-// The authenticated Firebase UID determines which
-// user's records are queried.
 // =====================================================
 
 router.get(
@@ -1365,42 +1116,62 @@ router.get(
             }
 
 
-            const ledgerCursor =
-                cursor?.ledger || null;
+            // -------------------------------------------------
+            // KEEP THE ORIGINAL LEDGER QUERY STRUCTURE
+            // -------------------------------------------------
 
-            const airtimeCursor =
-                cursor?.airtime || null;
+            const ledgerCollection =
+                getLedgerCollection(
+                    uid
+                );
 
-            const dataCursor =
-                cursor?.data || null;
+
+            let ledgerQuery =
+                ledgerCollection
+                    .orderBy(
+                        "createdAt",
+                        "desc"
+                    )
+                    .limit(
+                        limit + 1
+                    );
+
+
+            if (cursor) {
+
+                ledgerQuery =
+                    ledgerCollection
+                        .orderBy(
+                            "createdAt",
+                            "desc"
+                        )
+                        .startAfter(
+                            cursor.createdAt
+                        )
+                        .limit(
+                            limit + 1
+                        );
+
+            }
 
 
             const [
-                ledgerResult,
-                airtimeResult,
-                dataResult
+                ledgerSnapshot,
+                airtimeDocuments,
+                dataDocuments
             ] =
                 await Promise.all([
 
-                    readTransactionSource(
-                        getLedgerCollection(uid),
-                        uid,
-                        limit,
-                        ledgerCursor
+                    ledgerQuery.get(),
+
+                    readServiceTransactions(
+                        AIRTIME_TRANSACTIONS_COLLECTION,
+                        uid
                     ),
 
-                    readTransactionSource(
-                        getAirtimeTransactionsCollection(),
-                        uid,
-                        limit,
-                        airtimeCursor
-                    ),
-
-                    readTransactionSource(
-                        getDataTransactionsCollection(),
-                        uid,
-                        limit,
-                        dataCursor
+                    readServiceTransactions(
+                        DATA_TRANSACTIONS_COLLECTION,
+                        uid
                     )
 
                 ]);
@@ -1409,9 +1180,13 @@ router.get(
             const transactions = [];
 
 
+            // -------------------------------------------------
+            // LEDGER
+            // -------------------------------------------------
+
             for (
                 const document
-                of ledgerResult.documents
+                of ledgerSnapshot.docs
             ) {
 
                 try {
@@ -1426,6 +1201,8 @@ router.get(
 
                 catch {
 
+                    // Preserve existing behavior of allowing
+                    // the rest of transaction history to load.
                     continue;
 
                 }
@@ -1433,10 +1210,29 @@ router.get(
             }
 
 
+            // -------------------------------------------------
+            // AIRTIME
+            // -------------------------------------------------
+
             for (
                 const document
-                of airtimeResult.documents
+                of airtimeDocuments
             ) {
+
+                const data =
+                    document.data();
+
+
+                if (
+                    String(
+                        data.uid || ""
+                    ) !== uid
+                ) {
+
+                    continue;
+
+                }
+
 
                 const transaction =
                     serializeServiceTransaction(
@@ -1456,10 +1252,29 @@ router.get(
             }
 
 
+            // -------------------------------------------------
+            // DATA
+            // -------------------------------------------------
+
             for (
                 const document
-                of dataResult.documents
+                of dataDocuments
             ) {
+
+                const data =
+                    document.data();
+
+
+                if (
+                    String(
+                        data.uid || ""
+                    ) !== uid
+                ) {
+
+                    continue;
+
+                }
+
 
                 const transaction =
                     serializeServiceTransaction(
@@ -1479,53 +1294,28 @@ router.get(
             }
 
 
-            transactions.sort(
-                (
-                    first,
-                    second
-                ) => {
+            // -------------------------------------------------
+            // SORT ALL TRANSACTIONS
+            // -------------------------------------------------
 
-                    const firstTime =
-                        new Date(
-                            first.createdAt
-                        ).getTime();
-
-                    const secondTime =
-                        new Date(
-                            second.createdAt
-                        ).getTime();
-
-
-                    if (
-                        secondTime !==
-                        firstTime
-                    ) {
-
-                        return (
-                            secondTime -
-                            firstTime
-                        );
-
-                    }
-
-
-                    return String(
-                        second.id
-                    ).localeCompare(
-                        String(
-                            first.id
-                        )
-                    );
-
-                }
+            sortTransactions(
+                transactions
             );
 
+
+            // -------------------------------------------------
+            // REMOVE DUPLICATES
+            //
+            // A successful transaction can exist in both
+            // the service collection and wallet ledger.
+            // Keep the wallet ledger copy when both exist.
+            // -------------------------------------------------
 
             const uniqueTransactions =
                 [];
 
-            const seen =
-                new Set();
+            const seenReferences =
+                new Map();
 
 
             for (
@@ -1534,100 +1324,133 @@ router.get(
             ) {
 
                 const identity =
-                    getTransactionIdentity(
+                    transactionIdentity(
                         transaction
                     );
 
 
+                const existingIndex =
+                    seenReferences.get(
+                        identity
+                    );
+
+
                 if (
-                    seen.has(identity)
+                    existingIndex === undefined
                 ) {
+
+                    seenReferences.set(
+                        identity,
+                        uniqueTransactions.length
+                    );
+
+                    uniqueTransactions.push(
+                        transaction
+                    );
 
                     continue;
 
                 }
 
 
-                seen.add(
-                    identity
-                );
+                const existing =
+                    uniqueTransactions[
+                        existingIndex
+                    ];
 
 
-                uniqueTransactions.push(
-                    transaction
-                );
+                if (
+                    existing._source !==
+                    "ledger" &&
+                    transaction._source ===
+                    "ledger"
+                ) {
+
+                    uniqueTransactions[
+                        existingIndex
+                    ] =
+                        transaction;
+
+                }
 
             }
 
 
-            const pageTransactions =
-                uniqueTransactions
-                    .filter(
-                        (transaction) => {
+            // -------------------------------------------------
+            // APPLY CURSOR
+            // -------------------------------------------------
 
-                            const source =
-                                transaction._source;
+            const filteredTransactions =
+                uniqueTransactions.filter(
+                    (
+                        transaction
+                    ) => {
 
+                        if (!cursor) {
 
-                            const sourceCursor =
-                                source === "ledger"
-                                    ? ledgerCursor
-                                    : source === "airtime"
-                                        ? airtimeCursor
-                                        : dataCursor;
-
-
-                            return isAfterCursor(
-                                transaction,
-                                sourceCursor
-                            );
+                            return true;
 
                         }
-                    )
-                    .slice(
-                        0,
-                        limit
-                    );
+
+
+                        const transactionTime =
+                            new Date(
+                                transaction.createdAt
+                            ).getTime();
+
+
+                        const cursorTime =
+                            cursor.createdAt.getTime();
+
+
+                        if (
+                            transactionTime <
+                            cursorTime
+                        ) {
+
+                            return true;
+
+                        }
+
+
+                        if (
+                            transactionTime >
+                            cursorTime
+                        ) {
+
+                            return false;
+
+                        }
+
+
+                        return String(
+                            transaction.id
+                        ) <
+                        String(
+                            cursor.documentId
+                        );
+
+                    }
+                );
 
 
             const hasMore =
-                ledgerResult.hasMore ||
-                airtimeResult.hasMore ||
-                dataResult.hasMore ||
-                uniqueTransactions.length >
+                filteredTransactions.length >
                 limit;
 
 
-            const nextCursors = {
-
-                ledger:
-                    ledgerCursor,
-
-                airtime:
-                    airtimeCursor,
-
-                data:
-                    dataCursor
-
-            };
+            const pageTransactions =
+                hasMore
+                    ? filteredTransactions.slice(
+                        0,
+                        limit
+                    )
+                    : filteredTransactions;
 
 
-            for (
-                const transaction
-                of pageTransactions
-            ) {
-
-                const source =
-                    transaction._source;
-
-
-                nextCursors[source] =
-                    getSourceCursorFromTransaction(
-                        transaction
-                    );
-
-            }
-
+            // -------------------------------------------------
+            // NEXT CURSOR
+            // -------------------------------------------------
 
             let nextCursor =
                 null;
@@ -1638,13 +1461,24 @@ router.get(
                 pageTransactions.length > 0
             ) {
 
+                const lastTransaction =
+                    pageTransactions[
+                        pageTransactions.length - 1
+                    ];
+
+
                 nextCursor =
                     encodeCursor(
-                        nextCursors
+                        lastTransaction.createdAt,
+                        lastTransaction.id
                     );
 
             }
 
+
+            // -------------------------------------------------
+            // REMOVE INTERNAL SOURCE FIELD
+            // -------------------------------------------------
 
             const cleanTransactions =
                 pageTransactions.map(
@@ -1797,6 +1631,10 @@ router.get(
             }
 
 
+            // -------------------------------------------------
+            // LEDGER
+            // -------------------------------------------------
+
             const ledgerRef =
                 getLedgerCollection(
                     uid
@@ -1836,8 +1674,15 @@ router.get(
             }
 
 
+            // -------------------------------------------------
+            // AIRTIME
+            // -------------------------------------------------
+
             const airtimeRef =
-                getAirtimeTransactionsCollection()
+                db
+                    .collection(
+                        AIRTIME_TRANSACTIONS_COLLECTION
+                    )
                     .doc(
                         transactionId
                     );
@@ -1917,8 +1762,15 @@ router.get(
             }
 
 
+            // -------------------------------------------------
+            // DATA
+            // -------------------------------------------------
+
             const dataRef =
-                getDataTransactionsCollection()
+                db
+                    .collection(
+                        DATA_TRANSACTIONS_COLLECTION
+                    )
                     .doc(
                         transactionId
                     );
