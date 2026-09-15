@@ -548,6 +548,91 @@ async function safelyLoadReservation(
   return reservation;
 }
 
+async function releaseExpiredTransaction(
+  transaction
+) {
+  const transactionId =
+    transaction.id ||
+    transaction.transactionId ||
+    null;
+
+  if (!transactionId) {
+    throw createError(
+      "Data transaction ID is missing."
+    );
+  }
+
+  let releasedReservation;
+
+  try {
+    releasedReservation =
+      await releaseReservation({
+        uid:
+          transaction.uid,
+
+        reservationId:
+          transaction.reservationId
+      });
+  } catch (error) {
+    await updateTransaction(
+      transactionId,
+      {
+        status:
+          transaction.status,
+
+        reconciliationRequired:
+          true,
+
+        reconciliationError:
+          error.code ||
+          "WALLET_RELEASE_FAILED_AFTER_MAX_AGE"
+      }
+    );
+
+    return {
+      ok:
+        false,
+      status:
+        transaction.status,
+      transactionId
+    };
+  }
+
+  const completedAt =
+    releasedReservation.releasedAt ||
+    new Date();
+
+  await updateTransaction(
+    transactionId,
+    {
+      status:
+        STATUS_FAILED,
+
+      providerMessage:
+        "Transaction remained unresolved for the maximum reconciliation age. Wallet reservation released.",
+
+      reconciliationRequired:
+        false,
+
+      reconciliationError:
+        null,
+
+      completedAt,
+
+      walletReservationStatus:
+        RESERVATION_RELEASED
+    }
+  );
+
+  return {
+    ok:
+      true,
+    status:
+      STATUS_FAILED,
+    transactionId
+  };
+}
+
 async function reconcileTransaction(
   transaction
 ) {
@@ -740,6 +825,33 @@ async function reconcileTransaction(
     };
   }
 
+  /*
+   * Pending and unknown transactions are allowed to
+   * remain unresolved for the maximum reconciliation age.
+   *
+   * Once the maximum age is reached, the reservation is
+   * released and the transaction becomes failed.
+   *
+   * This is intentionally checked before another provider
+   * requery so that neither pending nor unknown funds can
+   * remain locked indefinitely.
+   */
+  if (
+    (
+      transaction.status ===
+        STATUS_PENDING ||
+      transaction.status ===
+        STATUS_UNKNOWN
+    ) &&
+    isOlderThanMaximumAge(
+      transaction
+    )
+  ) {
+    return releaseExpiredTransaction(
+      transaction
+    );
+  }
+
   const existingProviderReference =
     normalizeProviderReference(
       transaction.providerReference
@@ -798,7 +910,8 @@ async function reconcileTransaction(
     /*
      * Requery failure is ambiguous.
      *
-     * NEVER release the wallet here.
+     * NEVER release the wallet here unless the
+     * transaction has already reached the maximum age.
      */
     await updateTransaction(
       transactionId,
@@ -1058,7 +1171,8 @@ async function reconcileTransaction(
    * Pending, unknown, not-found, malformed, or otherwise
    * ambiguous responses remain unresolved.
    *
-   * The wallet remains reserved.
+   * The wallet remains reserved until the maximum age
+   * is reached.
    */
   await updateTransaction(
     transactionId,
@@ -1145,6 +1259,18 @@ function toMillis(value) {
 function isOlderThanMaximumAge(
   transaction
 ) {
+  if (
+    !transaction ||
+    (
+      transaction.status !==
+        STATUS_PENDING &&
+      transaction.status !==
+        STATUS_UNKNOWN
+    )
+  ) {
+    return false;
+  }
+
   const createdAtMillis =
     toMillis(
       transaction.createdAt
@@ -1158,7 +1284,7 @@ function isOlderThanMaximumAge(
 
   return (
     Date.now() -
-      createdAtMillis >
+      createdAtMillis >=
     RECONCILIATION_MAX_AGE_MS
   );
 }
@@ -1266,14 +1392,11 @@ async function findTransactionsForReconciliation() {
   );
 
   /*
-   * Old transactions are NOT automatically released.
-   *
-   * They remain visible to reconciliation/manual review.
-   *
-   * We process them as well rather than silently
-   * abandoning customer funds.
+   * Transactions that have reached the maximum age
+   * are processed first so pending/unknown reservations
+   * do not remain locked behind newer transactions.
    */
-  const staleTransactions =
+  const expiredTransactions =
     transactions.filter(
       isOlderThanMaximumAge
     );
@@ -1286,14 +1409,9 @@ async function findTransactionsForReconciliation() {
         )
     );
 
-  /*
-   * Process normal transactions first.
-   * Stale transactions remain eligible so that a
-   * delayed provider result can still be recovered.
-   */
   return [
-    ...normalTransactions,
-    ...staleTransactions
+    ...expiredTransactions,
+    ...normalTransactions
   ].slice(
     0,
     RECONCILIATION_BATCH_SIZE

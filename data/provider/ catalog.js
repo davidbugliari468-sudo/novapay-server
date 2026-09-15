@@ -398,21 +398,17 @@ async function loadCatalogue({
   const cached =
     cache.get(cacheKey);
 
+  /*
+   * A forced refresh always contacts BabsPay.
+   *
+   * Normal catalogue requests also fetch directly
+   * from BabsPay so the frontend receives the current
+   * provider catalogue.
+   */
   if (
-    !forceRefresh &&
-    isCacheFresh(cached)
+    forceRefresh
   ) {
-    console.log(
-      "[DATA DEBUG] Using cached catalogue",
-      {
-        network:
-          normalizedNetwork,
-        planCount:
-          cached.plans.length,
-      }
-    );
-
-    return cached.plans;
+    cache.delete(cacheKey);
   }
 
   console.log(
@@ -422,6 +418,7 @@ async function loadCatalogue({
         normalizedNetwork,
       babsPayNetwork:
         normalizedNetwork,
+      forceRefresh,
     }
   );
 
@@ -466,7 +463,7 @@ async function loadCatalogue({
       network:
         normalizedNetwork,
       activePlanCount:
-        plans.length,
+        plans.length
     }
   );
 
@@ -538,8 +535,7 @@ async function getPlans(
   const plans =
     await loadCatalogue({
       network,
-      forceRefresh:
-        options.forceRefresh === true,
+      forceRefresh: true,
     });
 
   return filterPlans(
@@ -563,8 +559,7 @@ async function getPlanById(
       network:
         options.network ??
         null,
-      forceRefresh:
-        options.forceRefresh === true,
+      forceRefresh: true,
     });
 
   return (
@@ -596,6 +591,7 @@ async function getPlanForPurchase({
     await loadCatalogue({
       network:
         normalizedNetwork,
+      forceRefresh: true,
     });
 
   const plan =
